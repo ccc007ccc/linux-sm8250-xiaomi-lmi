@@ -1,2 +1,12 @@
-status=unlocked
-reason=Pin the latest LTS Linux tag, commit SHA, signature or tarball hash before M1 build.
+status=locked
+source=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+tag=v6.18.30
+tag_object_sha=5427c43497a4528e2769c44262ed689722f4c761
+commit_sha=52dc660c85dbab60c07c8f1a716d68a4b7d4fc7e
+release=6.18.30
+release_moniker=longterm
+release_date=2026-05-14
+tarball=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.30.tar.xz
+tarball_sha256=a8b3886ec3af573f7420b23d27390d4f2b0aac62e8da041662523ce2e7dfb3d4
+pgp_signature=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.30.tar.sign
+reason=Latest kernel.org longterm release observed for M1 locking on 2026-05-15.

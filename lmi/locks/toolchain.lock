@@ -1,2 +1,15 @@
-status=unlocked
-reason=Record clang, ld.lld, dtc, make, and python versions before M1 build.
+status=partial
+clang_path=/home/ccc007/Android/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/clang
+clang_version=Android (13691557, +pgo, +bolt, +lto, +mlgo, based on r522817d) clang version 18.0.4 (https://android.googlesource.com/toolchain/llvm-project d8003a456d14a3deb8054cdaa529ffbf02d9b262)
+ld_lld_path=/home/ccc007/Android/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld
+ld_lld_version=LLD 18.0.4 (compatible with GNU linkers)
+dtc_path=/usr/bin/dtc
+dtc_version=Version: DTC 1.7.0
+python3_path=/home/ccc007/miniconda3/bin/python3
+python3_version=Python 3.13.5
+make_path=/usr/bin/make
+make_version=GNU Make 4.3
+gzip_path=/usr/bin/gzip
+gzip_version=gzip 1.12
+cpio_path=missing
+reason=Kernel toolchain commands are recorded; cpio/static busybox are still required before initramfs archive and M2 packaging.
