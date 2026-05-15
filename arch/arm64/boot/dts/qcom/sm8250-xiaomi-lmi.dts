@@ -4,7 +4,9 @@
 
 / {
 	model = "Xiaomi Redmi K30 Pro / POCO F2 Pro (lmi)";
-	compatible = "xiaomi,lmi", "qcom,sm8250";
+	compatible = "xiaomi,lmi", "qcom,sm8250", "qcom,kona-mtp", "qcom,kona", "qcom,mtp";
+	qcom,msm-id = <0x164 0x20001>;
+	qcom,board-id = <0x25 0x00>;
 
 	#address-cells = <2>;
 	#size-cells = <2>;
