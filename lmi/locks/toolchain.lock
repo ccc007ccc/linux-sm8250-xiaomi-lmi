@@ -1,0 +1,2 @@
+status=unlocked
+reason=Record clang, ld.lld, dtc, make, and python versions before M1 build.

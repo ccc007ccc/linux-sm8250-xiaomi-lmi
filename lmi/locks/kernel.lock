@@ -1,0 +1,2 @@
+status=unlocked
+reason=Pin the latest LTS Linux tag, commit SHA, signature or tarball hash before M1 build.

@@ -188,3 +188,8 @@ sphinx_*/
 
 # bc language scripts (not LLVM bitcode)
 !kernel/time/timeconst.bc
+# LMI local build outputs
+out/
+*.tmp
+__pycache__/
+*.py[cod]

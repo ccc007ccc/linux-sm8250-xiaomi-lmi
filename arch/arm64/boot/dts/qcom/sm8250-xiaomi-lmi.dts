@@ -1,0 +1,164 @@
+/dts-v1/;
+
+#include "sm8250.dtsi"
+
+/ {
+	model = "Xiaomi Redmi K30 Pro / POCO F2 Pro (lmi)";
+	compatible = "xiaomi,lmi", "qcom,sm8250";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	chosen {
+		bootargs = "earlycon=msm_geni_serial,0xa90000 console=tty0 loglevel=8 ignore_loglevel initcall_debug";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		/* Conservative M1 placeholder; replace with M0 captured RAM map before M2. */
+		reg = <0x0 0x80000000 0x0 0x70000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		hyp_mem: hyp-region@80000000 {
+			no-map;
+			reg = <0x0 0x80000000 0x0 0x00600000>;
+		};
+
+		xbl_aop_mem: xbl-aop-region@80600000 {
+			no-map;
+			reg = <0x0 0x80600000 0x0 0x00260000>;
+		};
+
+		cmd_db: cmd-db-region@80860000 {
+			compatible = "qcom,cmd-db";
+			no-map;
+			reg = <0x0 0x80860000 0x0 0x00020000>;
+		};
+
+		reserved_xbl_uefi_log: xbl-uefi-log-region@80880000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x80880000 0x0 0x00014000>;
+		};
+
+		smem_mem: smem-region@80900000 {
+			no-map;
+			reg = <0x0 0x80900000 0x0 0x00200000>;
+		};
+
+		removed_mem: removed-region@80b00000 {
+			no-map;
+			reg = <0x0 0x80b00000 0x0 0x05300000>;
+		};
+
+		pil_camera_mem: pil-camera-region@86200000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x86200000 0x0 0x00500000>;
+		};
+
+		pil_wlan_fw_mem: pil-wlan-fw-region@86700000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x86700000 0x0 0x00100000>;
+		};
+
+		pil_ipa_fw_mem: pil-ipa-fw-region@86800000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x86800000 0x0 0x00010000>;
+		};
+
+		pil_ipa_gsi_mem: pil-ipa-gsi-region@86810000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x86810000 0x0 0x0000a000>;
+		};
+
+		pil_gpu_mem: pil-gpu-region@8681a000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x8681a000 0x0 0x00002000>;
+		};
+
+		pil_npu_mem: pil-npu-region@86900000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x86900000 0x0 0x00500000>;
+		};
+
+		pil_video_mem: pil-video-region@86e00000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x86e00000 0x0 0x00500000>;
+		};
+
+		pil_cvp_mem: pil-cvp-region@87300000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x87300000 0x0 0x00500000>;
+		};
+
+		pil_cdsp_mem: pil-cdsp-region@87800000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x87800000 0x0 0x01400000>;
+		};
+
+		pil_slpi_mem: pil-slpi-region@88c00000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x88c00000 0x0 0x02f00000>;
+		};
+
+		pil_adsp_mem: pil-adsp-region@8bb00000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x8bb00000 0x0 0x02500000>;
+		};
+
+		pil_spss_mem: pil-spss-region@8e000000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x8e000000 0x0 0x00100000>;
+		};
+
+		cdsp_secure_heap: cdsp-secure-heap@8e100000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x8e100000 0x0 0x04600000>;
+		};
+
+		cont_splash_memory: cont-splash-region@9c000000 {
+			reg = <0x0 0x9c000000 0x0 0x02300000>;
+			label = "cont_splash_region";
+		};
+
+		dfps_data_memory: dfps-data-region@9e300000 {
+			reg = <0x0 0x9e300000 0x0 0x00100000>;
+			label = "dfps_data_region";
+		};
+
+		ramoops: ramoops@b0000000 {
+			compatible = "ramoops";
+			no-map;
+			reg = <0x0 0xb0000000 0x0 0x00400000>;
+			record-size = <0x00040000>;
+			console-size = <0x00200000>;
+			pmsg-size = <0x00100000>;
+			ecc-size = <0x0>;
+		};
+
+		disp_rdump_memory: disp-rdump-region@b0400000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0xb0400000 0x0 0x01000000>;
+			label = "disp_rdump_region";
+		};
+	};
+};
