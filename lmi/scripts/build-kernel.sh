@@ -26,7 +26,7 @@ mkdir -p "$OUT_DIR"
 make -C "$REPO_DIR" O="$OUT_DIR" ARCH=arm64 LLVM=1 defconfig
 
 if [ -x "$REPO_DIR/scripts/kconfig/merge_config.sh" ]; then
-  "$REPO_DIR/scripts/kconfig/merge_config.sh" -O "$OUT_DIR" "$OUT_DIR/.config" "$CONFIG_FRAGMENT"
+  "$REPO_DIR/scripts/kconfig/merge_config.sh" -m -O "$OUT_DIR" "$OUT_DIR/.config" "$CONFIG_FRAGMENT"
 else
   cat "$CONFIG_FRAGMENT" >>"$OUT_DIR/.config"
 fi
