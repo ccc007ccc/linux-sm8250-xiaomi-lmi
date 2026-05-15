@@ -60,8 +60,10 @@ if mem:
         print("memory.reg=<" + " ".join(reg.group(1).split()) + ">")
 
 reserved = ""
-m = re.search(r"reserved-memory\s*\{", text)
-if m:
+for pattern in (r"reserved-memory\s*\{", r"&\{/reserved-memory\}\s*\{"):
+    m = re.search(pattern, text)
+    if not m:
+        continue
     depth = 1
     pos = m.end()
     start = pos
@@ -71,7 +73,7 @@ if m:
         elif text[pos] == "}":
             depth -= 1
         pos += 1
-    reserved = text[start : pos - 1]
+    reserved += "\n" + text[start : pos - 1]
 
 print("reserved-memory.fixed:")
 for node in re.finditer(r"(?:(?P<label>[A-Za-z_][\w]*):\s*)?(?P<name>[A-Za-z0-9_,.+-]+)(?:@[0-9a-fA-F]+)?\s*\{(?P<body>[^{}]*)\};", reserved, flags=re.S):
@@ -95,5 +97,9 @@ for node in re.finditer(r"(?:(?P<label>[A-Za-z_][\w]*):\s*)?(?P<name>[A-Za-z0-9_
 PY
 
 if [ -x "$VERIFY" ]; then
-  "$VERIFY" "$SOURCE"
+  VERIFY_ARGS=()
+  case "$INPUT" in
+    *.dts) VERIFY_ARGS+=(--allow-missing) ;;
+  esac
+  "$VERIFY" "$SOURCE" "${VERIFY_ARGS[@]}"
 fi
