@@ -8,6 +8,7 @@
 #include <linux/cleanup.h>
 #include <linux/delay.h>
 #include <linux/devfreq.h>
+#include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interconnect.h>
 #include <linux/module.h>
@@ -1283,6 +1284,16 @@ static void ufs_qcom_fixup_dev_quirks(struct ufs_hba *hba)
 static u32 ufs_qcom_get_ufs_hci_version(struct ufs_hba *hba)
 {
 	return ufshci_version(2, 0);
+}
+
+static int ufs_qcom_set_dma_mask(struct ufs_hba *hba)
+{
+	if (hba->capabilities & MASK_64_ADDRESSING_SUPPORT) {
+		if (!dma_set_mask_and_coherent(hba->dev, DMA_BIT_MASK(64)))
+			return 0;
+	}
+
+	return dma_set_mask_and_coherent(hba->dev, DMA_BIT_MASK(32));
 }
 
 /**
@@ -2902,6 +2913,7 @@ static const struct ufs_hba_variant_ops ufs_hba_qcom_vops = {
 	.init                   = ufs_qcom_init,
 	.exit                   = ufs_qcom_exit,
 	.get_ufs_hci_version	= ufs_qcom_get_ufs_hci_version,
+	.set_dma_mask		= ufs_qcom_set_dma_mask,
 	.clk_scale_notify	= ufs_qcom_clk_scale_notify,
 	.setup_clocks           = ufs_qcom_setup_clocks,
 	.hce_enable_notify      = ufs_qcom_hce_enable_notify,

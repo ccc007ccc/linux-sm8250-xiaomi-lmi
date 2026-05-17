@@ -1570,6 +1570,7 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 			pctrl->regs[i] = devm_ioremap_resource(&pdev->dev, res);
 			if (IS_ERR(pctrl->regs[i]))
 				return PTR_ERR(pctrl->regs[i]);
+			pctrl->phys_base[i] = res->start;
 		}
 	} else {
 		pctrl->regs[0] = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
