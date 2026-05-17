@@ -12,8 +12,27 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	aliases {
+		serial0 = &uart12;
+	};
+
 	chosen {
-		bootargs = "clk_ignore_unused pd_ignore_unused fw_devlink=off pstore.backend=ramoops androidboot.hardware=qcom earlycon=msm_geni_serial,0xa90000 console=tty0 loglevel=4 kpti=off loop.max_part=7 lpm_levels.sleep_disabled=1 reboot=panic_warm swiotlb=2048 cgroup.memory=nokmem,nosocket msm_rtb.filter=0x237 service_locator.enable=1 drm_client_lib.active=fbdev";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:115200n8";
+		bootargs = "clk_ignore_unused pd_ignore_unused fw_devlink=off pstore.backend=ramoops androidboot.hardware=qcom earlycon=msm_geni_serial,0xa90000 console=tty0 loglevel=4 kpti=off loop.max_part=7 lpm_levels.sleep_disabled=1 reboot=panic_warm swiotlb=2048 cgroup.memory=nokmem,nosocket msm_rtb.filter=0x237 service_locator.enable=1 drm_client_lib.active=fbdev fbcon=font:TER16x32 fbcon=rotate:1";
+
+		framebuffer0: framebuffer@9c000000 {
+			compatible = "simple-framebuffer";
+			reg = <0x0 0x9c000000 0x0 0x02300000>;
+			width = <1080>;
+			height = <2400>;
+			stride = <4352>;
+			format = "a8r8g8b8";
+			status = "okay";
+		};
 	};
 
 	memory@80000000 {
@@ -92,6 +111,13 @@
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
+		vreg_l14a_1p8: ldo14 {
+			regulator-name = "vreg_l14a_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1880000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
 		vreg_l17a_3p0: ldo17 {
 			regulator-name = "vreg_l17a_3p0";
 			regulator-min-microvolt = <2856000>;
@@ -122,6 +148,13 @@
 			regulator-name = "vreg_s8c_1p3";
 			regulator-min-microvolt = <1352000>;
 			regulator-max-microvolt = <1352000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l10c_3p0: ldo10 {
+			regulator-name = "vreg_l10c_3p0";
+			regulator-min-microvolt = <3000000>;
+			regulator-max-microvolt = <3000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 	};
@@ -155,11 +188,15 @@
 	};
 
 	cont_splash_memory: memory@9c000000 {
+		compatible = "removed-dma-pool";
+		no-map;
 		reg = <0x0 0x9c000000 0x0 0x02300000>;
 		label = "cont_splash_region";
 	};
 
 	dfps_data_memory: memory@9e300000 {
+		compatible = "removed-dma-pool";
+		no-map;
 		reg = <0x0 0x9e300000 0x0 0x00100000>;
 		label = "dfps_data_region";
 	};
@@ -168,10 +205,11 @@
 		compatible = "ramoops";
 		no-map;
 		reg = <0x0 0xb0000000 0x0 0x00400000>;
-		record-size = <0x00040000>;
+		record-size = <0x0>;
 		console-size = <0x00200000>;
-		pmsg-size = <0x00100000>;
+		pmsg-size = <0x00200000>;
 		ecc-size = <0x0>;
+		max-reason = <3>;
 	};
 
 	disp_rdump_memory: memory@b0400000 {
@@ -180,6 +218,45 @@
 		reg = <0x0 0xb0400000 0x0 0x01000000>;
 		label = "disp_rdump_region";
 	};
+};
+
+&mdss {
+	memory-region = <&cont_splash_memory>;
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	vdda-supply = <&vreg_l9a_1p2>;
+	status = "okay";
+
+	panel@0 {
+		compatible = "xiaomi,lmi-ams667uu01";
+		reg = <0>;
+
+		pinctrl-0 = <&sde_dsi_active>, <&sde_te_active>;
+		pinctrl-1 = <&sde_dsi_sleep>, <&sde_te_sleep>;
+		pinctrl-names = "default", "sleep";
+
+		vddio-supply = <&vreg_l14a_1p8>;
+		vci-supply = <&vreg_l10c_3p0>;
+		reset-gpios = <&tlmm 46 GPIO_ACTIVE_LOW>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+	data-lanes = <0 1 2 3>;
+};
+
+&mdss_dsi0_phy {
+	vdds-supply = <&vreg_l5a_0p875>;
+	status = "okay";
 };
 
 &ufs_mem_hc {
@@ -201,4 +278,34 @@
 &tlmm {
 	status = "okay";
 	gpio-reserved-ranges = <28 4>, <40 4>;
+
+	sde_dsi_active: sde-dsi-active-state {
+		pins = "gpio46";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+		output-high;
+	};
+
+	sde_dsi_sleep: sde-dsi-sleep-state {
+		pins = "gpio46";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-high;
+	};
+
+	sde_te_active: sde-te-active-state {
+		pins = "gpio66";
+		function = "mdp_vsync";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	sde_te_sleep: sde-te-sleep-state {
+		pins = "gpio66";
+		function = "mdp_vsync";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
 };
