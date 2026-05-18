@@ -84,13 +84,13 @@
 
 后续处理：如果后续启用更多 USB-C 角色切换、PD 协商或主机模式时出现断连，再结合 Type-C/role-switch 日志单独分析。
 
-### 软件重启不能进入 bootloader/recovery
+### 软件重启进入 bootloader/recovery
 
-含义：当前主线内核还没有可靠接通 lmi 所需的 Qualcomm reboot-mode 后端。`reboot bootloader` 和 `reboot recovery` 会退化为普通重启，bootloader 没读到目标模式标记。
+含义：lmi bootloader 能读取 PM8150 PON spare register 中的 reboot reason。主线 `qcom-pon` 写入 `mode-bootloader = <0x2>` / `mode-recovery = <0x1>` 后，`reboot bootloader` 和 `reboot recovery` 不再退化为普通重启。
 
-当前影响：非致命但影响调试效率；需要手动进 fastboot/recovery，不能作为自动回收测试镜像的依赖。
+当前影响：已验证可用；M4a PON-only 镜像确认 Ubuntu 中执行 `reboot bootloader` 能进入 fastboot，执行 `reboot recovery` 能进入 recovery ADB。
 
-后续处理：下一步单独验证 PMIC PON、IMEM/SMEM 或 downstream reboot-mode 路径，确认 bootloader 实际读取的模式标记后再接入。
+后续处理：保持 `CONFIG_POWER_RESET_QCOM_PON=y`，不要依赖模块自动加载；如果后续更换 PMIC/启动链后失效，再回看 stock DTB 中的 IMEM `restart_reason@65c` 作为备选路径。
 
 ## Touchscreen / FocalTech FT3518
 

@@ -3,6 +3,7 @@
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/usb/pd.h>
 #include "sm8250.dtsi"
+#include "pm8150.dtsi"
 #include "pm8150b.dtsi"
 
 / {
@@ -361,6 +362,12 @@
 	regulator-min-microamp = <500000>;
 	regulator-max-microamp = <3000000>;
 	status = "okay";
+};
+
+&pon {
+	mode-bootloader = <0x2>;
+	mode-fastboot = <0x2>;
+	mode-recovery = <0x1>;
 };
 
 &qupv3_id_1 {
