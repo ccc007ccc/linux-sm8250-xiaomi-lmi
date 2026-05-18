@@ -38,7 +38,15 @@
 
 ## Display / Samsung AMS667UU01
 
-当前状态：AMS667UU01 已能通过 MSM DRM/DPU/DSI 显示 fbcon 控制台。当前默认使用大字体和横向 fbcon：`fbcon=font:TER16x32 fbcon=rotate:1`。DRM 节点、DSI connector、backlight 节点均能出现。
+当前状态：AMS667UU01 已能通过 MSM DRM/DPU/DSI 显示 fbcon 控制台。当前默认使用大字体和横向 fbcon：`fbcon=font:TER16x32 fbcon=rotate:1`。DRM 节点、DSI connector、backlight 节点均能出现。启动早期白屏/条纹已通过 lmi 专用 bootshim 在跳入 Linux 前拉低 GPIO46 panel reset 消除，随后 panel 驱动仍按正常流程重新初始化屏幕。
+
+### 启动早期白屏/条纹
+
+含义：bootloader 遗留的 panel/splash/DSI 状态在 Linux 接管前仍处于可见状态，导致简单帧缓冲和 DRM 接管窗口里出现短暂白屏或条纹。
+
+当前影响：已验证修复；M5h 镜像在 bootshim 阶段拉低 lmi 的 GPIO46 panel reset 后，开机不再出现白屏，DRM fbdev、backlight、ACM 串口和触摸输入仍正常。
+
+后续处理：该修复依赖 lmi 的 GPIO46 连接到 AMS667UU01 reset，只能用于 lmi 专用 bootshim；不要移植到通用 SM8250 bootshim。若后续更换面板 DTS 或启动链，需要重新确认 reset GPIO。
 
 ### `arm-smmu 15000000.iommu: Unhandled context fault ... iova=0x9c... SID=0x820/0xc20`
 
