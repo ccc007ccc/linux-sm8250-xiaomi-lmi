@@ -10,13 +10,13 @@
 
 ## UFS / userdata
 
-当前状态：UFS 已作为第一阶段稳定基线使用。`ufshcd-qcom` 能绑定，UFS PHY 正常，`sda1` 到 `sda34` 能枚举，`sda34` 能以 F2FS 挂载，initramfs 能写入 `/data/adb/lmi-mainline-logs/` 并自动重启回 Android。
+当前状态：UFS 已作为主线 Ubuntu 控制台阶段的稳定基线使用。`ufshcd-qcom` 能绑定，UFS PHY 正常，`sda1` 到 `sda34` 能枚举；当前 `/dev/sda34` 已被替换为 Ubuntu rootfs，label 为 `ubuntu-rootfs`，initramfs 能挂载后 `switch_root` 进入 Ubuntu 24.04。
 
 ### `freq-table-hz property not specified`
 
 含义：UFS 节点没有提供每个 UFS clock 的推荐频率范围，驱动使用当前 clock provider/default 频率继续运行。
 
-当前影响：非致命；不影响 UFS 枚举、分区扫描、F2FS 挂载和日志写入。
+当前影响：非致命；不影响 UFS 枚举、分区扫描、Ubuntu rootfs 挂载和 `switch_root`。
 
 后续处理：等确认 stock/downstream DTS 中与当前 `clocks` 顺序匹配的频率表后再补 `freq-table-hz`，不要猜测填写。
 
@@ -44,7 +44,7 @@
 
 含义：显示接管期间，MDSS/DPU 相关 stream 在访问 bootloader splash framebuffer 所在的 `0x9c000000` 附近地址时触发 SMMU fault。
 
-当前影响：非致命；当前 DRM fbdev、DSI panel、backlight 和自动回 Android 均正常。
+当前影响：非致命；当前 DRM fbdev、DSI panel、backlight 和 Ubuntu 控制台显示均正常。
 
 后续处理：继续作为显示接管/continuous splash/IOMMU handoff 问题跟踪。已验证关闭 simple-framebuffer 并不能减少该 fault，因此当前保留 simple-framebuffer 和 `&mdss memory-region = <&cont_splash_memory>` 的更稳定基线。
 
@@ -71,3 +71,43 @@
 当前影响：非致命；不影响当前屏幕控制台目标。
 
 后续处理：等后续适配 Adreno/GPU 或完整图形栈时再处理。
+
+## USB / Type-C / ACM 调试
+
+当前状态：PM8150B Type-C、DWC3 QCOM glue、USB HS PHY 和 configfs ACM gadget 已能支撑 Ubuntu 控制台调试。initramfs 会创建 VID/PID `1d6b:0104` 的 ACM gadget，Ubuntu 中提供 `/dev/ttyGS0` 登录，Windows 侧枚举为 COM 口。
+
+### `qcom,pmic-typec ... isr: tx_sig`
+
+含义：PM8150B Type-C 控制器上报 CC/PD PHY 相关中断，是当前 Type-C 控制器工作过程中的早期日志。
+
+当前影响：非致命；不影响 DWC3 gadget 绑定、ACM 串口枚举和 Ubuntu 串口登录。
+
+后续处理：如果后续启用更多 USB-C 角色切换、PD 协商或主机模式时出现断连，再结合 Type-C/role-switch 日志单独分析。
+
+### 软件重启不能进入 bootloader/recovery
+
+含义：当前主线内核还没有可靠接通 lmi 所需的 Qualcomm reboot-mode 后端。`reboot bootloader` 和 `reboot recovery` 会退化为普通重启，bootloader 没读到目标模式标记。
+
+当前影响：非致命但影响调试效率；需要手动进 fastboot/recovery，不能作为自动回收测试镜像的依赖。
+
+后续处理：下一步单独验证 PMIC PON、IMEM/SMEM 或 downstream reboot-mode 路径，确认 bootloader 实际读取的模式标记后再接入。
+
+## Touchscreen / FocalTech FT3518
+
+当前状态：FT3518 已能在 Ubuntu 中枚举为 `/dev/input/event0`，并确认真实触摸会上报 evdev 坐标事件。当前稳定路径是禁用硬件 `i2c13`，用 GPIO36/GPIO37 建立 `i2c-gpio` bitbang 总线；GPIO38 为 reset，GPIO39 为 IRQ，GPIO72 必须和 reset/IRQ 一起进入 active pinctrl，否则 0x38 不 ACK。
+
+### `input: generic ft5x06 (48)`
+
+含义：`edt-ft5x06` 能通过 FT3518 的通用 FocalTech 寄存器完成 probe，但该芯片的 ID 寄存器没有返回 EDT 风格型号字符串，所以驱动以 `generic ft5x06 (48)` 命名输入设备。
+
+当前影响：非致命；`/dev/input/event0` 存在，ABS/MT 坐标和 BTN_TOUCH 事件可用。
+
+后续处理：如果后续需要更准确的设备名、手势、固件管理或高级参数，再补 FT3518 专用识别和寄存器表；当前不要为改名增加不必要的协议分支。
+
+### 硬件 `i2c13` 暂时禁用
+
+含义：SM8250 GENI I2C13 在当前 DTS/GPI DMA 配置下会卡在 GPI RX DMA channel 分配，日志表现为 `EV ALLOCATE completion timeout` 和 `Failed to get rx DMA ch`。为先完成触摸功能验证，当前使用 `i2c-gpio` 绕开 GENI/GPI 路径。
+
+当前影响：非致命；bitbang I2C 足够支撑触摸枚举和事件上报，但不是最终性能/架构最优路径。
+
+后续处理：后续再单独修复 SM8250 GPI DMA/GENI I2C13，修复前不要恢复硬件 `i2c13` 触摸节点。

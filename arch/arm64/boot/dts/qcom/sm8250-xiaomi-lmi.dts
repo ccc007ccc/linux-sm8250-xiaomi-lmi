@@ -60,6 +60,35 @@
 		regulator-boot-on;
 		vin-supply = <&vph_pwr>;
 	};
+
+	i2c_touch: i2c-touch {
+		compatible = "i2c-gpio";
+		pinctrl-0 = <&touch_i2c_gpio>;
+		pinctrl-names = "default";
+		sda-gpios = <&tlmm 36 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&tlmm 37 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <5>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		touchscreen@38 {
+			compatible = "focaltech,ft3518";
+			reg = <0x38>;
+			interrupt-parent = <&tlmm>;
+			interrupts = <39 IRQ_TYPE_EDGE_FALLING>;
+			reset-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
+
+			pinctrl-0 = <&tp_active>;
+			pinctrl-1 = <&tp_sleep>;
+			pinctrl-names = "default", "sleep";
+
+			touchscreen-size-x = <1080>;
+			touchscreen-size-y = <2400>;
+
+			vcc-supply = <&vreg_l10c_3p0>;
+			iovcc-supply = <&vreg_l1c_1p8>;
+		};
+	};
 };
 
 &apps_rsc {
@@ -151,6 +180,7 @@
 		qcom,pmic-id = "c";
 
 		vdd-s8-supply = <&vph_pwr>;
+		vdd-l1-l8-supply = <&vreg_s4a_1p8>;
 		vdd-l9-l10-supply = <&vreg_bob>;
 		vdd-bob-supply = <&vph_pwr>;
 
@@ -165,6 +195,13 @@
 			regulator-name = "vreg_s8c_1p3";
 			regulator-min-microvolt = <1352000>;
 			regulator-max-microvolt = <1352000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l1c_1p8: ldo1 {
+			regulator-name = "vreg_l1c_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
@@ -276,6 +313,14 @@
 	status = "okay";
 };
 
+&gpi_dma1 {
+	status = "okay";
+};
+
+&i2c13 {
+	status = "disabled";
+};
+
 &pm8150b_typec {
 	vdd-pdphy-supply = <&vreg_l2a_3p1>;
 	status = "okay";
@@ -315,6 +360,10 @@
 &pm8150b_vbus {
 	regulator-min-microamp = <500000>;
 	regulator-max-microamp = <3000000>;
+	status = "okay";
+};
+
+&qupv3_id_1 {
 	status = "okay";
 };
 
@@ -390,5 +439,26 @@
 		function = "mdp_vsync";
 		drive-strength = <2>;
 		bias-pull-down;
+	};
+
+	touch_i2c_gpio: touch-i2c-gpio-state {
+		pins = "gpio36", "gpio37";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	tp_active: touchscreen-active-state {
+		pins = "gpio38", "gpio39", "gpio72";
+		function = "gpio";
+		drive-strength = <16>;
+		bias-pull-up;
+	};
+
+	tp_sleep: touchscreen-sleep-state {
+		pins = "gpio38", "gpio39";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
 	};
 };
