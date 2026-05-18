@@ -64,21 +64,13 @@
 
 后续处理：如果后续出现刷新异常、黑屏、帧率异常或 panel timing 调整失败，再结合 dispcc/DSI clock 配置单独分析。
 
-### `msm_dsi ae94000.dsi: supply refgen not found, using dummy regulator`
+### `dsi_err_worker: status=5`
 
-含义：DSI host 请求 `refgen` supply，但当前 DTS 没有提供该 regulator，内核使用 dummy regulator 继续。
+含义：DSI error worker 读到 panel/DSI 状态异常位，当前没有伴随 DRM connector 丢失或 framebuffer 退出。
 
-当前影响：非致命；DSI host 能绑定，panel 能显示。
+当前影响：暂按非致命记录；fbcon、`modetest -M msm`、`kmscube` 和 DSI 60/77 Hz mode 仍可用。
 
-后续处理：确认 SM8250 stock/downstream 对 refgen 供电的建模后再补齐。
-
-### `msm_dpu ae01000.display-controller: no GPU device was found`
-
-含义：MSM DRM 初始化时未找到 GPU 设备。当前阶段只验证 display controller、DSI panel 和 fbdev console。
-
-当前影响：非致命；不影响当前屏幕控制台目标。
-
-后续处理：等后续适配 Adreno/GPU 或完整图形栈时再处理。
+后续处理：如果后续出现闪屏、黑屏、ESD 恢复失败或 mode switch 不稳定，再结合 Android downstream 的 GPIO51 ESD/status 逻辑和 DSI error status 单独处理。
 
 ### HBM / FOD / DC dimming / ESD GPIO51
 
@@ -87,6 +79,26 @@
 当前影响：非致命；不影响 fbcon、普通背光、默认 60 Hz 显示或 77 Hz mode 枚举，但不代表完整 Android 显示特性已经齐全。
 
 后续处理：等进入完整图形桌面、指纹/息屏显示、高亮模式或 ESD 恢复需求时，再逐项把对应能力接到主线可接受的接口，避免把 downstream 私有 dispparam 命令一次性硬塞进基础 panel 驱动。
+
+## GPU / Adreno A650 / Freedreno
+
+当前状态：SM8250 Adreno A650 已按主线 DRM/MSM/Freedreno 路径启用。lmi DTS 只启用 SoC 已有的 `&gmu`、`&gpu` 并把 `&gpu_zap_shader` 指到 stock segmented zap `qcom/sm8250/xiaomi/lmi/a650_zap.mdt`。M11b 验证中 `/dev/dri/renderD128` 出现，GMU firmware v2.1.8 加载，`eglinfo -B` 和 `kmscube -D /dev/dri/card0` 均显示 `freedreno` / `FD650`。
+
+### `adreno 3d00000.gpu: supply vdd/vddcx not found, using dummy regulator`
+
+含义：MSM Adreno common path 会请求可选 `vdd` / `vddcx` regulator；当前主线 SM8250 GPU 节点主要通过 GPUCC GDSC、RPMh power domains、GMU 和 OPP 建模电源/频率，lmi 尚未确认存在可安全映射到这两个名字的板级 regulator。
+
+当前影响：非致命；GPU hw init 成功，render node 出现，Mesa 使用 freedreno FD650 而不是 llvmpipe。
+
+后续处理：只有后续发现 GPU 压力测试、频率切换、挂起恢复或功耗异常时，再对照 stock/downstream regulator 关系补真实 supply；不要为消日志添加假 fixed regulator。
+
+### lmi `a650_zap.mdt` firmware
+
+含义：A650 secure zap 需要设备可接受的签名 MDT + bXX 段。通用 `qcom/sm8250/a650_zap.mbn` 曾导致 `error -22 initializing firmware` 和 GMU OOB timeout。
+
+当前影响：已验证可用；firmware blob 放在 initramfs/rootfs 的 ignored `local/firmware` 路径，不进入 git。因为 `CONFIG_DRM_MSM=y` 是内建，initramfs 需要包含 `a650_sqe.fw`、`a650_gmu.bin` 和 lmi zap 段。
+
+后续处理：如果以后模块化 DRM/MSM，也要同步 modules/install、firmware 和 rootfs 路径；不要把 stock zap blob 提交到源码仓库。
 
 ## USB / Type-C / ACM 调试
 

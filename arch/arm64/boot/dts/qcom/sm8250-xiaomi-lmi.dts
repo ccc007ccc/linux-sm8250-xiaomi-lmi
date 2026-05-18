@@ -344,6 +344,18 @@
 	};
 };
 
+&gmu {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
+
+&gpu_zap_shader {
+	firmware-name = "qcom/sm8250/xiaomi/lmi/a650_zap.mdt";
+};
+
 &mdss {
 	memory-region = <&cont_splash_memory>;
 	status = "okay";
