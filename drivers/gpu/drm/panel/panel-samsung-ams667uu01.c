@@ -13,7 +13,6 @@
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
-#include <drm/drm_probe_helper.h>
 
 #define AMS667UU01_NUM_SUPPLIES 2
 
@@ -130,25 +129,56 @@ static int ams667uu01_unprepare(struct drm_panel *panel)
 	return 0;
 }
 
-static const struct drm_display_mode ams667uu01_mode = {
-	.clock = 183315,
-	.hdisplay = 1080,
-	.hsync_start = 1080 + 64,
-	.hsync_end = 1080 + 64 + 20,
-	.htotal = 1080 + 64 + 20 + 64,
-	.vdisplay = 2400,
-	.vsync_start = 2400 + 34,
-	.vsync_end = 2400 + 34 + 20,
-	.vtotal = 2400 + 34 + 20 + 34,
-	.width_mm = 71,
-	.height_mm = 158,
-	.type = DRM_MODE_TYPE_DRIVER,
+static const struct drm_display_mode ams667uu01_modes[] = {
+	{
+		.clock = 183315,
+		.hdisplay = 1080,
+		.hsync_start = 1080 + 64,
+		.hsync_end = 1080 + 64 + 20,
+		.htotal = 1080 + 64 + 20 + 64,
+		.vdisplay = 2400,
+		.vsync_start = 2400 + 34,
+		.vsync_end = 2400 + 34 + 20,
+		.vtotal = 2400 + 34 + 20 + 34,
+		.width_mm = 71,
+		.height_mm = 158,
+		.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
+	},
+	{
+		.clock = 235255,
+		.hdisplay = 1080,
+		.hsync_start = 1080 + 64,
+		.hsync_end = 1080 + 64 + 20,
+		.htotal = 1080 + 64 + 20 + 64,
+		.vdisplay = 2400,
+		.vsync_start = 2400 + 34,
+		.vsync_end = 2400 + 34 + 20,
+		.vtotal = 2400 + 34 + 20 + 34,
+		.width_mm = 71,
+		.height_mm = 158,
+		.type = DRM_MODE_TYPE_DRIVER,
+	},
 };
 
 static int ams667uu01_get_modes(struct drm_panel *panel,
 				       struct drm_connector *connector)
 {
-	return drm_connector_helper_get_modes_fixed(connector, &ams667uu01_mode);
+	struct drm_display_mode *mode;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(ams667uu01_modes); i++) {
+		mode = drm_mode_duplicate(connector->dev, &ams667uu01_modes[i]);
+		if (!mode)
+			return -ENOMEM;
+
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+	}
+
+	connector->display_info.width_mm = ams667uu01_modes[0].width_mm;
+	connector->display_info.height_mm = ams667uu01_modes[0].height_mm;
+
+	return ARRAY_SIZE(ams667uu01_modes);
 }
 
 static const struct drm_panel_funcs ams667uu01_panel_funcs = {

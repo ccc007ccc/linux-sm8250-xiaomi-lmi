@@ -81,6 +81,10 @@ properties:
   dma-channel-mask:
     maxItems: 1
 
+  qcom,gpi-ee-offset:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Offset from controller base to execution environment registers.
+
   dma-coherent: true
 
 required:

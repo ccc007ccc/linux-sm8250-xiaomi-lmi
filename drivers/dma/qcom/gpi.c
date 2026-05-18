@@ -2189,7 +2189,9 @@ static int gpi_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ee_offset = (uintptr_t)device_get_match_data(gpi_dev->dev);
+	if (of_property_read_u32(gpi_dev->dev->of_node, "qcom,gpi-ee-offset", &ee_offset))
+		ee_offset = (uintptr_t)device_get_match_data(gpi_dev->dev);
+
 	gpi_dev->ee_base = gpi_dev->ee_base - ee_offset;
 
 	gpi_dev->ev_factor = EV_FACTOR;
