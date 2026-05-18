@@ -100,6 +100,26 @@
 
 后续处理：如果以后模块化 DRM/MSM，也要同步 modules/install、firmware 和 rootfs 路径；不要把 stock zap blob 提交到源码仓库。
 
+## Power / PM8150B charger / fuel-gauge
+
+当前状态：PM8150B Type-C/TCPM/VBUS、SMB5 charger 和 gen4 fuel-gauge 已按普通充电路线接通。M14 验证 `/sys/class/power_supply` 出现 `pm8150b-charger`、`qcom-battery` 和 TCPM supply，并在标准 PD 电源上协商到 9V/2A；M15 验证 `pm8150b-charger` 在 USB online 时能上报 `voltage_now` 和 `current_now`。
+
+### `deferred probe pending: qcom-smbx-charger: Couldn't get usbin_v IIO channel`
+
+含义：PM8150B charger 是 built-in，probe 时需要 `ADC5_USB_IN_I` / `ADC5_USB_IN_V_16` IIO channel；M13 中 ADC5/VADC/ADC_TM 仍是模块，导致 charger 和 fuel-gauge 持续 deferred probe。
+
+当前影响：已验证修复；`CONFIG_QCOM_VADC_COMMON=y`、`CONFIG_QCOM_SPMI_ADC5=y`、`CONFIG_QCOM_SPMI_ADC_TM5=y` 后，M14 起 charger/FG 能随内核内建路径正常 probe。
+
+后续处理：只要 `CONFIG_CHARGER_QCOM_SMB2=y` 和 `CONFIG_BATTERY_QCOM_FG=y` 维持 built-in，就保持 ADC provider 也是 built-in；如果后续模块化电源栈，需要同步验证模块加载和 IIO probe 顺序。
+
+### `pm8150b-charger` 在 `Full` 状态下输入电压/电流为 0
+
+含义：早期 SMB5 backport 复用了按 `POWER_SUPPLY_STATUS_CHARGING` 判断的 helper，导致 USB 已在线但电池状态不是 `Charging` 时不读取 `usbin_v/usbin_i` IIO。
+
+当前影响：已验证修复；M15 改为按 `smb_get_prop_usb_online()` 判断是否读取 IIO，当前普通 5V 输入下 `pm8150b-charger` 上报 `voltage_now=4623520`、`current_now=442470`。
+
+后续处理：后续接 PD 电源时继续确认 TCPM 的 9V/2A 与 charger 侧 IIO 读数同时合理；如果加入限充/停充策略，也不要把输入电压/电流上报重新绑定到电池是否正在充电。
+
 ## USB / Type-C / ACM 调试
 
 当前状态：PM8150B Type-C、DWC3 QCOM glue、USB HS PHY 和 configfs ACM gadget 已能支撑 Ubuntu 控制台调试。initramfs 会创建 VID/PID `1d6b:0104` 的 ACM gadget，Ubuntu 中提供 `/dev/ttyGS0` 登录，Windows 侧枚举为 COM 口。
