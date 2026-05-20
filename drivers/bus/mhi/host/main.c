@@ -31,6 +31,57 @@ module_param_named(sbl_accept_multi_tre_completion,
 MODULE_PARM_DESC(sbl_accept_multi_tre_completion,
 		 "Accept downstream-style multi-TRE completions on SBL boot channels");
 
+#define MHI_SBL_SAHARA_MIN_LEN		8
+#define MHI_SBL_SAHARA_MAX_LEN		4096
+#define MHI_SBL_SAHARA_CMD_HELLO		1
+#define MHI_SBL_SAHARA_CMD_READ_DATA	3
+#define MHI_SBL_SAHARA_CMD_END_IMAGE	4
+#define MHI_SBL_SAHARA_CMD_DONE_RESP	6
+#define MHI_SBL_SAHARA_CMD_RESET_RESP	8
+#define MHI_SBL_SAHARA_CMD_READY		11
+#define MHI_SBL_SAHARA_CMD_EXEC_RESP	14
+
+static bool mhi_sbl_sahara_len_valid(u32 cmd, u32 pkt_len)
+{
+	switch (cmd) {
+	case MHI_SBL_SAHARA_CMD_HELLO:
+		return pkt_len == 48;
+	case MHI_SBL_SAHARA_CMD_READ_DATA:
+		return pkt_len == 20;
+	case MHI_SBL_SAHARA_CMD_END_IMAGE:
+		return pkt_len == 16;
+	case MHI_SBL_SAHARA_CMD_DONE_RESP:
+		return pkt_len == 12;
+	case MHI_SBL_SAHARA_CMD_RESET_RESP:
+	case MHI_SBL_SAHARA_CMD_READY:
+		return pkt_len == 8;
+	case MHI_SBL_SAHARA_CMD_EXEC_RESP:
+		return pkt_len == 16;
+	default:
+		return false;
+	}
+}
+
+static u16 mhi_sbl_infer_rx_len(const struct mhi_buf_info *buf_info,
+					const __le32 **out_words)
+{
+	const __le32 *words = buf_info->cb_buf;
+	u32 cmd, pkt_len;
+
+	*out_words = words;
+	if (!words || buf_info->len < MHI_SBL_SAHARA_MIN_LEN)
+		return 0;
+
+	cmd = le32_to_cpu(words[0]);
+	pkt_len = le32_to_cpu(words[1]);
+
+	if (!mhi_sbl_sahara_len_valid(cmd, pkt_len) ||
+	    pkt_len > buf_info->len || pkt_len > MHI_SBL_SAHARA_MAX_LEN)
+		return 0;
+
+	return pkt_len;
+}
+
 int __must_check mhi_read_reg(struct mhi_controller *mhi_cntrl,
 			      void __iomem *base, u32 offset, u32 *out)
 {
@@ -813,10 +864,14 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 		}
 
 		while (local_rp != dev_rp) {
+			const __le32 *inferred_words = NULL;
+			bool skipped_tre;
+
 			buf_info = buf_ring->rp;
+			skipped_tre = accepted_multi_tre_completion && local_rp != ev_tre;
 			if (local_rp == ev_tre)
 				xfer_len = MHI_TRE_GET_EV_LEN(event);
-			else if (accepted_multi_tre_completion)
+			else if (skipped_tre)
 				xfer_len = 0;
 			else
 				xfer_len = buf_info->len;
@@ -826,6 +881,18 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 				mhi_cntrl->unmap_single(mhi_cntrl, buf_info);
 
 			result.buf_addr = buf_info->cb_buf;
+			if (skipped_tre && mhi_chan->dir == DMA_FROM_DEVICE) {
+				xfer_len = mhi_sbl_infer_rx_len(buf_info, &inferred_words);
+				if (inferred_words && buf_info->len >= MHI_SBL_SAHARA_MIN_LEN)
+					dev_warn(dev,
+						 "SBL channel %u skipped RX TRE cmd %u pkt_len %u inferred_len %u buf_len %zu tre_rp 0x%llx ev_tre 0x%llx\n",
+						 mhi_chan->chan, le32_to_cpu(inferred_words[0]),
+						 le32_to_cpu(inferred_words[1]), xfer_len, buf_info->len,
+						 (unsigned long long)(tre_ring->iommu_base +
+							((u8 *)local_rp - (u8 *)tre_ring->base)),
+						 (unsigned long long)(tre_ring->iommu_base +
+							((u8 *)ev_tre - (u8 *)tre_ring->base)));
+			}
 
 			/* truncate to buf len if xfer_len is larger */
 			result.bytes_xferd =

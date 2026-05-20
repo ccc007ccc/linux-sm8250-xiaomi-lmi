@@ -522,6 +522,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M78 排除了“image40 DONE 后必须先进入 CMD_READY / `-a 9:mdmddr` command-exec 才会继续”的分支，并把阻塞点推进到 image41/devcfg 首段之后。下一步应在干净 reboot 后对 image41 使用同 fd follow 或边界 stop 诊断，确认 image41 0/52 后是否需要更长等待、不同 close/restart cadence，或后续 image41 offset 请求被当前 release-time RESET 打断；仍只响应真实 `READ_DATA`，如果没有 `CMD_READY` 就不发送 `CMD_EXEC`。若 image41 后仍不能推进，应继续回到 Android ESOC `IMG_XFER_DONE` / `BOOT_DONE` 与 downstream MHI channel lifecycle 差异，不扩大到 SIM、APN、IMS、VoLTE、ModemManager、EDL、firehose、NV 或 modem 分区写入。
 
+### M79/M80 SBL multi-TRE skipped RX 诊断
+
+含义：M79 复测 M78 的 image41 follow 时没有再次进入 image41，而是在 image40 `DONE` 后只收到 post-DONE HELLO 和 20 字节全零包。dmesg 同期显示 SAHARA DL channel 3 的 event pointer 跳过一个 RX TRE；M80 因此保留 downstream-style multi-TRE completion 接受路径，但只从被跳过 RX buffer 的 Sahara 短包头推断有效长度，未知或无效包头继续作为 0 字节 completion 丢弃，避免把整块 MTU 误送到 userspace。
+
+当前影响：M80 内核构建通过，boot-only 镜像只刷 `boot` 后实机复测仍能完成 image34 两段、image40 offset 0/52、52/96、4096/6712、12288/1220、`END_OF_IMAGE image=40 status=0` 和 host `DONE`。随后收到 48 字节 HELLO、完成 HELLO_RESP，再收到 20 字节全零包，未恢复 image40 `DONE_RESP` 或 image41/devcfg。新增 dmesg 证据显示被跳过 RX TRE 为 `cmd 0 pkt_len 0 inferred_len 0 buf_len 32768`，真正的 48 字节 HELLO 在下一 TRE，后续 20 字节零包也由独立 event 上报；最终仍为 `AP2MDM_STATUS=1 AP2MDM_ERRFATAL=0 MDM2AP_STATUS=0 MDM2AP_ERRFATAL=0 cached/reg=SECONDARY BOOTLOADER/M0 pm_state=0x4`。
+
+后续处理：M80 排除了“DONE_RESP 或 image41/devcfg 藏在被跳过 RX TRE 中但被内核丢弃”这一分支。下一步应继续对照 Android downstream ESOC `IMG_XFER_DONE` / `BOOT_DONE`、`ks` 退出重入语义和 MHI UCI channel lifecycle，重点看 post-DONE HELLO/HELLO_RESP 后为什么 SBL 返回 20 字节零包而不是下一段 READ_DATA；若继续改内核，应只增加针对 skipped invalid buffer 与 event ring 状态的诊断或调整 `mhi_sahara_diag` RX 生命周期，仍不读 BL、不主动发送未请求 payload、不写 NV/modem 分区。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
