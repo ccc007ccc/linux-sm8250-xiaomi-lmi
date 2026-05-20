@@ -530,6 +530,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M80 排除了“DONE_RESP 或 image41/devcfg 藏在被跳过 RX TRE 中但被内核丢弃”这一分支。下一步应继续对照 Android downstream ESOC `IMG_XFER_DONE` / `BOOT_DONE`、`ks` 退出重入语义和 MHI UCI channel lifecycle，重点看 post-DONE HELLO/HELLO_RESP 后为什么 SBL 返回 20 字节零包而不是下一段 READ_DATA；若继续改内核，应只增加针对 skipped invalid buffer 与 event ring 状态的诊断或调整 `mhi_sahara_diag` RX 生命周期，仍不读 BL、不主动发送未请求 payload、不写 NV/modem 分区。
 
+### M81/M82 SAHARA 同 fd 连续读取与主动 drain 诊断
+
+含义：M81 在 `lmi-sahara-loader.py` 中新增默认关闭的 `--continuous`，并在 rootfs `lmi-sahara-test` 中暴露 `KS_CONTINUOUS`，让 HELLO、READ_DATA 和 pending `DONE_RESP` 分支不立即 close/reopen，而是保持同一 fd 继续读取，以验证 Android `ks` 单 fd 状态机是否能直接复现。M82 又新增默认关闭的 `--active-read-drain` / `--active-read-interval`，rootfs 对应 `ACTIVE_READ_DRAIN` / `ACTIVE_READ_INTERVAL`，在连续模式下绕过 `select()` 等待、用短间隔主动非阻塞 `read()`，用于排除用户态 poll/select 唤醒丢失。
+
+当前影响：干净 SBL/M0 上，M81/M82 均稳定复现“同一 open 只收到一个包”：session 1 收到 48 字节 HELLO 并完成 HELLO_RESP 后 idle timeout；session 2 close/reopen 后才收到 `READ_DATA image=34 offset=0 length=40` 并完成 40 字节 UL；session 3 再次 close/reopen 后才收到 `READ_DATA image=34 offset=40 length=1596` 并完成 1596 字节 UL。M82 主动 drain 没有改变该行为。dmesg 同步确认每次 UL completion 后 45 秒内没有新的 DL event，下一包只在 close 触发 SAHARA channel RESET/START 后出现；结束后只读状态仍为 `AP2MDM_STATUS=1 AP2MDM_ERRFATAL=0 MDM2AP_STATUS=0 MDM2AP_ERRFATAL=0 cached/reg=SECONDARY BOOTLOADER/M0 pm_state=0x4`，未触发 `SYS_ERROR`。
+
+后续处理：M81/M82 排除了“用户态保持 fd 不够久”“`select()` 漏唤醒”和“主动读 drain 不及时”作为当前主因。结合下游 Android UCI 也会在 open 时排满 RX TRE、本地 `mhi_sahara_diag` 已在读取后重排 RX buffer，以及 Android `ks` 反编译显示 MHI pipe fd 只在 Sahara 状态机外层打开/关闭，下一步应转向 kernel/channel 层证据：对比 downstream MHI channel START/RESET、doorbell、runtime wake 和 ESOC client lifecycle，解释为什么 SDX55M SBL 只有在 host release-time RESET/START 后才发下一条 Sahara 包。继续避免猜 HELLO mode，不读 BL，不主动发送未请求 payload，不写 NV/modem/dtbo/recovery/vbmeta，也不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。

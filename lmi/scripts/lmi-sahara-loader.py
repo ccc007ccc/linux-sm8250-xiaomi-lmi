@@ -466,6 +466,8 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
         send_hello_resp(fd, words, args, hello_mode_override)
         if target_mode == 3 and args.mode3_close_delay >= 0:
             return "mode3_close", 0, None
+        if args.continuous:
+            return "progress", 0, None
         return "restart", 0, None
     if cmd == CMD_READ_DATA:
         if len(words) < 5:
@@ -495,6 +497,8 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
            (follow_image < 0 or follow_image == image) and \
            offset >= args.read_data_follow_min_offset:
             return "read_data_follow", sent, image
+        if args.continuous:
+            return "progress", sent, image
         return "restart", sent, image
     if cmd == CMD_END_OF_IMAGE:
         image = words[2] if len(words) > 2 else None
@@ -506,6 +510,8 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
                 enable_keep_prepared(args)
             if args.ks_pending_timeout > 0:
                 return "ks_pending_wait_done_resp", 0, None
+            if args.continuous:
+                return "progress", 0, None
             if args.done_wait_timeout > 0:
                 return "done_wait", 0, None
             if args.unsafe_done_restart:
@@ -528,6 +534,8 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
                 return "ks_pending_wait_hello", 0, None
             if args.done_resp_follow_timeout > 0:
                 return "done_resp_follow", 0, None
+            if args.continuous:
+                return "progress", 0, None
             if args.unsafe_done_restart:
                 return "done_resp_restart", 0, None
             return "stop", 0, None
@@ -621,12 +629,17 @@ def run_session(fat, args, index):
                     close_reason = "hold_after_image"
                 log("session", f"{index} {close_reason}_timeout packets={packets} bytes_sent={bytes_sent}")
                 return packets, bytes_sent, close_reason
-            readable, _, _ = select.select([fd], [], [], min(remaining, 1.0))
-            if not readable:
-                continue
             try:
-                data = os.read(fd, args.read_size)
+                if args.active_read_drain:
+                    data = os.read(fd, args.read_size)
+                else:
+                    readable, _, _ = select.select([fd], [], [], min(remaining, 1.0))
+                    if not readable:
+                        continue
+                    data = os.read(fd, args.read_size)
             except BlockingIOError:
+                if args.active_read_drain:
+                    time.sleep(min(max(args.active_read_interval, 0.001), max(remaining, 0.0)))
                 continue
             if not data:
                 log("session", f"{index} eof packets={packets} bytes_sent={bytes_sent}")
@@ -760,6 +773,9 @@ def parse_args():
     parser.add_argument("--idle-timeout", type=float, default=90.0)
     parser.add_argument("--between-sessions", type=float, default=2.0)
     parser.add_argument("--restart-after-packet-delay", type=float, default=1.0)
+    parser.add_argument("--continuous", action="store_true")
+    parser.add_argument("--active-read-drain", action="store_true")
+    parser.add_argument("--active-read-interval", type=float, default=0.02)
     parser.add_argument("--done-restart-delay", type=float, default=-1.0)
     parser.add_argument("--done-hello-close-image", type=int, default=-2)
     parser.add_argument("--done-hello-close-delay", type=float, default=1.0)
