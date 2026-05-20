@@ -29,3 +29,10 @@ config MHI_BUS_PCI_GENERIC
 	  This driver provides MHI PCI controller driver for devices such as
 	  Qualcomm SDX55 based PCIe modems.
 
+config MHI_SAHARA_DIAG
+	tristate "MHI Sahara diagnostic character device"
+	depends on MHI_BUS
+	help
+	  Exposes MHI SAHARA bootloader channels through a character device
+	  for local modem bring-up diagnostics.
+

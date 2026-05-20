@@ -18,6 +18,22 @@
 #include <linux/wait.h>
 #include "internal.h"
 
+static uint mhi_sbl_fw_poll_delay_ms = 500;
+module_param_named(sbl_fw_poll_delay_ms, mhi_sbl_fw_poll_delay_ms, uint, 0644);
+MODULE_PARM_DESC(sbl_fw_poll_delay_ms,
+		 "Delay before fallback polling firmware-loaded devices for SBL/Mission state");
+
+static bool mhi_sbl_fw_poll_force_transition = true;
+module_param_named(sbl_fw_poll_force_transition,
+		   mhi_sbl_fw_poll_force_transition, bool, 0644);
+MODULE_PARM_DESC(sbl_fw_poll_force_transition,
+		 "Enable fallback firmware-load polling and forced SBL/Mission transition");
+
+static bool mhi_sbl_fw_poll_force_m0 = true;
+module_param_named(sbl_fw_poll_force_m0, mhi_sbl_fw_poll_force_m0, bool, 0644);
+MODULE_PARM_DESC(sbl_fw_poll_force_m0,
+		 "Force M0 PM transition after fallback firmware-load polling");
+
 /* Setup RDDM vector table for RDDM transfer and program RXVEC */
 int mhi_rddm_prepare(struct mhi_controller *mhi_cntrl,
 		     struct image_info *img_info)
@@ -477,9 +493,14 @@ void mhi_fw_load_handler(struct mhi_controller *mhi_cntrl)
 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
 	enum mhi_fw_load_type fw_load_type;
 	enum mhi_pm_state new_state;
+	enum mhi_state state;
+	enum mhi_ee_type ee;
 	const char *fw_name;
+	const char *fw_load_desc;
 	const u8 *fw_data;
 	size_t size, fw_sz;
+	unsigned long flags;
+	bool pending_transition, enter_m0;
 	int ret;
 
 	if (MHI_PM_IN_ERROR_STATE(mhi_cntrl->pm_state)) {
@@ -499,6 +520,14 @@ void mhi_fw_load_handler(struct mhi_controller *mhi_cntrl)
 
 	fw_name = (mhi_cntrl->ee == MHI_EE_EDL) ?
 		mhi_cntrl->edl_image : mhi_cntrl->fw_image;
+
+	dev_info(dev,
+		 "Firmware load path: EE %s fw %s fbc %d sbl_size %zu seg_len %zu fw_data %s fw_sz %zu\n",
+		 TO_MHI_EXEC_STR(mhi_cntrl->ee), fw_name ?: "(none)",
+		 mhi_cntrl->fbc_download, mhi_cntrl->sbl_size,
+		 mhi_cntrl->seg_len,
+		 mhi_cntrl->fw_data ? "present" : "absent",
+		 mhi_cntrl->fw_sz);
 
 	/* check if the driver has already provided the firmware data */
 	if (!fw_name && mhi_cntrl->fbc_download &&
@@ -538,6 +567,10 @@ void mhi_fw_load_handler(struct mhi_controller *mhi_cntrl)
 
 skip_req_fw:
 	fw_load_type = mhi_fw_load_type_get(mhi_cntrl);
+	fw_load_desc = fw_load_type == MHI_FW_LOAD_FBC ? "FBC" :
+		fw_load_type == MHI_FW_LOAD_BHIE ? "BHIE" : "BHI";
+	dev_info(dev, "Loading firmware stage via %s: stage_size %zu total_size %zu\n",
+		 fw_load_desc, size, fw_sz);
 	if (fw_load_type == MHI_FW_LOAD_BHIE)
 		ret = mhi_load_image_bhie(mhi_cntrl, fw_data, size);
 	else
@@ -577,12 +610,15 @@ skip_req_fw:
 			fw_sz -= mhi_cntrl->sbl_size;
 		}
 
+		dev_info(dev, "Preparing FBC AMSS payload: payload_size %zu\n", fw_sz);
 		ret = mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->fbc_image, fw_sz);
 		if (ret) {
 			release_firmware(firmware);
 			goto error_fw_load;
 		}
 
+		dev_info(dev, "Prepared FBC vector table: entries %u\n",
+			 mhi_cntrl->fbc_image->entries);
 		/* Load the firmware into BHIE vec table */
 		mhi_firmware_copy_bhie(mhi_cntrl, fw_data, fw_sz, mhi_cntrl->fbc_image);
 	}
@@ -598,6 +634,47 @@ fw_load_ready_state:
 	}
 
 	dev_info(dev, "Wait for device to enter SBL or Mission mode\n");
+
+	if (!mhi_sbl_fw_poll_force_transition) {
+		dev_info(dev, "Skipping firmware-load fallback poll\n");
+		return;
+	}
+
+	if (mhi_sbl_fw_poll_delay_ms)
+		msleep(mhi_sbl_fw_poll_delay_ms);
+	spin_lock_irqsave(&mhi_cntrl->transition_lock, flags);
+	pending_transition = !list_empty(&mhi_cntrl->transition_list);
+	spin_unlock_irqrestore(&mhi_cntrl->transition_lock, flags);
+	if (!pending_transition && MHI_FW_LOAD_CAPABLE(mhi_cntrl->ee)) {
+		ee = mhi_get_exec_env(mhi_cntrl);
+		state = mhi_get_mhi_state(mhi_cntrl);
+		dev_info(dev, "Polled device after firmware load: EE %s, state %s\n",
+			 TO_MHI_EXEC_STR(ee), mhi_state_str(state));
+		read_lock_bh(&mhi_cntrl->pm_lock);
+		enter_m0 = state == MHI_STATE_M0 &&
+			   mhi_cntrl->pm_state != MHI_PM_M0;
+		read_unlock_bh(&mhi_cntrl->pm_lock);
+		if (enter_m0) {
+			if (mhi_sbl_fw_poll_force_m0) {
+				dev_info(dev, "Forcing M0 transition after firmware load poll\n");
+				mhi_pm_m0_transition(mhi_cntrl);
+			} else {
+				dev_info(dev, "Skipping forced M0 transition after firmware load poll\n");
+			}
+		}
+		switch (ee) {
+		case MHI_EE_SBL:
+			mhi_queue_state_transition(mhi_cntrl, DEV_ST_TRANSITION_SBL);
+			break;
+		case MHI_EE_WFW:
+		case MHI_EE_AMSS:
+			mhi_queue_state_transition(mhi_cntrl,
+						 DEV_ST_TRANSITION_MISSION_MODE);
+			break;
+		default:
+			break;
+		}
+	}
 	return;
 
 error_ready_state:
@@ -621,9 +698,13 @@ int mhi_download_amss_image(struct mhi_controller *mhi_cntrl)
 	enum mhi_pm_state new_state;
 	int ret;
 
-	if (!image_info)
+	if (!image_info) {
+		dev_info(dev, "AMSS download skipped: no FBC image prepared\n");
 		return -EIO;
+	}
 
+	dev_info(dev, "Starting FBC AMSS download: entries %u\n",
+		 image_info->entries);
 	ret = mhi_fw_load_bhie(mhi_cntrl,
 			       /* Vector table is the last entry */
 			       &image_info->mhi_buf[image_info->entries - 1]);
@@ -634,6 +715,8 @@ int mhi_download_amss_image(struct mhi_controller *mhi_cntrl)
 		write_unlock_irq(&mhi_cntrl->pm_lock);
 		if (new_state == MHI_PM_FW_DL_ERR)
 			wake_up_all(&mhi_cntrl->state_event);
+	} else {
+		dev_info(dev, "FBC AMSS download request completed\n");
 	}
 
 	return ret;

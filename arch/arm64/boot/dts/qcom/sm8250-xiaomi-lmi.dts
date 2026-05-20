@@ -79,6 +79,16 @@
 		vin-supply = <&vph_pwr>;
 	};
 
+	sdx55m-esoc-diag {
+		compatible = "xiaomi,lmi-sdx55m-esoc-diag";
+		modem-pmic = <&sdx55m_modem_pmic>;
+		modem-pon-base = <0x800>;
+		ap2mdm-status-gpios = <&tlmm 56 GPIO_ACTIVE_HIGH>;
+		ap2mdm-errfatal-gpios = <&tlmm 57 GPIO_ACTIVE_HIGH>;
+		mdm2ap-status-gpios = <&tlmm 3 GPIO_ACTIVE_HIGH>;
+		mdm2ap-errfatal-gpios = <&tlmm 1 GPIO_ACTIVE_HIGH>;
+	};
+
 	qca6390-pmu {
 		compatible = "qcom,qca6390-pmu";
 
@@ -415,6 +425,17 @@
 	status = "okay";
 };
 
+&pcie2 {
+	pinctrl-0 = <&pcie2_default_state &mdm2ap_default &ap2mdm_default>;
+	status = "okay";
+};
+
+&pcie2_phy {
+	vdda-phy-supply = <&vreg_l5a_0p875>;
+	vdda-pll-supply = <&vreg_l9a_1p2>;
+	status = "okay";
+};
+
 &pcieport0 {
 	wifi@0 {
 		compatible = "pci17cb,1101";
@@ -516,6 +537,15 @@
 	mode-bootloader = <0x2>;
 	mode-fastboot = <0x2>;
 	mode-recovery = <0x1>;
+};
+
+&spmi_bus {
+	sdx55m_modem_pmic: pmic@8 {
+		compatible = "qcom,spmi-pmic";
+		reg = <0x8 SPMI_USID>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
 };
 
 &qupv3_id_0 {
@@ -634,6 +664,30 @@
 		bias-pull-down;
 	};
 
+	mdm2ap_default: mdm2ap-default-state {
+		pins = "gpio1", "gpio3";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	ap2mdm_default: ap2mdm-default-state {
+		ap2mdm-status-pins {
+			pins = "gpio56";
+			function = "gpio";
+			drive-strength = <16>;
+			output-low;
+			bias-disable;
+		};
+
+		ap2mdm-errfatal-pins {
+			pins = "gpio57";
+			function = "gpio";
+			drive-strength = <16>;
+			output-low;
+			bias-disable;
+		};
+	};
 
 	tp_active: touchscreen-active-state {
 		pins = "gpio38", "gpio39", "gpio72";

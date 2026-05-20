@@ -798,10 +798,13 @@ void mhi_pm_sys_err_handler(struct mhi_controller *mhi_cntrl)
 void mhi_pm_st_worker(struct work_struct *work)
 {
 	struct state_transition *itr, *tmp;
+	struct device *dev;
 	LIST_HEAD(head);
 	struct mhi_controller *mhi_cntrl = container_of(work,
 							struct mhi_controller,
 							st_worker);
+
+	dev = &mhi_cntrl->mhi_dev->dev;
 
 	spin_lock_irq(&mhi_cntrl->transition_lock);
 	list_splice_tail_init(&mhi_cntrl->transition_list, &head);
@@ -830,8 +833,12 @@ void mhi_pm_st_worker(struct work_struct *work)
 			 * either SBL or AMSS states
 			 */
 			mhi_create_devices(mhi_cntrl);
-			if (mhi_cntrl->fbc_download)
+			if (mhi_cntrl->fbc_download) {
+				dev_info(dev, "SBL transition: starting FBC AMSS download\n");
 				mhi_download_amss_image(mhi_cntrl);
+			} else {
+				dev_info(dev, "SBL transition: FBC disabled, skipping AMSS download\n");
+			}
 
 			mhi_uevent_notify(mhi_cntrl, mhi_cntrl->ee);
 			break;

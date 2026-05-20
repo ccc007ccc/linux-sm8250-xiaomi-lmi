@@ -60,8 +60,13 @@ static int mhi_debugfs_events_show(struct seq_file *m, void *d)
 			continue;
 		}
 
-		seq_printf(m, "Index: %d intmod count: %lu time: %lu",
-			   i, (le32_to_cpu(er_ctxt->intmod) & EV_CTX_INTMODC_MASK) >>
+		seq_printf(m,
+			   "Index: %d type: 0x%x msivec: %u irq: %u linux_irq: %d intmod count: %lu time: %lu",
+			   i, le32_to_cpu(er_ctxt->ertype),
+			   le32_to_cpu(er_ctxt->msivec), mhi_event->irq,
+			   mhi_event->irq < mhi_cntrl->nr_irqs ?
+			   mhi_cntrl->irq[mhi_event->irq] : -1,
+			   (le32_to_cpu(er_ctxt->intmod) & EV_CTX_INTMODC_MASK) >>
 			   __ffs(EV_CTX_INTMODC_MASK),
 			   (le32_to_cpu(er_ctxt->intmod) & EV_CTX_INTMODT_MASK) >>
 			   __ffs(EV_CTX_INTMODT_MASK));

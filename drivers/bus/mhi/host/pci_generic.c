@@ -10,16 +10,33 @@
 
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
 #include <linux/mhi.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
+#include <linux/spmi.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
+
+#include "internal.h"
 
 #define MHI_PCI_DEFAULT_BAR_NUM 0
 
 #define MHI_POST_RESET_DELAY_MS 2000
+#define MHI_SDX55M_AP2MDM_STATUS_DELAY_MS 150
+#define MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS 2000
+#define MHI_SDX55M_ESOC_POLL_INTERVAL_MS 500
+#define MHI_SDX55M_ESOC_POLL_SAMPLES 24
+#define MHI_SDX55M_MODEM_PON_BASE 0x800
+#define MHI_SDX55M_PON_SW_RST_S2_CTL 0x62
+#define MHI_SDX55M_PON_SW_RST_S2_CTL2 0x63
+#define MHI_SDX55M_PON_SW_RST_GO 0x64
+#define MHI_SDX55M_PON_WARM_RESET 0x01
+#define MHI_SDX55M_PON_RESET_EN 0x80
+#define MHI_SDX55M_PON_SW_RST_GO_VAL 0xa5
 
 #define HEALTH_CHECK_PERIOD (HZ * 2)
 
@@ -237,6 +254,76 @@ struct mhi_pci_dev_info {
 		.channel = ch_num,		\
 	}
 
+#define MHI_EVENT_CONFIG_CTRL_IRQ(el_count, irq_idx) \
+	{\
+		.num_elements = el_count,\
+		.irq_moderation_ms = 0,\
+		.irq = irq_idx,\
+		.channel = U32_MAX,\
+		.priority = 1,\
+		.mode = MHI_DB_BRST_DISABLE,\
+		.data_type = MHI_ER_CTRL,\
+		.hardware_event = false,\
+		.client_managed = false,\
+		.offload_channel = false,\
+	}
+
+#define MHI_EVENT_CONFIG_SW_DATA_IRQ(el_count, irq_idx) \
+	{\
+		.num_elements = el_count,\
+		.irq_moderation_ms = 0,\
+		.irq = irq_idx,\
+		.channel = U32_MAX,\
+		.priority = 1,\
+		.mode = MHI_DB_BRST_DISABLE,\
+		.data_type = MHI_ER_DATA,\
+		.hardware_event = false,\
+		.client_managed = false,\
+		.offload_channel = false,\
+	}
+
+#define MHI_EVENT_CONFIG_HW_DATA_IRQ(el_count, irq_idx, intmod, ch_num, brstmode) \
+	{\
+		.num_elements = el_count,\
+		.irq_moderation_ms = intmod,\
+		.irq = irq_idx,\
+		.channel = ch_num,\
+		.priority = 1,\
+		.mode = brstmode,\
+		.data_type = MHI_ER_DATA,\
+		.hardware_event = true,\
+		.client_managed = false,\
+		.offload_channel = false,\
+	}
+
+#define MHI_EVENT_CONFIG_OFFLOAD(el_count, intmod) \
+	{\
+		.num_elements = el_count,\
+		.irq_moderation_ms = intmod,\
+		.irq = 0,\
+		.channel = U32_MAX,\
+		.priority = 1,\
+		.mode = MHI_DB_BRST_ENABLE,\
+		.data_type = MHI_ER_DATA,\
+		.hardware_event = false,\
+		.client_managed = true,\
+		.offload_channel = true,\
+	}
+
+#define MHI_EVENT_CONFIG_HW_OFFLOAD(ch_num) \
+	{\
+		.num_elements = 0,\
+		.irq_moderation_ms = 0,\
+		.irq = 0,\
+		.channel = ch_num,\
+		.priority = 1,\
+		.mode = MHI_DB_BRST_ENABLE,\
+		.data_type = MHI_ER_DATA,\
+		.hardware_event = true,\
+		.client_managed = true,\
+		.offload_channel = true,\
+	}
+
 static const struct mhi_channel_config mhi_qcom_qdu100_channels[] = {
 	MHI_CHANNEL_CONFIG_UL(0, "LOOPBACK", 32, 2),
 	MHI_CHANNEL_CONFIG_DL(1, "LOOPBACK", 32, 2),
@@ -330,6 +417,39 @@ static const struct mhi_channel_config modem_qcom_v1_mhi_channels[] = {
 	MHI_CHANNEL_CONFIG_HW_DL(101, "IP_HW0", 128, 5),
 };
 
+static const struct mhi_channel_config mhi_qcom_sdx55_channels[] = {
+	MHI_CHANNEL_CONFIG_UL(0, "LOOPBACK", 64, 2),
+	MHI_CHANNEL_CONFIG_DL(1, "LOOPBACK", 64, 2),
+	MHI_CHANNEL_CONFIG_UL_SBL(2, "SAHARA", 128, 1),
+	MHI_CHANNEL_CONFIG_DL_SBL(3, "SAHARA", 128, 1),
+	MHI_CHANNEL_CONFIG_UL(4, "DIAG", 64, 1),
+	MHI_CHANNEL_CONFIG_DL(5, "DIAG", 64, 3),
+	MHI_CHANNEL_CONFIG_UL(8, "QDSS", 64, 1),
+	MHI_CHANNEL_CONFIG_DL(9, "QDSS", 128, 1),
+	MHI_CHANNEL_CONFIG_UL(10, "EFS", 64, 1),
+	MHI_CHANNEL_CONFIG_DL(11, "EFS", 64, 1),
+	MHI_CHANNEL_CONFIG_UL(14, "QMI0", 64, 1),
+	MHI_CHANNEL_CONFIG_DL(15, "QMI0", 64, 2),
+	MHI_CHANNEL_CONFIG_UL(16, "QMI1", 64, 3),
+	MHI_CHANNEL_CONFIG_DL(17, "QMI1", 64, 3),
+	MHI_CHANNEL_CONFIG_UL(18, "IP_CTRL", 64, 1),
+	MHI_CHANNEL_CONFIG_DL(19, "IP_CTRL", 64, 1),
+	MHI_CHANNEL_CONFIG_UL(20, "IPCR", 64, 2),
+	MHI_CHANNEL_CONFIG_DL(21, "IPCR", 64, 2),
+	MHI_CHANNEL_CONFIG_UL(22, "TF", 64, 2),
+	MHI_CHANNEL_CONFIG_DL(23, "TF", 64, 2),
+	MHI_CHANNEL_CONFIG_DL_SBL(25, "BL", 32, 1),
+	MHI_CHANNEL_CONFIG_UL(26, "DCI", 64, 3),
+	MHI_CHANNEL_CONFIG_DL(27, "DCI", 64, 3),
+	MHI_CHANNEL_CONFIG_UL(32, "DUN", 64, 3),
+	MHI_CHANNEL_CONFIG_DL(33, "DUN", 64, 3),
+	MHI_CHANNEL_CONFIG_HW_UL(100, "IP_HW0", 512, 7),
+	MHI_CHANNEL_CONFIG_HW_DL(101, "IP_HW0", 512, 8),
+	MHI_CHANNEL_CONFIG_DL(103, "IP_HW_QDSS", 128, 10),
+	MHI_CHANNEL_CONFIG_UL(109, "RMNET_CTL", 128, 15),
+	MHI_CHANNEL_CONFIG_DL(110, "RMNET_CTL", 128, 16),
+};
+
 static struct mhi_event_config modem_qcom_v1_mhi_events[] = {
 	/* first ring is control+data ring */
 	MHI_EVENT_CONFIG_CTRL(0, 64),
@@ -341,6 +461,26 @@ static struct mhi_event_config modem_qcom_v1_mhi_events[] = {
 	/* Hardware channels request dedicated hardware event rings */
 	MHI_EVENT_CONFIG_HW_DATA(4, 1024, 100),
 	MHI_EVENT_CONFIG_HW_DATA(5, 2048, 101)
+};
+
+static struct mhi_event_config modem_qcom_sdx55_mhi_events[] = {
+	MHI_EVENT_CONFIG_CTRL_IRQ(32, 1),
+	MHI_EVENT_CONFIG_SW_DATA_IRQ(256, 2),
+	MHI_EVENT_CONFIG_SW_DATA_IRQ(256, 3),
+	MHI_EVENT_CONFIG_SW_DATA_IRQ(256, 4),
+	MHI_EVENT_CONFIG_OFFLOAD(512, 5),
+	MHI_EVENT_CONFIG_OFFLOAD(512, 5),
+	MHI_EVENT_CONFIG_OFFLOAD(64, 0),
+	MHI_EVENT_CONFIG_HW_DATA_IRQ(1024, 5, 5, 100, MHI_DB_BRST_ENABLE),
+	MHI_EVENT_CONFIG_HW_DATA_IRQ(2048, 6, 5, 101, MHI_DB_BRST_ENABLE),
+	MHI_EVENT_CONFIG_HW_OFFLOAD(102),
+	MHI_EVENT_CONFIG_HW_DATA_IRQ(1024, 7, 5, 103, MHI_DB_BRST_DISABLE),
+	MHI_EVENT_CONFIG_HW_OFFLOAD(105),
+	MHI_EVENT_CONFIG_HW_OFFLOAD(106),
+	MHI_EVENT_CONFIG_HW_OFFLOAD(107),
+	MHI_EVENT_CONFIG_HW_OFFLOAD(108),
+	MHI_EVENT_CONFIG_HW_DATA_IRQ(1024, 8, 1, 109, MHI_DB_BRST_DISABLE),
+	MHI_EVENT_CONFIG_HW_DATA_IRQ(1024, 9, 0, 110, MHI_DB_BRST_DISABLE),
 };
 
 static const struct mhi_controller_config mhi_qcom_sa8775p_config = {
@@ -369,6 +509,16 @@ static const struct mhi_controller_config modem_qcom_v1_mhiv_config = {
 	.ch_cfg = modem_qcom_v1_mhi_channels,
 	.num_events = ARRAY_SIZE(modem_qcom_v1_mhi_events),
 	.event_cfg = modem_qcom_v1_mhi_events,
+};
+
+static const struct mhi_controller_config modem_qcom_sdx55_config = {
+	.max_channels = 111,
+	.timeout_ms = 8000,
+	.buf_len = 0x8000,
+	.num_channels = ARRAY_SIZE(mhi_qcom_sdx55_channels),
+	.ch_cfg = mhi_qcom_sdx55_channels,
+	.num_events = ARRAY_SIZE(modem_qcom_sdx55_mhi_events),
+	.event_cfg = modem_qcom_sdx55_mhi_events,
 };
 
 static const struct mhi_pci_dev_info mhi_qcom_sa8775p_info = {
@@ -408,7 +558,7 @@ static const struct mhi_pci_dev_info mhi_qcom_sdx55_info = {
 	.fw = "qcom/sdx55m/sbl1.mbn",
 	.edl = "qcom/sdx55m/edl.mbn",
 	.edl_trigger = true,
-	.config = &modem_qcom_v1_mhiv_config,
+	.config = &modem_qcom_sdx55_config,
 	.bar_num = MHI_PCI_DEFAULT_BAR_NUM,
 	.dma_data_width = 32,
 	.mru_default = 32768,
@@ -949,7 +1099,7 @@ static const struct pci_device_id mhi_pci_id_table[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_QCOM, 0x0304),
 		.driver_data = (kernel_ulong_t) &mhi_qcom_sdx24_info },
 	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_QCOM, 0x0306, PCI_VENDOR_ID_QCOM, 0x010c),
-		.driver_data = (kernel_ulong_t) &mhi_foxconn_sdx55_info },
+		.driver_data = (kernel_ulong_t) &mhi_qcom_sdx55_info },
 	/* EM919x (sdx55), use the same vid:pid as qcom-sdx55m */
 	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_QCOM, 0x0306, 0x18d7, 0x0200),
 		.driver_data = (kernel_ulong_t) &mhi_sierra_em919x_info },
@@ -1074,14 +1224,28 @@ enum mhi_pci_device_status {
 	MHI_PCI_DEV_SUSPENDED,
 };
 
+struct mhi_sdx55m_esoc_diag {
+	struct gpio_desc *ap2mdm_status;
+	struct gpio_desc *ap2mdm_errfatal;
+	struct gpio_desc *mdm2ap_status;
+	struct gpio_desc *mdm2ap_errfatal;
+	struct delayed_work poll_work;
+	unsigned int poll_count;
+	bool enabled;
+};
+
 struct mhi_pci_device {
 	struct mhi_controller mhi_cntrl;
 	struct pci_saved_state *pci_state;
 	struct work_struct recovery_work;
 	struct timer_list health_check_timer;
+	struct mhi_sdx55m_esoc_diag esoc_diag;
 	unsigned long status;
 	bool reset_on_remove;
 };
+
+static void mhi_sdx55m_esoc_diag_start_poll(struct mhi_pci_device *mhi_pdev);
+static void mhi_sdx55m_esoc_diag_stop(struct mhi_pci_device *mhi_pdev);
 
 static int mhi_pci_read_reg(struct mhi_controller *mhi_cntrl,
 			    void __iomem *addr, u32 *out)
@@ -1176,6 +1340,17 @@ static int mhi_pci_claim(struct mhi_controller *mhi_cntrl,
 	return 0;
 }
 
+static int mhi_pci_required_irqs(const struct mhi_controller_config *mhi_cntrl_config)
+{
+	int i, nr_irqs = 1;
+
+	for (i = 0; i < mhi_cntrl_config->num_events; i++)
+		nr_irqs = max_t(int, nr_irqs,
+				 mhi_cntrl_config->event_cfg[i].irq + 1);
+
+	return nr_irqs;
+}
+
 static int mhi_pci_get_irqs(struct mhi_controller *mhi_cntrl,
 			    const struct mhi_controller_config *mhi_cntrl_config)
 {
@@ -1183,11 +1358,8 @@ static int mhi_pci_get_irqs(struct mhi_controller *mhi_cntrl,
 	int nr_vectors, i;
 	int *irq;
 
-	/*
-	 * Alloc one MSI vector for BHI + one vector per event ring, ideally...
-	 * No explicit pci_free_irq_vectors required, done by pcim_release.
-	 */
-	mhi_cntrl->nr_irqs = 1 + mhi_cntrl_config->num_events;
+	/* No explicit pci_free_irq_vectors required, done by pcim_release. */
+	mhi_cntrl->nr_irqs = mhi_pci_required_irqs(mhi_cntrl_config);
 
 	nr_vectors = pci_alloc_irq_vectors(pdev, 1, mhi_cntrl->nr_irqs, PCI_IRQ_MSIX | PCI_IRQ_MSI);
 	if (nr_vectors < 0) {
@@ -1197,13 +1369,19 @@ static int mhi_pci_get_irqs(struct mhi_controller *mhi_cntrl,
 	}
 
 	if (nr_vectors < mhi_cntrl->nr_irqs) {
-		dev_warn(&pdev->dev, "using shared MSI\n");
+		dev_warn(&pdev->dev, "using shared MSI for limited vectors\n");
 
 		/* Patch msi vectors, use only one (shared) */
 		for (i = 0; i < mhi_cntrl_config->num_events; i++)
 			mhi_cntrl_config->event_cfg[i].irq = 0;
 		mhi_cntrl->nr_irqs = 1;
 	}
+
+	dev_info(&pdev->dev, "MHI allocated %d MSI vector(s), nr_irqs %d\n",
+		 nr_vectors, mhi_cntrl->nr_irqs);
+	for (i = 0; i < mhi_cntrl_config->num_events; i++)
+		dev_info(&pdev->dev, "MHI event ring %d uses irq index %u\n",
+			 i, mhi_cntrl_config->event_cfg[i].irq);
 
 	irq = devm_kcalloc(&pdev->dev, mhi_cntrl->nr_irqs, sizeof(int), GFP_KERNEL);
 	if (!irq)
@@ -1249,6 +1427,7 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 
 	if (pdev->is_physfn)
 		timer_delete(&mhi_pdev->health_check_timer);
+	mhi_sdx55m_esoc_diag_stop(mhi_pdev);
 
 	pm_runtime_forbid(&pdev->dev);
 
@@ -1276,6 +1455,7 @@ static void mhi_pci_recovery_work(struct work_struct *work)
 	dev_dbg(&pdev->dev, "Recovery completed\n");
 
 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
+	mhi_sdx55m_esoc_diag_start_poll(mhi_pdev);
 
 	if (pdev->is_physfn)
 		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
@@ -1344,6 +1524,293 @@ err_get_chdb:
 	return ret;
 }
 
+static struct gpio_desc *mhi_sdx55m_get_diag_gpio(struct pci_dev *pdev,
+						 struct device_node *np,
+						 const char *name,
+						 enum gpiod_flags flags)
+{
+	struct gpio_desc *desc;
+
+	desc = devm_fwnode_gpiod_get_index(&pdev->dev, of_fwnode_handle(np),
+						 name, 0, flags, name);
+	if (IS_ERR(desc)) {
+		dev_info(&pdev->dev, "SDX55M ESOC diag GPIO %s unavailable: %ld\n",
+			 name, PTR_ERR(desc));
+		return NULL;
+	}
+
+	return desc;
+}
+
+static int mhi_sdx55m_gpio_get_value(struct gpio_desc *desc)
+{
+	return desc ? gpiod_get_value_cansleep(desc) : -1;
+}
+
+static ssize_t sdx55m_esoc_diag_state_show(struct device *dev,
+						   struct device_attribute *attr,
+						   char *buf)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mhi_pci_device *mhi_pdev = pci_get_drvdata(pdev);
+	struct mhi_sdx55m_esoc_diag *diag;
+	struct mhi_controller *mhi_cntrl;
+	enum mhi_ee_type reg_ee = MHI_EE_MAX;
+	enum mhi_state reg_state = MHI_STATE_MAX;
+
+	if (!mhi_pdev)
+		return sysfs_emit(buf, "enabled=0\n");
+
+	diag = &mhi_pdev->esoc_diag;
+	mhi_cntrl = &mhi_pdev->mhi_cntrl;
+
+	if (mhi_cntrl->bhi) {
+		reg_ee = mhi_get_exec_env(mhi_cntrl);
+		reg_state = mhi_get_mhi_state(mhi_cntrl);
+	}
+
+	return sysfs_emit(buf,
+			  "enabled=%d AP2MDM_STATUS=%d AP2MDM_ERRFATAL=%d MDM2AP_STATUS=%d MDM2AP_ERRFATAL=%d cached_ee=%s cached_state=%s reg_ee=%s reg_state=%s pm_state=0x%x\n",
+			  diag->enabled,
+			  mhi_sdx55m_gpio_get_value(diag->ap2mdm_status),
+			  mhi_sdx55m_gpio_get_value(diag->ap2mdm_errfatal),
+			  mhi_sdx55m_gpio_get_value(diag->mdm2ap_status),
+			  mhi_sdx55m_gpio_get_value(diag->mdm2ap_errfatal),
+			  TO_MHI_EXEC_STR(mhi_cntrl->ee),
+			  mhi_state_str(mhi_cntrl->dev_state), TO_MHI_EXEC_STR(reg_ee),
+			  mhi_state_str(reg_state), mhi_cntrl->pm_state);
+}
+static DEVICE_ATTR_RO(sdx55m_esoc_diag_state);
+
+static struct attribute *mhi_sdx55m_esoc_diag_attrs[] = {
+	&dev_attr_sdx55m_esoc_diag_state.attr,
+	NULL,
+};
+
+static const struct attribute_group mhi_sdx55m_esoc_diag_group = {
+	.attrs = mhi_sdx55m_esoc_diag_attrs,
+};
+
+static void mhi_sdx55m_esoc_diag_log(struct mhi_pci_device *mhi_pdev,
+						     const char *stage, bool read_regs)
+{
+	struct mhi_sdx55m_esoc_diag *diag = &mhi_pdev->esoc_diag;
+	struct mhi_controller *mhi_cntrl = &mhi_pdev->mhi_cntrl;
+	struct pci_dev *pdev = to_pci_dev(mhi_cntrl->cntrl_dev);
+	enum mhi_ee_type reg_ee = MHI_EE_MAX;
+	enum mhi_state reg_state = MHI_STATE_MAX;
+
+	if (read_regs && mhi_cntrl->bhi) {
+		reg_ee = mhi_get_exec_env(mhi_cntrl);
+		reg_state = mhi_get_mhi_state(mhi_cntrl);
+	}
+
+	dev_info(&pdev->dev,
+		 "SDX55M ESOC diag %s: AP2MDM_STATUS=%d AP2MDM_ERRFATAL=%d MDM2AP_STATUS=%d MDM2AP_ERRFATAL=%d cached_ee=%s cached_state=%s reg_ee=%s reg_state=%s pm_state=0x%x\n",
+		 stage, mhi_sdx55m_gpio_get_value(diag->ap2mdm_status),
+		 mhi_sdx55m_gpio_get_value(diag->ap2mdm_errfatal),
+		 mhi_sdx55m_gpio_get_value(diag->mdm2ap_status),
+		 mhi_sdx55m_gpio_get_value(diag->mdm2ap_errfatal),
+		 TO_MHI_EXEC_STR(mhi_cntrl->ee), mhi_state_str(mhi_cntrl->dev_state),
+		 TO_MHI_EXEC_STR(reg_ee), mhi_state_str(reg_state),
+		 mhi_cntrl->pm_state);
+}
+
+static irqreturn_t mhi_sdx55m_esoc_gpio_irq(int irq, void *data)
+{
+	struct mhi_sdx55m_esoc_diag *diag = data;
+	struct mhi_pci_device *mhi_pdev = container_of(diag, struct mhi_pci_device,
+							      esoc_diag);
+
+	mhi_sdx55m_esoc_diag_log(mhi_pdev, "sideband IRQ",
+				       test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status));
+
+	return IRQ_HANDLED;
+}
+
+static void mhi_sdx55m_esoc_request_irq(struct mhi_pci_device *mhi_pdev,
+						struct gpio_desc *desc,
+						const char *name)
+{
+	struct pci_dev *pdev = to_pci_dev(mhi_pdev->mhi_cntrl.cntrl_dev);
+	int irq, ret;
+
+	if (!desc)
+		return;
+
+	irq = gpiod_to_irq(desc);
+	if (irq < 0) {
+		dev_info(&pdev->dev, "SDX55M ESOC diag: %s IRQ unavailable: %d\n",
+			 name, irq);
+		return;
+	}
+
+	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
+					      mhi_sdx55m_esoc_gpio_irq,
+					      IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
+					      IRQF_ONESHOT, name, &mhi_pdev->esoc_diag);
+	if (ret)
+		dev_info(&pdev->dev, "SDX55M ESOC diag: %s IRQ %d request failed: %d\n",
+			 name, irq, ret);
+	else
+		dev_info(&pdev->dev, "SDX55M ESOC diag: watching %s IRQ %d\n",
+			 name, irq);
+}
+
+static void mhi_sdx55m_esoc_poll_work(struct work_struct *work)
+{
+	struct mhi_sdx55m_esoc_diag *diag = container_of(to_delayed_work(work),
+								struct mhi_sdx55m_esoc_diag,
+								poll_work);
+	struct mhi_pci_device *mhi_pdev = container_of(diag, struct mhi_pci_device,
+							      esoc_diag);
+
+	if (!diag->enabled || !test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status))
+		return;
+
+	diag->poll_count++;
+	mhi_sdx55m_esoc_diag_log(mhi_pdev, "ESOC_REQ_IMG/SBL poll", true);
+
+	if (diag->poll_count < MHI_SDX55M_ESOC_POLL_SAMPLES)
+		schedule_delayed_work(&diag->poll_work,
+				      msecs_to_jiffies(MHI_SDX55M_ESOC_POLL_INTERVAL_MS));
+}
+
+static void mhi_sdx55m_esoc_diag_start_poll(struct mhi_pci_device *mhi_pdev)
+{
+	struct mhi_sdx55m_esoc_diag *diag = &mhi_pdev->esoc_diag;
+
+	if (!diag->enabled)
+		return;
+
+	cancel_delayed_work(&diag->poll_work);
+	diag->poll_count = 0;
+	mhi_sdx55m_esoc_diag_log(mhi_pdev, "ESOC_REQ_IMG diagnostic start", true);
+	schedule_delayed_work(&diag->poll_work,
+			      msecs_to_jiffies(MHI_SDX55M_ESOC_POLL_INTERVAL_MS));
+}
+
+static void mhi_sdx55m_esoc_diag_stop(struct mhi_pci_device *mhi_pdev)
+{
+	if (mhi_pdev->esoc_diag.enabled)
+		cancel_delayed_work_sync(&mhi_pdev->esoc_diag.poll_work);
+}
+
+static int mhi_sdx55m_spmi_write(struct spmi_device *sdev, u16 addr, u8 val)
+{
+	return spmi_ext_register_writel(sdev, addr, &val, sizeof(val));
+}
+
+static int mhi_sdx55m_modem_pon_warm_reset(struct pci_dev *pdev,
+						   struct device_node *np)
+{
+	struct device_node *pmic_np;
+	struct spmi_device *sdev;
+	u32 base = MHI_SDX55M_MODEM_PON_BASE;
+	int ret;
+
+	pmic_np = of_parse_phandle(np, "modem-pmic", 0);
+	if (!pmic_np)
+		return 0;
+
+	of_property_read_u32(np, "modem-pon-base", &base);
+	sdev = spmi_find_device_by_of_node(pmic_np);
+	of_node_put(pmic_np);
+	if (!sdev) {
+		dev_info(&pdev->dev, "SDX55M ESOC diag: modem PMIC SPMI device unavailable\n");
+		return -ENODEV;
+	}
+
+	ret = mhi_sdx55m_spmi_write(sdev,
+					base + MHI_SDX55M_PON_SW_RST_S2_CTL2, 0);
+	if (ret)
+		goto out;
+
+	udelay(500);
+
+	ret = mhi_sdx55m_spmi_write(sdev,
+					base + MHI_SDX55M_PON_SW_RST_S2_CTL,
+					MHI_SDX55M_PON_WARM_RESET);
+	if (ret)
+		goto out;
+
+	ret = mhi_sdx55m_spmi_write(sdev,
+					base + MHI_SDX55M_PON_SW_RST_S2_CTL2,
+					MHI_SDX55M_PON_RESET_EN);
+	if (ret)
+		goto out;
+
+	udelay(500);
+
+	ret = mhi_sdx55m_spmi_write(sdev,
+					base + MHI_SDX55M_PON_SW_RST_GO,
+					MHI_SDX55M_PON_SW_RST_GO_VAL);
+
+out:
+	put_device(&sdev->dev);
+	if (ret)
+		dev_info(&pdev->dev, "SDX55M ESOC diag: modem PON warm reset failed: %d\n",
+			 ret);
+	else
+		dev_info(&pdev->dev, "SDX55M ESOC diag: modem PON warm reset triggered\n");
+
+	return ret;
+}
+
+static void mhi_sdx55m_esoc_diag_sequence(struct mhi_pci_device *mhi_pdev,
+						 const struct mhi_pci_dev_info *info)
+{
+	struct mhi_sdx55m_esoc_diag *diag = &mhi_pdev->esoc_diag;
+	struct pci_dev *pdev = to_pci_dev(mhi_pdev->mhi_cntrl.cntrl_dev);
+	struct device_node *np;
+
+	if (info != &mhi_qcom_sdx55_info)
+		return;
+
+	np = of_find_compatible_node(NULL, NULL, "xiaomi,lmi-sdx55m-esoc-diag");
+	if (!np)
+		return;
+
+	diag->ap2mdm_status = mhi_sdx55m_get_diag_gpio(pdev, np, "ap2mdm-status",
+							       GPIOD_OUT_LOW);
+	diag->ap2mdm_errfatal = mhi_sdx55m_get_diag_gpio(pdev, np, "ap2mdm-errfatal",
+								 GPIOD_OUT_LOW);
+	diag->mdm2ap_status = mhi_sdx55m_get_diag_gpio(pdev, np, "mdm2ap-status",
+							       GPIOD_IN);
+	diag->mdm2ap_errfatal = mhi_sdx55m_get_diag_gpio(pdev, np, "mdm2ap-errfatal",
+								 GPIOD_IN);
+
+	if (!diag->ap2mdm_status) {
+		of_node_put(np);
+		return;
+	}
+
+	diag->enabled = true;
+	mhi_sdx55m_esoc_request_irq(mhi_pdev, diag->mdm2ap_status,
+					 "sdx55m-mdm2ap-status");
+	mhi_sdx55m_esoc_request_irq(mhi_pdev, diag->mdm2ap_errfatal,
+					 "sdx55m-mdm2ap-errfatal");
+
+	if (diag->ap2mdm_errfatal)
+		gpiod_set_value_cansleep(diag->ap2mdm_errfatal, 0);
+	gpiod_set_value_cansleep(diag->ap2mdm_status, 0);
+	mhi_sdx55m_esoc_diag_log(mhi_pdev, "after AP2MDM_STATUS low", false);
+
+	mhi_sdx55m_modem_pon_warm_reset(pdev, np);
+	of_node_put(np);
+
+	msleep(MHI_SDX55M_AP2MDM_STATUS_DELAY_MS);
+	gpiod_set_value_cansleep(diag->ap2mdm_status, 1);
+	mhi_sdx55m_esoc_diag_log(mhi_pdev, "after AP2MDM_STATUS high", false);
+	dev_info(&pdev->dev,
+		 "SDX55M ESOC diag: ESOC_REQ_IMG diagnostic phase armed; waiting %u ms before MHI power-up\n",
+		 MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS);
+	msleep(MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS);
+	mhi_sdx55m_esoc_diag_log(mhi_pdev, "after ESOC_REQ_IMG diagnostic window", false);
+	dev_info(&pdev->dev,
+		 "SDX55M ESOC diag: ESOC_REQ_IMG diagnostic window done; continuing MHI SBL/Sahara observation\n");
+}
+
 static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	const struct mhi_pci_dev_info *info = (struct mhi_pci_dev_info *) id->driver_data;
@@ -1361,6 +1828,7 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return -ENOMEM;
 
 	INIT_WORK(&mhi_pdev->recovery_work, mhi_pci_recovery_work);
+	INIT_DELAYED_WORK(&mhi_pdev->esoc_diag.poll_work, mhi_sdx55m_esoc_poll_work);
 
 	if (pdev->is_virtfn && info->vf_config)
 		mhi_cntrl_config = info->vf_config;
@@ -1402,6 +1870,8 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		mhi_cntrl->wake_toggle = mhi_pci_wake_toggle_nop;
 	}
 
+	mhi_sdx55m_esoc_diag_sequence(mhi_pdev, info);
+
 	err = mhi_pci_claim(mhi_cntrl, info->bar_num, DMA_BIT_MASK(dma_data_width));
 	if (err)
 		return err;
@@ -1411,6 +1881,12 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return err;
 
 	pci_set_drvdata(pdev, mhi_pdev);
+
+	if (info == &mhi_qcom_sdx55_info && mhi_pdev->esoc_diag.enabled) {
+		err = devm_device_add_group(&pdev->dev, &mhi_sdx55m_esoc_diag_group);
+		if (err)
+			return err;
+	}
 
 	/* Have stored pci confspace at hand for restore in sudden PCI error.
 	 * cache the state locally and discard the PCI core one.
@@ -1437,6 +1913,7 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
+	mhi_sdx55m_esoc_diag_start_poll(mhi_pdev);
 
 	/* start health check */
 	if (pdev->is_physfn)
@@ -1471,6 +1948,7 @@ static void mhi_pci_remove(struct pci_dev *pdev)
 	if (pdev->is_physfn)
 		timer_delete_sync(&mhi_pdev->health_check_timer);
 	cancel_work_sync(&mhi_pdev->recovery_work);
+	mhi_sdx55m_esoc_diag_stop(mhi_pdev);
 
 	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
 		mhi_power_down(mhi_cntrl, true);
@@ -1502,6 +1980,7 @@ static void mhi_pci_reset_prepare(struct pci_dev *pdev)
 
 	if (pdev->is_physfn)
 		timer_delete(&mhi_pdev->health_check_timer);
+	mhi_sdx55m_esoc_diag_stop(mhi_pdev);
 
 	/* Clean up MHI state */
 	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
@@ -1546,6 +2025,7 @@ static void mhi_pci_reset_done(struct pci_dev *pdev)
 	}
 
 	set_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status);
+	mhi_sdx55m_esoc_diag_start_poll(mhi_pdev);
 	if (pdev->is_physfn)
 		mod_timer(&mhi_pdev->health_check_timer, jiffies + HEALTH_CHECK_PERIOD);
 }
@@ -1560,6 +2040,8 @@ static pci_ers_result_t mhi_pci_error_detected(struct pci_dev *pdev,
 
 	if (state == pci_channel_io_perm_failure)
 		return PCI_ERS_RESULT_DISCONNECT;
+
+	mhi_sdx55m_esoc_diag_stop(mhi_pdev);
 
 	/* Clean up MHI state */
 	if (test_and_clear_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status)) {
