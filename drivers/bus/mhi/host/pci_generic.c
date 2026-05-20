@@ -27,7 +27,7 @@
 
 #define MHI_POST_RESET_DELAY_MS 2000
 #define MHI_SDX55M_AP2MDM_STATUS_DELAY_MS 150
-#define MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS 2000
+#define MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS 0
 #define MHI_SDX55M_ESOC_POLL_INTERVAL_MS 500
 #define MHI_SDX55M_ESOC_POLL_SAMPLES 24
 #define MHI_SDX55M_MODEM_PON_BASE 0x800
@@ -1802,13 +1802,16 @@ static void mhi_sdx55m_esoc_diag_sequence(struct mhi_pci_device *mhi_pdev,
 	msleep(MHI_SDX55M_AP2MDM_STATUS_DELAY_MS);
 	gpiod_set_value_cansleep(diag->ap2mdm_status, 1);
 	mhi_sdx55m_esoc_diag_log(mhi_pdev, "after AP2MDM_STATUS high", false);
-	dev_info(&pdev->dev,
-		 "SDX55M ESOC diag: ESOC_REQ_IMG diagnostic phase armed; waiting %u ms before MHI power-up\n",
-		 MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS);
-	msleep(MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS);
-	mhi_sdx55m_esoc_diag_log(mhi_pdev, "after ESOC_REQ_IMG diagnostic window", false);
-	dev_info(&pdev->dev,
-		 "SDX55M ESOC diag: ESOC_REQ_IMG diagnostic window done; continuing MHI SBL/Sahara observation\n");
+	if (MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS) {
+		dev_info(&pdev->dev,
+			 "SDX55M ESOC diag: ESOC_REQ_IMG diagnostic phase armed; waiting %u ms before MHI power-up\n",
+			 MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS);
+		msleep(MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS);
+		mhi_sdx55m_esoc_diag_log(mhi_pdev, "after ESOC_REQ_IMG diagnostic window", false);
+	} else {
+		dev_info(&pdev->dev,
+			 "SDX55M ESOC diag: ESOC_REQ_IMG diagnostic phase armed; continuing to MHI power-up immediately\n");
+	}
 }
 
 static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)

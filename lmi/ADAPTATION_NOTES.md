@@ -490,6 +490,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M73 排除“image40 DONE 后的新 HELLO 必须以 Sahara command mode 回复才会触发下一批 READ_DATA 或 MISSION”这个分支。当前阻塞仍是 SBL 在 image40 DONE 后接受 HELLO_RESP 但不再请求镜像、MDM2AP_STATUS 不拉高、MHI 不离开 SBL/M0；下一步应继续收敛最小 ESOC 生命周期/host-side request-engine 诊断，特别是 Android `ESOC_IMG_XFER_DONE` / `ESOC_BOOT_DONE` 在 AP-side 状态机中的作用，以及是否需要一个不会破坏 SAHARA channel 的受控状态通知点。仍保持只读 signed firmware 来源、只被动响应真实 `READ_DATA`，不进入 EDL/firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M74 ESOC_REQ_IMG 零等待 / immediate MHI power-up 诊断
+
+含义：Android downstream 的 modem power-up 是 request-engine 可用后执行 `ESOC_PWR_ON`，再通过 ESOC client hook 进入 MHI/PCIe power-on。M74 把当前 SDX55M 诊断路径中的 `MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS` 改为 0，让 AP2MDM_STATUS 拉高并记录 ESOC_REQ_IMG armed 后立即进入 `mhi_prepare_for_power_up()` / `mhi_async_power_up()`，用来单独排除“当前 2 秒诊断等待窗口与 downstream power-on 顺序不一致”这个分支。
+
+当前影响：M74 boot-only 镜像只刷 `boot` 后正常启动，dmesg 出现 `SDX55M ESOC diag: ESOC_REQ_IMG diagnostic phase armed; continuing to MHI power-up immediately`，`/dev/mhi_sahara0` 与 `/dev/mhi_bl0` 仍正常注册。第一次验证因未带 `--unsafe-done-restart` 按安全默认停在 image34 `END_OF_IMAGE` 后；普通 reboot 恢复后，按 M71/M73 成功 cadence 加 `--unsafe-done-restart` 复测，稳定复现 image34 两段、`END_OF_IMAGE image=34 status=0`、`DONE_RESP status=0`、第二轮 HELLO、image40 offset 0/52、52/96、4096/6712、12288/1220 和 `END_OF_IMAGE image=40 status=0`。image40 `DONE` 后的新 mode0 HELLO 仍能完成 `HELLO_RESP mode=0`，dmesg 确认 final APDP chunk、image40 `DONE` 和 post-DONE HELLO_RESP 都有 `SAHARA UL completion status 0`；随后同 session 8 秒 idle，后三轮 session 均无 packet，最终状态仍为 `AP2MDM_STATUS=1 AP2MDM_ERRFATAL=0 MDM2AP_STATUS=0 MDM2AP_ERRFATAL=0 cached/reg=SECONDARY BOOTLOADER/M0 pm_state=0x4`，未出现 `SYS_ERROR` 或 `INVALID_EE`。
+
+后续处理：M74 排除“ESOC_REQ_IMG armed 后额外等 2 秒才启动 MHI 导致 SBL 不推进”作为当前根因。当前阻塞仍在 image40 `DONE` 后的新 HELLO/HELLO_RESP 之后：SBL 不再请求后续 image，MDM2AP_STATUS 不拉高，MHI 不进入 Mission。下一步应继续对照 Android ESOC request-engine / `ks` 状态机，重点验证 `ESOC_IMG_XFER_DONE`、`ESOC_BOOT_DONE`、MDM2AP_STATUS 等 AP-side 状态通知是否只是 host bookkeeping，或是否还需要一个受控且不会触发 SAHARA reset 的生命周期点；仍保持只读 signed firmware 来源、只被动响应真实 `READ_DATA`，不进入 EDL/firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
