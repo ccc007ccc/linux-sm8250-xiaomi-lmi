@@ -430,7 +430,7 @@ def handle_packet(fd, fat, data, args):
             if args.done_wait_timeout > 0:
                 return "done_wait", 0, None
             if args.unsafe_done_restart:
-                return "done_restart", 0, None
+                return "done_restart", 0, image
             return "stop", 0, None
         return "stop", 0, None
     if cmd == CMD_DONE_RESP:
@@ -481,6 +481,7 @@ def run_session(fat, args, index):
     read_data_follow_image = None
     restart_deadline = None
     restart_action = None
+    restart_image = None
     ks_pending_deadline = None
     ks_pending_phase = None
     hold_deadline = None
@@ -547,14 +548,22 @@ def run_session(fat, args, index):
                 continue
             deadline = time.monotonic() + args.idle_timeout
             if restart_deadline is not None and restart_action in ("done_restart", "done_resp_restart") and action == "restart" and sent == 0 and image is None:
+                if restart_action == "done_restart" and args.done_hello_close_image >= -1 and \
+                   (args.done_hello_close_image < 0 or args.done_hello_close_image == restart_image):
+                    restart_action = "done_hello_restart"
+                    restart_deadline = time.monotonic() + args.done_hello_close_delay
+                    log("session", f"{index} close_after_done_hello image={restart_image} delay={args.done_hello_close_delay}")
+                    continue
                 log("session", f"{index} continue_after_{restart_action}_packet")
                 restart_deadline = None
                 restart_action = None
+                restart_image = None
                 continue
             if restart_deadline is not None:
                 log("session", f"{index} cancel_{restart_action}_after_packet")
                 restart_deadline = None
                 restart_action = None
+                restart_image = None
             if done_wait_deadline is not None and action == "restart" and sent == 0 and image is None:
                 log("session", f"{index} continue_after_done_wait_packet")
                 done_wait_deadline = None
@@ -624,6 +633,7 @@ def run_session(fat, args, index):
                     delay = args.done_resp_restart_delay
                 if delay > 0:
                     restart_action = action
+                    restart_image = image
                     restart_deadline = time.monotonic() + delay
                     log("session", f"{index} {action}_delay={delay}")
                     continue
@@ -643,6 +653,8 @@ def parse_args():
     parser.add_argument("--between-sessions", type=float, default=2.0)
     parser.add_argument("--restart-after-packet-delay", type=float, default=1.0)
     parser.add_argument("--done-restart-delay", type=float, default=-1.0)
+    parser.add_argument("--done-hello-close-image", type=int, default=-2)
+    parser.add_argument("--done-hello-close-delay", type=float, default=1.0)
     parser.add_argument("--done-wait-timeout", type=float, default=0.0)
     parser.add_argument("--done-resp-restart-delay", type=float, default=-1.0)
     parser.add_argument("--done-resp-follow-timeout", type=float, default=0.0)

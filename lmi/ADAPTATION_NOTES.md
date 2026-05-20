@@ -474,6 +474,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M71 把阻塞点从“APDP 尾段后没有 image40 EOI”推进到“image40 DONE 后的新 HELLO/下一阶段握手无后续请求”。rootfs `lmi-sahara-test` 默认已把 `HOLD_AFTER_IMAGE` 从 40 改回 `-1`，避免从 image40 offset 0 起 hold 阻断后续 APDP 请求；后续应围绕 image40 DONE 后的 HELLO_RESP 语义、是否需要 ESOC `IMG_XFER_DONE` / `BOOT_DONE` 通知、MDM2AP_STATUS 边沿或受控 channel restart/start 继续缩小范围。仍不补发未请求镜像、不进入 EDL/firehose、不写 NV/modem/dtbo/recovery/vbmeta，也不提交 firmware blob。
 
+### M72 image40 DONE 后 HELLO close/reopen 诊断
+
+含义：M72 在 `lmi-sahara-loader.py` 中新增默认关闭的 `--done-hello-close-image` / `--done-hello-close-delay` 诊断开关，并在 rootfs `lmi-sahara-test` 中暴露 `DONE_HELLO_CLOSE_IMAGE` / `DONE_HELLO_CLOSE_DELAY`。该开关只在指定 image 的 `END_OF_IMAGE` 后发送 `DONE`，随后收到下一次 HELLO 并完成 HELLO_RESP 后生效，用来单独测试 image40 DONE 后的新 HELLO 是否需要立刻 close/reopen 才能推进后续阶段。
+
+当前影响：干净 reboot 后按 M71 成功 cadence 复测，并且只额外叠加 `--done-hello-close-image 40 --done-hello-close-delay 1`。本轮稳定复现 image34 两段、`END_OF_IMAGE image=34 status=0`、`DONE_RESP status=0`、第二轮 HELLO、image40 offset 0/52、52/96、4096/6712、12288/1220 和 `END_OF_IMAGE image=40 status=0`。image40 `DONE` 后 er1 上先收到一个 12 字节零包，再收到新的 mode0 HELLO；host 完成 HELLO_RESP，dmesg 确认 image40 `DONE` 和该 HELLO_RESP 均有 `SAHARA UL completion status 0`。随后 M72 按开关在 1 秒后 close/reopen，但接下来的 3 个 session 均为 8 秒 idle、packets=0，最终只因 `EMPTY_LIMIT=3` 停止；只读状态仍是 `AP2MDM_STATUS=1 AP2MDM_ERRFATAL=0 MDM2AP_STATUS=0 MDM2AP_ERRFATAL=0 cached/reg=SECONDARY BOOTLOADER/M0 pm_state=0x4`，未出现 `SYS_ERROR` 或 `INVALID_EE`。
+
+后续处理：M72 排除“image40 DONE 后的新 HELLO_RESP 必须立刻 close/reopen 才会触发下一批 READ_DATA 或 MISSION”这个分支。当前阻塞仍是 image40 DONE 后 SBL 只重新 HELLO 但不再请求镜像、MDM2AP_STATUS 不拉高、MHI 不离开 SBL/M0。下一步应转向最小 ESOC 生命周期通知/状态诊断，特别是 `IMG_XFER_DONE` / `BOOT_DONE` 的 AP-side request-engine 语义是否只影响 host 状态还是还会间接改变 modem 侧等待条件；继续保持被动 READ_DATA、安全只读来源和现有禁写边界。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
