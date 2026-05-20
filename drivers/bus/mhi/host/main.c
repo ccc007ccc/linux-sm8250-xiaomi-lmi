@@ -19,11 +19,28 @@
 #include "internal.h"
 #include "trace.h"
 
+static bool mhi_is_sahara_chan(const struct mhi_chan *mhi_chan)
+{
+	return mhi_chan && mhi_chan->name && !strcmp(mhi_chan->name, "SAHARA");
+}
+
 static bool mhi_is_sbl_boot_chan(const struct mhi_chan *mhi_chan)
 {
-	return mhi_chan && mhi_chan->name &&
-		(!strcmp(mhi_chan->name, "SAHARA") || !strcmp(mhi_chan->name, "BL"));
+	return mhi_is_sahara_chan(mhi_chan) ||
+		(mhi_chan && mhi_chan->name && !strcmp(mhi_chan->name, "BL"));
 }
+
+static bool mhi_sahara_queue_force_resume;
+module_param_named(sahara_queue_force_resume,
+		   mhi_sahara_queue_force_resume, bool, 0644);
+MODULE_PARM_DESC(sahara_queue_force_resume,
+		 "Force an MHI runtime resume cycle before queueing SAHARA TREs");
+
+static bool mhi_sahara_queue_chan_lock_db;
+module_param_named(sahara_queue_chan_lock_db,
+		   mhi_sahara_queue_chan_lock_db, bool, 0644);
+MODULE_PARM_DESC(sahara_queue_chan_lock_db,
+		 "Ring the SAHARA channel doorbell while holding the channel lock");
 
 static bool mhi_sbl_accept_multi_tre_completion = true;
 module_param_named(sbl_accept_multi_tre_completion,
@@ -1484,7 +1501,17 @@ static int mhi_queue(struct mhi_device *mhi_dev, struct mhi_buf_info *buf_info,
 	struct mhi_chan *mhi_chan = (dir == DMA_TO_DEVICE) ? mhi_dev->ul_chan :
 							     mhi_dev->dl_chan;
 	struct mhi_ring *tre_ring = &mhi_chan->tre_ring;
+	bool sahara_chan = mhi_is_sahara_chan(mhi_chan);
+	bool queue_diag = sahara_chan && (mhi_sahara_queue_force_resume ||
+					   mhi_sahara_queue_chan_lock_db);
+	bool force_resume = false;
+	bool chan_lock_db = false;
+	bool db_valid = false;
+	unsigned long chan_flags;
 	unsigned long flags;
+	u32 pm_state_before = 0;
+	u32 pm_state_after = 0;
+	u32 db_access = 0;
 	int ret;
 
 	if (unlikely(MHI_PM_IN_ERROR_STATE(mhi_cntrl->pm_state)))
@@ -1500,6 +1527,14 @@ static int mhi_queue(struct mhi_device *mhi_dev, struct mhi_buf_info *buf_info,
 
 	read_lock_irqsave(&mhi_cntrl->pm_lock, flags);
 
+	pm_state_before = mhi_cntrl->pm_state;
+	db_access = mhi_cntrl->db_access;
+
+	if (sahara_chan && mhi_sahara_queue_force_resume) {
+		mhi_trigger_resume(mhi_cntrl);
+		force_resume = true;
+	}
+
 	/* Packet is queued, take a usage ref to exit M3 if necessary
 	 * for host->device buffer, balanced put is done on buffer completion
 	 * for device->host buffer, balanced put is after ringing the DB
@@ -1512,13 +1547,29 @@ static int mhi_queue(struct mhi_device *mhi_dev, struct mhi_buf_info *buf_info,
 	if (mhi_chan->dir == DMA_TO_DEVICE)
 		atomic_inc(&mhi_cntrl->pending_pkts);
 
-	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl)))
-		mhi_ring_chan_db(mhi_cntrl, mhi_chan);
+	db_valid = MHI_DB_ACCESS_VALID(mhi_cntrl);
+	if (likely(db_valid)) {
+		if (sahara_chan && mhi_sahara_queue_chan_lock_db) {
+			read_lock_irqsave(&mhi_chan->lock, chan_flags);
+			mhi_ring_chan_db(mhi_cntrl, mhi_chan);
+			read_unlock_irqrestore(&mhi_chan->lock, chan_flags);
+			chan_lock_db = true;
+		} else {
+			mhi_ring_chan_db(mhi_cntrl, mhi_chan);
+		}
+	}
 
 	if (dir == DMA_FROM_DEVICE)
 		mhi_cntrl->runtime_put(mhi_cntrl);
 
+	pm_state_after = mhi_cntrl->pm_state;
 	read_unlock_irqrestore(&mhi_cntrl->pm_lock, flags);
+
+	if (queue_diag)
+		dev_info(&mhi_dev->dev,
+			 "SAHARA queue dir=%d len=%zu flags=0x%x pm_before=0x%x pm_after=0x%x db_access=0x%x db_valid=%u force_resume=%u chan_lock_db=%u\n",
+			 dir, buf_info->len, mflags, pm_state_before, pm_state_after,
+			 db_access, db_valid, force_resume, chan_lock_db);
 
 	return ret;
 }

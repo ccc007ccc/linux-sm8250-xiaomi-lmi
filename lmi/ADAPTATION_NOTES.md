@@ -546,6 +546,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M83 排除了“host 已重排 RX 但忘记敲 DL doorbell”这一简单分支。下一步应继续对照 Android downstream MHI queue 顺序、runtime wake/trigger resume、channel lock 保护、DB_MODE 语义，以及 ESOC client link power-on / image-transfer done 前后的 channel 生命周期；不要把 re-ring 作为默认修复，也继续不读 BL、不主动发送未请求 payload、不发送 `CMD_EXEC` 除非真实 `CMD_READY` 出现，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M84 MHI queue wake / channel-lock doorbell 诊断
+
+含义：M84 在 MHI core 的 SAHARA channel queue 路径新增默认关闭的 `sahara_queue_force_resume` 与 `sahara_queue_chan_lock_db` 参数，分别用于 queue TRE 前触发一次 `mhi_trigger_resume()`、以及在 `mhi_chan->lock` 下敲 channel doorbell，贴近 Android downstream `mhi_queue()` 的 runtime wake / channel-lock doorbell 顺序；诊断日志同步记录 queue 方向、长度、flags、queue 前后 `pm_state`、`db_access`、`db_valid` 和开关状态。
+
+当前影响：M84 内核构建通过，boot-only 镜像只刷 `boot` 后 `/sys/module/mhi/parameters/sahara_queue_force_resume`、`/sys/module/mhi/parameters/sahara_queue_chan_lock_db` 与 `/dev/mhi_sahara0` 均存在。三轮 fresh SBL 对照分别测试 channel-lock doorbell only、force-resume only、两者同时开启，结果都复现“同一 open 只收到一个包”：HELLO/HELLO_RESP 后 idle，reopen 才收到 image34 offset 0/40，再 reopen 收到 image34 offset 40/1596，再 reopen 收到 `END_OF_IMAGE image=34 status=0`；host 发送 `DONE` 后同 fd 等待 15 秒仍没有 `DONE_RESP`。dmesg 确认诊断 queue 路径确实执行，典型状态为 `pm_before=0x4 pm_after=0x4 db_access=0xc db_valid=1`，且对应 `force_resume` / `chan_lock_db` 开关值正确，最终仍停在 SBL/M0。
+
+后续处理：M84 排除了“缺少 downstream-style queue-time trigger-resume”以及“doorbell 必须在 channel lock 下敲”作为当前一包一开的直接根因。当前 SBL 阶段已经处于 M0 且 DB access valid，继续堆叠 queue doorbell 变体的价值较低；下一步应回到 ESOC/request-engine 生命周期、image-transfer done 通知语义、或 channel START/RESET cadence 差异，而不是把这些 M84 诊断开关作为默认修复。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
