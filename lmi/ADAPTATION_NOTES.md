@@ -498,6 +498,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M74 排除“ESOC_REQ_IMG armed 后额外等 2 秒才启动 MHI 导致 SBL 不推进”作为当前根因。当前阻塞仍在 image40 `DONE` 后的新 HELLO/HELLO_RESP 之后：SBL 不再请求后续 image，MDM2AP_STATUS 不拉高，MHI 不进入 Mission。下一步应继续对照 Android ESOC request-engine / `ks` 状态机，重点验证 `ESOC_IMG_XFER_DONE`、`ESOC_BOOT_DONE`、MDM2AP_STATUS 等 AP-side 状态通知是否只是 host bookkeeping，或是否还需要一个受控且不会触发 SAHARA reset 的生命周期点；仍保持只读 signed firmware 来源、只被动响应真实 `READ_DATA`，不进入 EDL/firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M75 Android `ks` DONE_RESP pending 语义复测
+
+含义：只读解包 stock `vendor.img` 后，`/vendor/bin/ks` 字符串和 `libmdmimgload.so` argv 还原显示 Android SDX55M 路径通过 `/vendor/bin/ks -o -p /dev/mhi_pipe_2 -r -1 --partition_path /dev/block/bootdevice/by-name/ ...` 执行 Sahara；`DONE_RESP` 第三字段在 `ks` 日志里叫 `SAHARA_MODE_IMAGE_TX_PENDING`，`0` 表示还有 image-transfer pending，需要回到 HELLO wait，而不是通用成功状态。M75 因此只调整本地 loader 的诊断语义：记录 `image_tx_pending` / `meaning`，并在 `--ks-pending-timeout` 下保持同一 fd 等待 DONE_RESP 和下一轮 HELLO；仍只响应真实 `READ_DATA`，image34 只读 live `mdmddr`，image40 只读 live `msadp`。
+
+当前影响：M75 loader 语法在主线脚本和 rootfs 安装副本上均通过校验；本机 signed `NON-HLOS.bin` 的 FAT 中 image38 文件名仍是 `image/sdx55m/xbl_cfg.elf`，所以没有跟随 Android 字符串改为 `xbl_config.elf`。实机先在旧 SBL/M0 状态做短探测，确认无包后普通 reboot 恢复；干净状态下 M75 复测稳定完成 image34 offset 0/40、offset 40/1596、`END_OF_IMAGE image=34 status=0` 和 host `DONE`。image34 的 `DONE_RESP 6 12 0` 被记录为 `image_tx_pending=0 meaning=pending`；同 fd 等到新 HELLO 并完成 HELLO_RESP 后 20 秒内没有 READ_DATA，close/reopen 后才继续 image40。image40 随后完成 offset 0/52、52/96、4096/6712、12288/1220、`END_OF_IMAGE image=40 status=0`、host `DONE`、`DONE_RESP image_tx_pending=0 meaning=pending`、新 mode0 HELLO 和 HELLO_RESP；这一次同 fd 还收到一个 20 字节全零包，但没有后续 READ_DATA。关闭后再短跑 3 个后续 session 仍无 packet；最终只读状态仍是 `AP2MDM_STATUS=1 AP2MDM_ERRFATAL=0 MDM2AP_STATUS=0 MDM2AP_ERRFATAL=0 cached/reg=SECONDARY BOOTLOADER/M0 pm_state=0x4`，未进入 Mission。
+
+后续处理：M75 排除“当前只是误把 `DONE_RESP 0` 当 success，导致没有按 Android `ks` pending 语义等待下一轮 HELLO”作为根因。新证据还说明：当前 `mhi_sahara_diag` 路径里，image34 pending HELLO 后同 fd 不自然产生 image40，仍需要 close/reopen 的 START/RESET 副作用；而 image40 pending HELLO 后无论同 fd 等待还是后续 close/reopen，都没有下一张 image 或 Mission。下一步应从 Android downstream ESOC/client hook 与 MHI channel lifecycle 差异继续收敛：确认是否需要最小 `ESOC_IMG_XFER_DONE`/status-wait bookkeeping、受控 SAHARA channel restart 语义，或修正当前诊断 client 的 START/RESET 时机；仍不补发未请求 bytes，不进入 EDL/firehose，不写 NV/modem/dtbo/recovery/vbmeta，也不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。

@@ -18,6 +18,8 @@ CMD_RESET = 7
 CMD_READY = 0x0B
 CMD_SWITCH_MODE = 0x0C
 SAHARA_HELLO_LEN = 48
+SAHARA_MODE_IMAGE_TX_PENDING = 0
+SAHARA_MODE_IMAGE_TX_COMPLETE = 1
 
 IMAGE_PATHS = {
     6: "image/sdx55m/apps.mbn",
@@ -435,9 +437,15 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
             return "stop", 0, None
         return "stop", 0, None
     if cmd == CMD_DONE_RESP:
-        status = words[2] if len(words) > 2 else None
-        log("done_resp", f"status={status}")
-        if status == 0:
+        image_tx_pending = words[2] if len(words) > 2 else None
+        if image_tx_pending == SAHARA_MODE_IMAGE_TX_PENDING:
+            meaning = "pending"
+        elif image_tx_pending == SAHARA_MODE_IMAGE_TX_COMPLETE:
+            meaning = "complete"
+        else:
+            meaning = "unknown"
+        log("done_resp", f"image_tx_pending={image_tx_pending} meaning={meaning}")
+        if image_tx_pending == SAHARA_MODE_IMAGE_TX_PENDING:
             if args.keep_prepared_after_done_resp or not args.unsafe_done_restart:
                 enable_keep_prepared(args)
             if args.ks_pending_timeout > 0:
@@ -447,6 +455,8 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
             if args.unsafe_done_restart:
                 return "done_resp_restart", 0, None
             return "stop", 0, None
+        if image_tx_pending == SAHARA_MODE_IMAGE_TX_COMPLETE and args.done_resp_follow_timeout > 0:
+            return "done_resp_follow", 0, None
         return "stop", 0, None
     if cmd == CMD_READY:
         log("ready", "received READY")
