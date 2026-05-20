@@ -466,6 +466,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M70 证明“APDP 最后一段后只是需要再等一会儿”不是当前主分支，且 MDM2AP_STATUS 没有在 image40 tail 或 180 秒窗口内拉高。下一步应对照 Android downstream/`ks` 在完成 APDP 后是否会通知 ESOC `IMG_XFER_DONE`、切换 AP2MDM/MDM2AP 状态、执行特定 SAHARA channel restart，或继续请求其他 image 前需要某个 host-side lifecycle 事件。仍不要把工作扩大到 AMSS/Mission 以外的蜂窝业务栈，也不要进入 EDL/firehose、写 NV、写 modem 分区或提交 firmware blob。
 
+### M71 image40 EOI 与 APDP restart cadence
+
+含义：M71 不改 boot 镜像，直接在 M70 基线上做 no-code cadence 复测，用来区分 APDP 从 offset 0 起长时间同 fd hold、APDP 每段后 release-time RESET/下一次 START，以及短 restart delay 被后续 RX 取消这三种行为。loader 仍只在真实 `READ_DATA` 后被动返回请求范围，image34 只读 live `mdmddr`，image40 只读 live `msadp`，不发送未请求 bytes。
+
+当前影响：干净 SBL/M0 上，`--hold-after-image 40` 会在 image40 offset 0/52 之后停住 240 秒，offset 52/96、4096/6712、12288/1220 均不出现，说明不能从 APDP 首包起保持同一 fd。另一轮把 `DONE_RESP` 后 restart delay 压到 0 会在消费后续 HELLO 前关闭，导致 image40 不再出现，说明 `DONE_RESP` 后的新 HELLO 仍必须被读取并完成 HELLO_RESP。最终有效复测使用 `--unsafe-done-restart`、READ_DATA 后 1 秒 restart delay、`hold_after_image=-1` 和 8 秒短 idle：image34 两段、`END_OF_IMAGE image=34 status=0`、`DONE_RESP status=0` 后收到新 HELLO，HELLO_RESP 完成后短 idle close/reopen；随后 image40 先按 offset 0/52、52/96 分 session 推进，在 offset 4096/6712 后同 session 立即收到 offset 12288/1220，并继续收到 `END_OF_IMAGE image=40 status=0`。dmesg 同步确认 final APDP chunk、image40 `DONE` 和 HELLO_RESP 都有 `SAHARA UL completion status 0`；但 image40 `DONE` 后只收到新的 mode0 HELLO 和一个零包，没有后续 `READ_DATA`，MDM2AP_STATUS 仍为 0，MHI cached/reg 仍停在 `SECONDARY BOOTLOADER` / `M0`。
+
+后续处理：M71 把阻塞点从“APDP 尾段后没有 image40 EOI”推进到“image40 DONE 后的新 HELLO/下一阶段握手无后续请求”。rootfs `lmi-sahara-test` 默认已把 `HOLD_AFTER_IMAGE` 从 40 改回 `-1`，避免从 image40 offset 0 起 hold 阻断后续 APDP 请求；后续应围绕 image40 DONE 后的 HELLO_RESP 语义、是否需要 ESOC `IMG_XFER_DONE` / `BOOT_DONE` 通知、MDM2AP_STATUS 边沿或受控 channel restart/start 继续缩小范围。仍不补发未请求镜像、不进入 EDL/firehose、不写 NV/modem/dtbo/recovery/vbmeta，也不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
