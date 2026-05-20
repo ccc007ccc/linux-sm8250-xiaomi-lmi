@@ -279,14 +279,15 @@ def write_all(fd, data, label, timeout):
         done += n
 
 
-def send_hello_resp(fd, words, args):
+def send_hello_resp(fd, words, args, mode_override=None):
     version = words[2] if len(words) > 2 else 2
     compatible = words[3] if len(words) > 3 else 1
     target_mode = words[5] if len(words) > 5 else 0
-    mode = target_mode if args.echo_hello_mode else args.hello_mode
+    mode = mode_override if mode_override is not None else target_mode if args.echo_hello_mode else args.hello_mode
     resp = struct.pack("<12I", CMD_HELLO_RESP, SAHARA_HELLO_LEN, version, compatible, 0, mode, 0, 0, 0, 0, 0, 0)
     write_all(fd, resp, "hello_resp", args.write_timeout)
-    log("tx", f"HELLO_RESP version={version} compatible={compatible} target_mode={target_mode} mode={mode}")
+    override = " override=1" if mode_override is not None else ""
+    log("tx", f"HELLO_RESP version={version} compatible={compatible} target_mode={target_mode} mode={mode}{override}")
 
 
 def send_done(fd, timeout):
@@ -385,7 +386,7 @@ def stream_image(fd, fat, image, offset, length, args):
     return sent
 
 
-def handle_packet(fd, fat, data, args):
+def handle_packet(fd, fat, data, args, hello_mode_override=None):
     words = pack_words(data)
     cmd = words[0] if words else 0
     pkt_len = words[1] if len(words) > 1 else len(data)
@@ -397,7 +398,7 @@ def handle_packet(fd, fat, data, args):
         if len(data) < SAHARA_HELLO_LEN:
             raise RuntimeError(f"short HELLO len={len(data)}")
         target_mode = words[5] if len(words) > 5 else 0
-        send_hello_resp(fd, words, args)
+        send_hello_resp(fd, words, args, hello_mode_override)
         if target_mode == 3 and args.mode3_close_delay >= 0:
             return "mode3_close", 0, None
         return "restart", 0, None
@@ -542,7 +543,12 @@ def run_session(fat, args, index):
                 log("session", f"{index} eof packets={packets} bytes_sent={bytes_sent}")
                 return packets, bytes_sent, "eof"
             packets += 1
-            action, sent, image = handle_packet(fd, fat, data, args)
+            hello_mode_override = None
+            if restart_deadline is not None and restart_action == "done_restart" and \
+               args.done_hello_mode >= 0 and args.done_hello_mode_image >= -1 and \
+               (args.done_hello_mode_image < 0 or args.done_hello_mode_image == restart_image):
+                hello_mode_override = args.done_hello_mode
+            action, sent, image = handle_packet(fd, fat, data, args, hello_mode_override)
             bytes_sent += sent
             if action == "empty":
                 continue
@@ -655,6 +661,8 @@ def parse_args():
     parser.add_argument("--done-restart-delay", type=float, default=-1.0)
     parser.add_argument("--done-hello-close-image", type=int, default=-2)
     parser.add_argument("--done-hello-close-delay", type=float, default=1.0)
+    parser.add_argument("--done-hello-mode-image", type=int, default=-2)
+    parser.add_argument("--done-hello-mode", type=int, default=-1)
     parser.add_argument("--done-wait-timeout", type=float, default=0.0)
     parser.add_argument("--done-resp-restart-delay", type=float, default=-1.0)
     parser.add_argument("--done-resp-follow-timeout", type=float, default=0.0)
