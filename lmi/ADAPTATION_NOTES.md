@@ -506,6 +506,22 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M75 排除“当前只是误把 `DONE_RESP 0` 当 success，导致没有按 Android `ks` pending 语义等待下一轮 HELLO”作为根因。新证据还说明：当前 `mhi_sahara_diag` 路径里，image34 pending HELLO 后同 fd 不自然产生 image40，仍需要 close/reopen 的 START/RESET 副作用；而 image40 pending HELLO 后无论同 fd 等待还是后续 close/reopen，都没有下一张 image 或 Mission。下一步应从 Android downstream ESOC/client hook 与 MHI channel lifecycle 差异继续收敛：确认是否需要最小 `ESOC_IMG_XFER_DONE`/status-wait bookkeeping、受控 SAHARA channel restart 语义，或修正当前诊断 client 的 START/RESET 时机；仍不补发未请求 bytes，不进入 EDL/firehose，不写 NV/modem/dtbo/recovery/vbmeta，也不提交 firmware blob。
 
+### M76/M77 SAHARA / BL channel lifecycle 诊断
+
+含义：M76/M77 围绕 image40 DONE 后的 SBL 敏感状态继续验证 channel lifecycle，而不是继续猜测 HELLO mode。`/dev/mhi_bl0` 原本只作为 SBL boot log 的只读通道，但实测在 SAHARA 传输前后显式读取 BL 会扰动 modem；因此正常 Sahara progression 测试不能并行读取 BL。为减少破坏性观察，loader 新增默认关闭的 `--stop-before-read-data-image`、`--stop-after-read-data-image`、`--read-data-follow-*` 和 `--diag-after-read-data-*` 诊断开关，只在真实 READ_DATA 边界停住或采样状态。
+
+当前影响：BL 读取干扰可把设备推到 `cached_ee=DISABLE cached_state=RESET reg_ee=INVALID_EE` 一类失败态，表现为 SAHARA `EIO`、BL `No such device` 和字符设备消失；恢复仍只通过普通 Linux reboot。边界采样开关不主动发送未请求 image bytes，不读 BL，不写 NV 或 modem 分区，只用于定位具体 READ_DATA 前后 AP2MDM/MDM2AP 与 MHI cached/reg 状态。M77 之后，BL 只在单独隔离测试中读取，不能作为 image40 后等待 Mission 的 watcher。
+
+后续处理：后续实机验证应继续避开并行 BL read，优先用 `sdx55m_esoc_diag_state` 和 loader 自身日志做只读状态采样。若需要重新读取 BL，必须把它当作可能扰动 SBL 的单独实验，先普通 reboot 恢复干净 SBL/M0，再运行有界测试；不要把 BL 输出解析成 Sahara 包，也不要为了观察 BL 而消耗多轮 SAHARA open/close。
+
+### M78 Android `ks -a 9:mdmddr` / `CMD_READY` 反编译诊断
+
+含义：继续反编译 Android `/vendor/bin/ks`、`libmdmimgload.so` 和 `mdm_helper` 后确认，SDX55M 路径的 `-a 9:mdmddr` 是 Sahara command response 映射，不替代普通 `READ_DATA` image-transfer。只有 modem 发送 `SAHARA_CMD_READY` (`cmd=11`) 时，Android `ks` 才会对队列里的 command id 发送 `SAHARA_CMD_EXEC` (`cmd=13`)，等待 `SAHARA_CMD_EXEC_RESP` (`cmd=14`) 给出 response length，再发送 `SAHARA_CMD_EXEC_DATA` (`cmd=15`) 并读取 raw response；本机 Android argv 中 command id 9 映射到 `mdmddr`。
+
+当前影响：项目内 `lmi/scripts/lmi-sahara-loader.py` 与 rootfs `/usr/local/bin/lmi-sahara-loader` 已补齐被动 command-exec 诊断：默认 `--cmd-exec 9`，并暴露 `--max-command-response` 和 `--command-timeout`；rootfs `/usr/local/sbin/lmi-sahara-test` 同步暴露 `CMD_EXEC`、`MAX_COMMAND_RESPONSE`、`COMMAND_TIMEOUT` 环境变量。loader 只在真实 `CMD_READY` 后发送 `CMD_EXEC` / `CMD_EXEC_DATA`，并只记录 raw response 的长度、SHA256 和前 32 字节，不把 response 写入 modem/NV/分区，也不把 firmware 或 response blob 纳入 git。该改动已通过 Python 和 shell 语法检查，但尚未实机验证 image40 DONE 后是否会出现 `CMD_READY`。
+
+后续处理：下一轮 M78 实机测试应按已知可到 image40 `END_OF_IMAGE` 的 cadence 运行，并观察 post-DONE HELLO 之后是否出现真实 `CMD_READY`。如果没有 `CMD_READY`，不要主动发送 `CMD_EXEC`；如果出现，只允许执行配置的只读 command id 并记录摘要。若 command response 仍不能推进 Mission，应回到 Android ESOC `IMG_XFER_DONE` / `BOOT_DONE` 与 downstream MHI channel lifecycle 差异，不扩大到 SIM、APN、IMS、VoLTE、ModemManager、EDL、firehose、NV 或 modem 分区写入。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。

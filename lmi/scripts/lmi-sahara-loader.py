@@ -2,6 +2,7 @@
 import argparse
 import errno
 import glob
+import hashlib
 import os
 import select
 import struct
@@ -17,6 +18,9 @@ CMD_DONE_RESP = 6
 CMD_RESET = 7
 CMD_READY = 0x0B
 CMD_SWITCH_MODE = 0x0C
+CMD_EXEC = 0x0D
+CMD_EXEC_RESP = 0x0E
+CMD_EXEC_DATA = 0x0F
 SAHARA_HELLO_LEN = 48
 SAHARA_MODE_IMAGE_TX_PENDING = 0
 SAHARA_MODE_IMAGE_TX_COMPLETE = 1
@@ -297,6 +301,61 @@ def send_done(fd, timeout):
     log("tx", "DONE")
 
 
+def read_exact(fd, length, label, args):
+    chunks = []
+    remaining = length
+    while remaining:
+        readable, _, _ = select.select([fd], [], [], args.command_timeout)
+        if not readable:
+            raise TimeoutError(f"read timeout for {label}")
+        try:
+            chunk = os.read(fd, min(args.read_size, remaining))
+        except BlockingIOError:
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                continue
+            raise
+        if not chunk:
+            raise RuntimeError(f"eof while reading {label}")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def send_cmd_exec(fd, cmd_id, args):
+    write_all(fd, struct.pack("<3I", CMD_EXEC, 12, cmd_id), f"cmd_exec{cmd_id}", args.write_timeout)
+    log("tx", f"CMD_EXEC id={cmd_id}")
+    response = read_exact(fd, 16, f"cmd_exec_resp{cmd_id}", args)
+    words = pack_words(response)
+    log("rx", f"cmd_exec_resp len={len(response)} words={' '.join(str(x) for x in words[:4])}")
+    if len(words) < 4 or words[0] != CMD_EXEC_RESP or words[1] != 16:
+        raise RuntimeError(f"unexpected CMD_EXEC_RESP for id={cmd_id}: {words[:4]}")
+    if words[2] != cmd_id:
+        raise RuntimeError(f"CMD_EXEC_RESP id mismatch expected={cmd_id} got={words[2]}")
+    length = words[3]
+    if length > args.max_command_response:
+        raise RuntimeError(f"command response too large id={cmd_id} length={length} max={args.max_command_response}")
+    if length == 0:
+        log("cmd_exec_raw", f"id={cmd_id} bytes=0")
+        return 0
+    write_all(fd, struct.pack("<3I", CMD_EXEC_DATA, 12, cmd_id), f"cmd_exec_data{cmd_id}", args.write_timeout)
+    log("tx", f"CMD_EXEC_DATA id={cmd_id} length={length}")
+    payload = read_exact(fd, length, f"cmd_exec_raw{cmd_id}", args)
+    digest = hashlib.sha256(payload).hexdigest()
+    log("cmd_exec_raw", f"id={cmd_id} bytes={len(payload)} sha256={digest} head={payload[:32].hex()}")
+    return len(payload)
+
+
+def handle_cmd_ready(fd, args):
+    queue = getattr(args, "cmd_exec_queue", [])
+    log("ready", f"received READY queued_cmds={len(queue)}")
+    total = 0
+    while queue:
+        total += send_cmd_exec(fd, queue.pop(), args)
+    return total
+
+
 def iter_raw_range(path, offset, length, chunk_size):
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -362,6 +421,10 @@ def restore_keep_prepared(args, value):
         log("keep_prepared", f"restore_failed {args.keep_prepared_param}: {exc}")
 
 
+def read_data_filter_matches(option_image, min_offset, image, offset):
+    return option_image >= -1 and (option_image < 0 or option_image == image) and offset >= min_offset
+
+
 def stream_image(fd, fat, image, offset, length, args):
     if image not in IMAGE_PATHS:
         raise RuntimeError(f"unhandled image id {image}")
@@ -409,11 +472,24 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
             raise RuntimeError("short READ_DATA")
         image = words[2]
         offset = words[3]
-        sent = stream_image(fd, fat, image, offset, words[4], args)
+        length = words[4]
+        if read_data_filter_matches(args.stop_before_read_data_image,
+                                    args.stop_before_read_data_min_offset,
+                                    image, offset):
+            log("stop_before_read_data", f"image={image} offset={offset} length={length}")
+            log_diag_state(args, f"stop_before_read_data image={image} offset={offset}")
+            return "stop_before_read_data", 0, image
+        sent = stream_image(fd, fat, image, offset, length, args)
         if (args.diag_after_read_data_image < 0 or
                 args.diag_after_read_data_image == image) and \
                 offset >= args.diag_after_read_data_min_offset:
             log_diag_state(args, f"after_read_data image={image} offset={offset}")
+        if read_data_filter_matches(args.stop_after_read_data_image,
+                                    args.stop_after_read_data_min_offset,
+                                    image, offset):
+            log("stop_after_read_data", f"image={image} offset={offset} length={length} bytes={sent}")
+            log_diag_state(args, f"stop_after_read_data image={image} offset={offset}")
+            return "stop_after_read_data", sent, image
         follow_image = args.read_data_follow_image
         if args.read_data_follow_timeout > 0 and \
            (follow_image < 0 or follow_image == image) and \
@@ -459,7 +535,10 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
             return "done_resp_follow", 0, None
         return "stop", 0, None
     if cmd == CMD_READY:
-        log("ready", "received READY")
+        handle_cmd_ready(fd, args)
+        return "progress", 0, None
+    if cmd == CMD_EXEC_RESP:
+        log("cmd_exec_resp", "received outside CMD_READY")
         return "progress", 0, None
     if cmd == CMD_SWITCH_MODE:
         mode = words[2] if len(words) > 2 else None
@@ -639,8 +718,8 @@ def run_session(fat, args, index):
                 ks_pending_phase = "hello"
                 ks_pending_deadline = time.monotonic() + args.ks_pending_timeout
                 log("session", f"{index} ks_pending_wait_hello_timeout={args.ks_pending_timeout}")
-            if action == "stop":
-                return packets, bytes_sent, "stop"
+            if action in ("stop", "stop_before_read_data", "stop_after_read_data"):
+                return packets, bytes_sent, action
             if action in ("restart", "done_restart", "done_resp_restart") and hold_deadline is None:
                 delay = args.restart_after_packet_delay
                 if action == "done_restart" and args.done_restart_delay >= 0:
@@ -658,6 +737,19 @@ def run_session(fat, args, index):
     finally:
         os.close(fd)
         log("session", f"{index} close")
+
+
+def parse_cmd_exec_ids(text):
+    ids = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        cmd_id = int(part, 0)
+        if cmd_id < 0 or cmd_id > 0xffffffff:
+            raise ValueError(f"invalid command id {part}")
+        ids.append(cmd_id)
+    return ids
 
 
 def parse_args():
@@ -680,6 +772,10 @@ def parse_args():
     parser.add_argument("--read-data-follow-timeout", type=float, default=0.0)
     parser.add_argument("--read-data-follow-image", type=int, default=-1)
     parser.add_argument("--read-data-follow-min-offset", type=int, default=0)
+    parser.add_argument("--stop-before-read-data-image", type=int, default=-2)
+    parser.add_argument("--stop-before-read-data-min-offset", type=int, default=0)
+    parser.add_argument("--stop-after-read-data-image", type=int, default=-2)
+    parser.add_argument("--stop-after-read-data-min-offset", type=int, default=0)
     parser.add_argument("--diag-state-path", default="/sys/bus/pci/devices/*/sdx55m_esoc_diag_state")
     parser.add_argument("--diag-after-read-data-image", type=int, default=-1)
     parser.add_argument("--diag-after-read-data-min-offset", type=int, default=0)
@@ -688,7 +784,10 @@ def parse_args():
     parser.add_argument("--read-size", type=int, default=4096)
     parser.add_argument("--chunk-size", type=int, default=65536)
     parser.add_argument("--max-request", type=int, default=268435456)
+    parser.add_argument("--max-command-response", type=int, default=16777216)
     parser.add_argument("--write-timeout", type=float, default=30.0)
+    parser.add_argument("--command-timeout", type=float, default=30.0)
+    parser.add_argument("--cmd-exec", default="9")
     parser.add_argument("--image34", default="/dev/disk/by-partlabel/mdmddr")
     parser.add_argument("--image40", default="/dev/disk/by-partlabel/msadp")
     parser.add_argument("--hello-mode", type=int, default=0)
@@ -701,7 +800,9 @@ def parse_args():
     parser.add_argument("--keep-prepared-after-done", action="store_true")
     parser.add_argument("--keep-prepared-after-done-resp", action="store_true")
     parser.add_argument("--keep-prepared-param", default="/sys/module/mhi_sahara_diag/parameters/keep_prepared_on_release")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.cmd_exec_queue = parse_cmd_exec_ids(args.cmd_exec)
+    return args
 
 
 def main():
@@ -728,8 +829,8 @@ def main():
             if empty >= args.empty_limit:
                 log("summary", f"stop_after_empty_sessions={empty}")
                 break
-            if reason == "stop":
-                log("summary", "stop_after_terminal_packet")
+            if reason in ("stop", "stop_before_read_data", "stop_after_read_data"):
+                log("summary", f"stop_after_terminal_packet reason={reason}")
                 break
             if index != args.sessions:
                 delay = args.after_mode3_delay if reason == "mode3_close" else args.between_sessions
