@@ -47,6 +47,14 @@ static bool mhi_sahara_keep_prepared_on_release;
 module_param_named(keep_prepared_on_release, mhi_sahara_keep_prepared_on_release, bool, 0644);
 MODULE_PARM_DESC(keep_prepared_on_release, "Keep Sahara transfer rings prepared when userspace closes the diagnostic device");
 
+static bool mhi_sahara_ring_ul_db_after_ul;
+module_param_named(ring_ul_db_after_ul, mhi_sahara_ring_ul_db_after_ul, bool, 0644);
+MODULE_PARM_DESC(ring_ul_db_after_ul, "Ring the SAHARA UL channel doorbell after UL completion");
+
+static bool mhi_sahara_ring_dl_db_after_ul;
+module_param_named(ring_dl_db_after_ul, mhi_sahara_ring_dl_db_after_ul, bool, 0644);
+MODULE_PARM_DESC(ring_dl_db_after_ul, "Ring the SAHARA DL channel doorbell after UL completion");
+
 static bool mhi_sahara_bl_auto_start;
 module_param_named(bl_auto_start, mhi_sahara_bl_auto_start, bool, 0644);
 MODULE_PARM_DESC(bl_auto_start, "Automatically start the read-only BL diagnostic channel");
@@ -121,6 +129,61 @@ static struct mhi_sahara_buf *mhi_sahara_rx_from_data(struct mhi_sahara_dev *sde
 	return (struct mhi_sahara_buf *)((u8 *)data + sdev->mtu);
 }
 
+static u64 mhi_sahara_ring_ptr(struct mhi_ring *ring, const void *ptr)
+{
+	if (!ring->base || !ptr)
+		return 0;
+
+	return ring->iommu_base + ((const u8 *)ptr - (const u8 *)ring->base);
+}
+
+static u64 mhi_sahara_context_wp(struct mhi_ring *ring)
+{
+	return ring->ctxt_wp ? le64_to_cpu(*ring->ctxt_wp) : 0;
+}
+
+static void mhi_sahara_log_chan(struct mhi_sahara_dev *sdev,
+					struct mhi_chan *mhi_chan, const char *tag)
+{
+	struct mhi_ring *tre_ring;
+	unsigned long flags;
+	u32 ch_state;
+	u32 ccs;
+	u32 db_mode;
+	u64 tre_rp;
+	u64 tre_wp;
+	u64 ctxt_wp;
+	u64 db_val;
+
+	if (!mhi_chan)
+		return;
+
+	tre_ring = &mhi_chan->tre_ring;
+	read_lock_irqsave(&mhi_chan->lock, flags);
+	ch_state = mhi_chan->ch_state;
+	ccs = mhi_chan->ccs;
+	db_mode = mhi_chan->db_cfg.db_mode;
+	tre_rp = mhi_sahara_ring_ptr(tre_ring, tre_ring->rp);
+	tre_wp = mhi_sahara_ring_ptr(tre_ring, tre_ring->wp);
+	ctxt_wp = mhi_sahara_context_wp(tre_ring);
+	db_val = mhi_chan->db_cfg.db_val;
+	read_unlock_irqrestore(&mhi_chan->lock, flags);
+
+	dev_info(&sdev->mhi_dev->dev,
+		 "SAHARA %s chan%u dir=%u state=%u ccs=%u tre_rp=0x%llx tre_wp=0x%llx ctxt_wp=0x%llx db_mode=%u db_val=0x%llx\n",
+		 tag, mhi_chan->chan, mhi_chan->dir, ch_state, ccs,
+		 tre_rp, tre_wp, ctxt_wp, db_mode, db_val);
+}
+
+static void mhi_sahara_log_channels(struct mhi_sahara_dev *sdev, const char *tag)
+{
+	if (!sdev->allow_write)
+		return;
+
+	mhi_sahara_log_chan(sdev, sdev->mhi_dev->ul_chan, tag);
+	mhi_sahara_log_chan(sdev, sdev->mhi_dev->dl_chan, tag);
+}
+
 static void mhi_sahara_log_state(struct mhi_sahara_dev *sdev, const char *tag)
 {
 	struct mhi_controller *mhi_cntrl = sdev->mhi_dev->mhi_cntrl;
@@ -136,6 +199,28 @@ static void mhi_sahara_log_state(struct mhi_sahara_dev *sdev, const char *tag)
 		 "SAHARA %s: cached_ee=%s cached_state=%s reg_ee=%s reg_state=%s pm_state=0x%x\n",
 		 tag, TO_MHI_EXEC_STR(mhi_cntrl->ee), mhi_state_str(mhi_cntrl->dev_state),
 		 TO_MHI_EXEC_STR(reg_ee), mhi_state_str(reg_state), mhi_cntrl->pm_state);
+	mhi_sahara_log_channels(sdev, tag);
+}
+
+static void mhi_sahara_ring_chan_db_now(struct mhi_sahara_dev *sdev,
+					 struct mhi_chan *mhi_chan, const char *tag)
+{
+	struct mhi_controller *mhi_cntrl = sdev->mhi_dev->mhi_cntrl;
+	unsigned long flags;
+	bool db_valid;
+
+	if (!mhi_chan)
+		return;
+
+	read_lock_irqsave(&mhi_cntrl->pm_lock, flags);
+	db_valid = MHI_DB_ACCESS_VALID(mhi_cntrl);
+	if (db_valid)
+		mhi_ring_chan_db(mhi_cntrl, mhi_chan);
+	read_unlock_irqrestore(&mhi_cntrl->pm_lock, flags);
+
+	dev_info(&sdev->mhi_dev->dev, "SAHARA %s chan%u ring_db db_valid=%u\n",
+		 tag, mhi_chan->chan, db_valid);
+	mhi_sahara_log_chan(sdev, mhi_chan, tag);
 }
 
 static void mhi_sahara_dump_words(struct mhi_sahara_dev *sdev, const char *tag,
@@ -733,6 +818,12 @@ static void mhi_sahara_ul_xfer_cb(struct mhi_device *mhi_dev,
 		dev_info(&mhi_dev->dev, "SAHARA UL completion status %d bytes %zu\n",
 			 result->transaction_status, result->bytes_xferd);
 		mhi_sahara_log_state(sdev, "UL completion");
+		if (!result->transaction_status && mhi_sahara_ring_ul_db_after_ul)
+			mhi_sahara_ring_chan_db_now(sdev, mhi_dev->ul_chan,
+							    "UL completion UL re-ring");
+		if (!result->transaction_status && mhi_sahara_ring_dl_db_after_ul)
+			mhi_sahara_ring_chan_db_now(sdev, mhi_dev->dl_chan,
+							    "UL completion DL re-ring");
 	}
 
 	kfree(result->buf_addr);

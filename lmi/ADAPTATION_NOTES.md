@@ -538,6 +538,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M81/M82 排除了“用户态保持 fd 不够久”“`select()` 漏唤醒”和“主动读 drain 不及时”作为当前主因。结合下游 Android UCI 也会在 open 时排满 RX TRE、本地 `mhi_sahara_diag` 已在读取后重排 RX buffer，以及 Android `ks` 反编译显示 MHI pipe fd 只在 Sahara 状态机外层打开/关闭，下一步应转向 kernel/channel 层证据：对比 downstream MHI channel START/RESET、doorbell、runtime wake 和 ESOC client lifecycle，解释为什么 SDX55M SBL 只有在 host release-time RESET/START 后才发下一条 Sahara 包。继续避免猜 HELLO mode，不读 BL，不主动发送未请求 payload，不写 NV/modem/dtbo/recovery/vbmeta，也不提交 firmware blob。
 
+### M83 SAHARA channel ring / doorbell 诊断
+
+含义：M83 在 `mhi_sahara_diag` 中为 SAHARA UL completion 增加 UL/DL channel ring pointer、context WP、doorbell mode/value 日志，并新增默认关闭的 `ring_ul_db_after_ul` / `ring_dl_db_after_ul` 参数，用于只在显式测试时于 UL completion 后额外敲 UL 或 DL doorbell，验证当前同 fd 不推进是否只是缺少一次 channel doorbell。
+
+当前影响：M83 内核构建通过，boot-only 镜像只刷 `boot` 后 `/sys/module/mhi_sahara_diag/parameters/ring_dl_db_after_ul` 与 `/dev/mhi_sahara0` 均存在。默认关闭 re-ring 时，`--continuous --active-read-drain` 仍只得到每个 open 一个包：HELLO、image34 offset 0/40、image34 offset 40/1596 分别依赖 close/reopen 后出现。dmesg 同步显示 UL completion 时 ch2/ch3 均为 enabled，DL ring 已有重新排队后的 RX TRE，`ctxt_wp` / `db_val` 已指向当前 WP。随后临时打开 `ring_dl_db_after_ul=Y`，image34 `END_OF_IMAGE` 后 host 发送 `DONE`，UL completion 路径额外记录 `DL re-ring chan3 ring_db db_valid=1`，但 20 秒内没有 `DONE_RESP`，后续 session 也没有新 Sahara packet；测试后 re-ring 和 keep-prepared 参数均恢复为关闭。
+
+后续处理：M83 排除了“host 已重排 RX 但忘记敲 DL doorbell”这一简单分支。下一步应继续对照 Android downstream MHI queue 顺序、runtime wake/trigger resume、channel lock 保护、DB_MODE 语义，以及 ESOC client link power-on / image-transfer done 前后的 channel 生命周期；不要把 re-ring 作为默认修复，也继续不读 BL、不主动发送未请求 payload、不发送 `CMD_EXEC` 除非真实 `CMD_READY` 出现，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
