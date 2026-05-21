@@ -181,11 +181,23 @@ static u64 mhi_sahara_context_wp(struct mhi_ring *ring)
 static void mhi_sahara_log_chan(struct mhi_sahara_dev *sdev,
 					struct mhi_chan *mhi_chan, const char *tag)
 {
+	struct mhi_controller *mhi_cntrl = sdev->mhi_dev->mhi_cntrl;
+	struct mhi_chan_ctxt *chan_ctxt = NULL;
+	struct mhi_ring *buf_ring;
 	struct mhi_ring *tre_ring;
 	unsigned long flags;
 	u32 ch_state;
+	u32 chcfg = 0;
+	u32 chtype = 0;
 	u32 ccs;
 	u32 db_mode;
+	u32 erindex = 0;
+	u64 buf_rp;
+	u64 buf_wp;
+	u64 ctx_rbase = 0;
+	u64 ctx_rlen = 0;
+	u64 ctx_rp = 0;
+	u64 ctx_wp = 0;
 	u64 tre_rp;
 	u64 tre_wp;
 	u64 ctxt_wp;
@@ -194,21 +206,38 @@ static void mhi_sahara_log_chan(struct mhi_sahara_dev *sdev,
 	if (!mhi_chan)
 		return;
 
+	if (mhi_cntrl->mhi_ctxt)
+		chan_ctxt = &mhi_cntrl->mhi_ctxt->chan_ctxt[mhi_chan->chan];
+
+	buf_ring = &mhi_chan->buf_ring;
 	tre_ring = &mhi_chan->tre_ring;
 	read_lock_irqsave(&mhi_chan->lock, flags);
 	ch_state = mhi_chan->ch_state;
 	ccs = mhi_chan->ccs;
 	db_mode = mhi_chan->db_cfg.db_mode;
+	buf_rp = mhi_sahara_ring_ptr(buf_ring, buf_ring->rp);
+	buf_wp = mhi_sahara_ring_ptr(buf_ring, buf_ring->wp);
 	tre_rp = mhi_sahara_ring_ptr(tre_ring, tre_ring->rp);
 	tre_wp = mhi_sahara_ring_ptr(tre_ring, tre_ring->wp);
 	ctxt_wp = mhi_sahara_context_wp(tre_ring);
 	db_val = mhi_chan->db_cfg.db_val;
+	if (chan_ctxt) {
+		chcfg = le32_to_cpu(chan_ctxt->chcfg);
+		chtype = le32_to_cpu(chan_ctxt->chtype);
+		erindex = le32_to_cpu(chan_ctxt->erindex);
+		ctx_rbase = le64_to_cpu(chan_ctxt->rbase);
+		ctx_rlen = le64_to_cpu(chan_ctxt->rlen);
+		ctx_rp = le64_to_cpu(chan_ctxt->rp);
+		ctx_wp = le64_to_cpu(chan_ctxt->wp);
+	}
 	read_unlock_irqrestore(&mhi_chan->lock, flags);
 
 	dev_info(&sdev->mhi_dev->dev,
-		 "SAHARA %s chan%u dir=%u state=%u ccs=%u tre_rp=0x%llx tre_wp=0x%llx ctxt_wp=0x%llx db_mode=%u db_val=0x%llx\n",
+		 "SAHARA %s chan%u dir=%u state=%u ccs=%u chcfg=0x%x chtype=0x%x erindex=%u ctx_rbase=0x%llx ctx_rlen=0x%llx ctx_rp=0x%llx ctx_wp=0x%llx tre_rp=0x%llx tre_wp=0x%llx buf_rp=0x%llx buf_wp=0x%llx ctxt_wp=0x%llx db_mode=%u db_val=0x%llx\n",
 		 tag, mhi_chan->chan, mhi_chan->dir, ch_state, ccs,
-		 tre_rp, tre_wp, ctxt_wp, db_mode, db_val);
+		 chcfg, chtype, erindex, ctx_rbase, ctx_rlen, ctx_rp,
+		 ctx_wp, tre_rp, tre_wp, buf_rp, buf_wp, ctxt_wp,
+		 db_mode, db_val);
 }
 
 static void mhi_sahara_log_channels(struct mhi_sahara_dev *sdev, const char *tag)

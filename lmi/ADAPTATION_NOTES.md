@@ -610,6 +610,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：下一版应把重点从 payload grouping 转到 restart/context 同步：在 SAHARA restart 前后记录 channel context `rbase/rp/wp`、host `tre_ring`/`buf_ring` rp/wp、`tre_ring->ctxt_wp`、`db_cfg.db_val` 和 event stale/reset 结果，确认是否存在 restart 后 doorbell 或 context WP 仍指向旧环位置。若确认 full unprepare/prepare 会破坏同步，再测试更轻量的 restart/progression 方式，而不是继续堆固定 delay。仍保持只响应真实 `READ_DATA`、不读 `/dev/mhi_bl0`、不进入 EDL、不发送 firehose、不写 NV/modem/dtbo/recovery/vbmeta、不提交 firmware blob。
 
+### M93 SAHARA restart context 与 doorbell stale 诊断
+
+含义：M93 在 SAHARA restart 前后记录 device-visible channel context `rbase/rlen/rp/wp`、host `tre_ring` / `buf_ring` rp/wp、`ctxt_wp`、`db_cfg.db_val`、channel state、CCS 和 event ring index，用来验证 M91/M92 怀疑的 full `mhi_unprepare_from_transfer()` / `mhi_prepare_for_transfer()` 后 context/doorbell 是否失步。M93b 进一步把 `restart_track_read_data_len=1`、`restart_suppress_read_data_len=1`，验证“所有 READ_DATA payload 后都禁止 full restart”是否能自然推进。
+
+当前影响：M93 boot-only 镜像只刷 `boot` 后可启动，`/dev/mhi_sahara0` 正常出现。按 M90-like 参数 `restart_after_ul_delay_ms=200`、`restart_track_read_data_len=4096`、`restart_suppress_read_data_len=131072`、`--continuous --active-read-drain` 复测时，流程推进到 image34/mdmddr 完整、`DONE_RESP image_tx_pending=0`、新 HELLO/HELLO_RESP 和 image40/APDP offset 0/52，随后出现 invalid zero RX 并 idle timeout。关键 dmesg 证据是 restart 后 UL channel 的 device context 与 host WP 已重置到 ring base，但 cached doorbell value 仍停在旧地址：例如 chan2 `ctx_wp=0xfffb5000 tre_wp=0xfffb5000 ctxt_wp=0xfffb5000`，同时 `db_val=0xfffb5010` 或后续 `db_val=0xfffb5040`。这说明 repeated full restart 确实可能留下旧 doorbell 缓存，而不是单纯 userspace grouping 或固定 delay 问题。
+
+M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP 后的 restart，并抑制所有 READ_DATA payload 后的 restart：image34 offset 0/40 写入后内核记录 `SAHARA suppressing channel restart after READ_DATA image=34 remaining=0`，随后不再出现 image34 offset 40/1596 并 idle timeout。该结果说明某种 post-UL progression 动作仍是必要的；但当前的 full unprepare/prepare restart 又会造成 context/doorbell stale 风险。M94 不应继续盲目堆固定 delay，应测试更轻量的 post-UL 推进或显式 context/doorbell resync，并按阶段限制 full restart 使用范围。仍保持只响应真实 `READ_DATA`、不读 `/dev/mhi_bl0`、不进入 EDL、不发送 firehose、不写 NV/modem/dtbo/recovery/vbmeta、不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
