@@ -97,6 +97,12 @@ module_param_named(requeue_discarded_rx,
 MODULE_PARM_DESC(requeue_discarded_rx,
 		 "Requeue successful empty or invalid SAHARA RX buffers instead of freeing them");
 
+static bool mhi_sahara_restart_cancel_on_invalid_rx;
+module_param_named(restart_cancel_on_invalid_rx,
+			   mhi_sahara_restart_cancel_on_invalid_rx, bool, 0644);
+MODULE_PARM_DESC(restart_cancel_on_invalid_rx,
+			 "Cancel pending SAHARA channel restart after invalid RX packets");
+
 static bool mhi_sahara_bl_auto_start;
 module_param_named(bl_auto_start, mhi_sahara_bl_auto_start, bool, 0644);
 MODULE_PARM_DESC(bl_auto_start, "Automatically start the read-only BL diagnostic channel");
@@ -1160,6 +1166,11 @@ static void mhi_sahara_dl_xfer_cb(struct mhi_device *mhi_dev,
 		mhi_sahara_log_rx_packet(sdev, result->buf_addr, result->bytes_xferd);
 		dev_info(&mhi_dev->dev, "SAHARA dropping invalid RX packet len %zu\n",
 			 result->bytes_xferd);
+		if (sdev->allow_write && mhi_sahara_restart_cancel_on_invalid_rx &&
+		    mhi_sahara_restart_after_ul_completion &&
+		    cancel_delayed_work(&sdev->restart_work))
+			dev_info(&mhi_dev->dev,
+				 "SAHARA canceled pending channel restart after invalid RX packet\n");
 		mhi_sahara_discard_rx_buf(sdev, rx, "invalid");
 		wake_up_all(&sdev->read_wq);
 		return;

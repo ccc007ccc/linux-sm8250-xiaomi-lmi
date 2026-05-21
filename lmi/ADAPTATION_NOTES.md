@@ -682,6 +682,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M101 证明 BAD_TRE failed-completion 与 discarded RX requeue 可以作为安全诊断手段推进部分 ring 状态，但不是最终修复；当前停点进一步收敛到 image40 `DONE` 后 post-image40 HELLO/HELLO_RESP 之后的 20 字节全零 RX 与 pending restart/resync 生命周期。M102 应重点比较 Android `ks` 在 post-image DONE/HELLO 后是否保持同一 SAHARA channel 上下文、是否避免 HELLO_RESP 后立刻 full restart、以及 invalid zero RX 是否应取消或延后 restart，而不是继续增加固定 delay、空 doorbell re-ring 或单独 requeue。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M102 invalid RX restart cancel 诊断
+
+含义：M102 在 `mhi_sahara_diag` 中加入默认关闭的 `restart_cancel_on_invalid_rx` 参数，使 invalid RX packet 也能像有效 DL packet 一样取消已经排队的 UL-completion channel restart。该诊断专门针对 M101 的 image40 `DONE` 后窗口：post-image40 HELLO/HELLO_RESP 前后出现 zero/invalid RX 时，验证是否应该避免马上 full restart/resync 并保留同一 SAHARA channel 上下文。
+
+当前影响：M102 boot-only 镜像只刷 `boot` 后启动正常；实机运行时打开 `mhi.sbl_bad_tre_complete=Y`、`mhi_sahara_diag.requeue_discarded_rx=Y`、`restart_cancel_on_invalid_rx=Y`，沿用 200ms UL completion restart、`restart_resync_db_val=Y`、`restart_ring_ul_db=N` 与 `--hello-resp-delay 0`。本轮完成 image34/mdmddr、`DONE_RESP pending`、post-image34 HELLO，以及 image40/APDP offset 0/52、52/96、4096/6712、12288/1220 和 `END_OF_IMAGE image=40 status=0`；dmesg 中 chan3 `BAD_TRE` failed-completion 命中 4 次。image40 `DONE` 后出现 12 字节全零 invalid RX，M102 新逻辑成功打印 `SAHARA canceled pending channel restart after invalid RX packet` 并 requeue buffer，随后 SBL 继续发送 post-image40 HELLO，host 回 `HELLO_RESP`。但该 `HELLO_RESP` 的 UL completion 又重新调度 200ms channel restart，之后 full restart/resync 并 240 秒 idle；仍没有 image41/devcfg、`CMD_READY`、Mission/AMSS、MDM2AP_STATUS 拉高或 `SYS_ERROR`。
+
+后续处理：M102 证明 invalid RX cancel 分支有效且安全，但不足以推进到 image41；当前停点进一步定位为 post-image40 HELLO_RESP 自身的 UL completion restart，而不是 image40 DONE 后 invalid RX 的旧 restart。M103 应新增更窄的默认关闭诊断：在刚处理过 post-image DONE/HELLO 的情况下，抑制或延后 HELLO_RESP UL completion 触发的 full channel restart，观察 modem 是否在同一 channel 上下文继续发 image41/devcfg 或 `CMD_READY`。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
