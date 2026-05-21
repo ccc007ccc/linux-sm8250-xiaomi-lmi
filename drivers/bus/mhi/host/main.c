@@ -48,6 +48,11 @@ module_param_named(sbl_accept_multi_tre_completion,
 MODULE_PARM_DESC(sbl_accept_multi_tre_completion,
 		 "Accept downstream-style multi-TRE completions on SBL boot channels");
 
+static bool mhi_sbl_bad_tre_ring_db;
+module_param_named(sbl_bad_tre_ring_db, mhi_sbl_bad_tre_ring_db, bool, 0644);
+MODULE_PARM_DESC(sbl_bad_tre_ring_db,
+		 "Re-ring SBL boot channel doorbell after BAD_TRE events");
+
 #define MHI_SBL_SAHARA_MIN_LEN		8
 #define MHI_SBL_SAHARA_MAX_LEN		4096
 #define MHI_SBL_SAHARA_CMD_HELLO		1
@@ -948,6 +953,40 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 		break;
 	}
 	case MHI_EV_CC_BAD_TRE:
+	{
+		dma_addr_t ptr = MHI_TRE_GET_EV_PTR(event);
+		struct mhi_ring_element *bad_tre = NULL;
+		unsigned long pm_lock_flags;
+
+		if (is_valid_ring_ptr(tre_ring, ptr))
+			bad_tre = mhi_to_virtual(tre_ring, ptr);
+
+		if (mhi_is_sbl_boot_chan(mhi_chan) && bad_tre)
+			dev_warn(dev,
+				 "SBL channel %u BAD_TRE ptr 0x%llx tre_rp 0x%llx tre_wp 0x%llx bad_tre_ptr 0x%llx dword0 0x%x dword1 0x%x\n",
+				 mhi_chan->chan, (unsigned long long)ptr,
+				 (unsigned long long)(tre_ring->iommu_base +
+					((u8 *)tre_ring->rp - (u8 *)tre_ring->base)),
+				 (unsigned long long)(tre_ring->iommu_base +
+					((u8 *)tre_ring->wp - (u8 *)tre_ring->base)),
+				 (unsigned long long)le64_to_cpu(bad_tre->ptr),
+				 le32_to_cpu(bad_tre->dword[0]),
+				 le32_to_cpu(bad_tre->dword[1]));
+		else
+			dev_err(dev, "BAD_TRE event 0x%x ptr 0x%llx\n",
+				ev_code, (unsigned long long)ptr);
+
+		if (mhi_is_sbl_boot_chan(mhi_chan) && mhi_sbl_bad_tre_ring_db) {
+			read_lock_irqsave(&mhi_cntrl->pm_lock, pm_lock_flags);
+			if (tre_ring->wp != tre_ring->rp && MHI_DB_ACCESS_VALID(mhi_cntrl)) {
+				dev_warn(dev, "SBL channel %u re-ring DB after BAD_TRE\n",
+					 mhi_chan->chan);
+				mhi_ring_chan_db(mhi_cntrl, mhi_chan);
+			}
+			read_unlock_irqrestore(&mhi_cntrl->pm_lock, pm_lock_flags);
+		}
+		break;
+	}
 	default:
 		dev_err(dev, "Unknown event 0x%x\n", ev_code);
 		break;

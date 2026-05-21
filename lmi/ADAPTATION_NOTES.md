@@ -642,6 +642,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：继续保留 M94b 的 skipped RX 短包推断/零长度处理和 `restart_resync_db_val=Y`、`restart_ring_ul_db=N` 路线。下一步不要再模拟整块全零 RX buffer；应更精确比较 upstream 与 Android downstream 在 multi-TRE completion 后如何推进 event ring RP、channel TRE RP、RX requeue 和 BAD_TRE 恢复，并重点处理 chan3 `MHI_EV_CC_BAD_TRE` 对后续 image 请求节拍的影响。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M97 BAD_TRE / image40 零 RX 诊断
+
+含义：M97 对照 Android downstream `mhi_main.c` 后确认，下游对 `MHI_EV_CC_BAD_TRE` 也只是 assert，没有独立恢复分支；因此本轮只在主线 MHI core 中加入 SBL boot channel 的 BAD_TRE 细节日志，并提供默认关闭的 `mhi.sbl_bad_tre_ring_db` 诊断开关，用于必要时在 BAD_TRE 后重新敲 channel doorbell。
+
+当前影响：M97 default boot 只刷 `boot` 后参数可见，默认 `sbl_bad_tre_ring_db=N`、M94b 等价 `restart_resync_db_val=Y`、`restart_ring_ul_db=N`。实机没有复现 M96 的 chan3 `BAD_TRE` / `Unknown event 0x11`，流程比 M96 进一步到 image34/mdmddr 完整、`DONE_RESP pending`、post-DONE HELLO/HELLO_RESP 和 image40/APDP offset 0 length 52；但发送 52 字节后，DL 侧回调了一个长度 20、内容全零的无效 RX packet（`cmd=0 pkt_len=0`），随后 idle。进一步打开 `ring_dl_db_after_ul=Y` 会更早停在 post-image34 HELLO/HELLO_RESP；把 `restart_after_ul_delay_ms` 拉到 1000ms 也回退到 image34 后停住，说明“额外敲 DL doorbell”或“单纯等更久”都不是当前修复方向。
+
+后续处理：BAD_TRE 详细日志和默认关闭的 re-ring 开关保留为诊断工具，但 M97 的可复现主因已转为 image40 首个 52 字节请求后的零 RX / RX requeue / channel restart 状态同步问题。下一步应对照 M94b 成功越过 image40 52 字节后的日志，重点比较 `parse_xfer_event()` 的 event ring RP、channel TRE RP、RX requeue、invalid RX drop、restart 后 context/doorbell resync 与自定义 event drain 是否错误推进空事件；仍不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
