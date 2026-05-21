@@ -10,6 +10,7 @@
 #include <linux/miscdevice.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/pm_wakeup.h>
 #include <linux/poll.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
@@ -97,6 +98,12 @@ module_param_named(requeue_discarded_rx,
 MODULE_PARM_DESC(requeue_discarded_rx,
 		 "Requeue successful empty or invalid SAHARA RX buffers instead of freeing them");
 
+static bool mhi_sahara_async_rx_requeue = true;
+module_param_named(async_rx_requeue,
+		   mhi_sahara_async_rx_requeue, bool, 0644);
+MODULE_PARM_DESC(async_rx_requeue,
+		 "Copy valid SAHARA RX packets to userspace and immediately requeue MHI RX buffers");
+
 static bool mhi_sahara_restart_cancel_on_invalid_rx;
 module_param_named(restart_cancel_on_invalid_rx,
 			   mhi_sahara_restart_cancel_on_invalid_rx, bool, 0644);
@@ -113,6 +120,7 @@ struct mhi_sahara_buf {
 	void *data;
 	size_t len;
 	bool queued;
+	bool recycle_after_read;
 };
 
 struct mhi_sahara_tx_chunk {
@@ -160,6 +168,11 @@ static void mhi_sahara_put(struct mhi_sahara_dev *sdev)
 
 	kfree(sdev->miscdev.name);
 	kfree(sdev);
+}
+
+static bool mhi_sahara_async_rx_enabled(struct mhi_sahara_dev *sdev)
+{
+	return sdev->allow_write && mhi_sahara_async_rx_requeue;
 }
 
 static void mhi_sahara_schedule_drain(struct mhi_sahara_dev *sdev)
@@ -498,6 +511,7 @@ static int mhi_sahara_queue_rx_buf(struct mhi_sahara_dev *sdev,
 	INIT_LIST_HEAD(&rx->queued_node);
 	rx->len = 0;
 	rx->queued = true;
+	rx->recycle_after_read = true;
 	memset(rx->data, 0, sdev->mtu);
 
 	spin_lock_bh(&sdev->rx_lock);
@@ -534,14 +548,50 @@ static int mhi_sahara_alloc_queue_rx(struct mhi_sahara_dev *sdev)
 	return mhi_sahara_queue_rx_buf(sdev, rx);
 }
 
+static struct mhi_sahara_buf *mhi_sahara_clone_rx_packet(const void *buf, size_t len)
+{
+	struct mhi_sahara_buf *rx;
+	size_t meta_offset;
+	void *data;
+
+	meta_offset = ALIGN(len, __alignof__(*rx));
+	data = kmalloc(meta_offset + sizeof(*rx), GFP_ATOMIC);
+	if (!data)
+		return NULL;
+
+	memcpy(data, buf, len);
+	rx = (struct mhi_sahara_buf *)((u8 *)data + meta_offset);
+	INIT_LIST_HEAD(&rx->node);
+	INIT_LIST_HEAD(&rx->queued_node);
+	rx->data = data;
+	rx->len = len;
+	rx->queued = false;
+	rx->recycle_after_read = false;
+
+	return rx;
+}
+
+static void mhi_sahara_deliver_rx_buf(struct mhi_sahara_dev *sdev,
+				      struct mhi_sahara_buf *rx)
+{
+	spin_lock_bh(&sdev->rx_lock);
+	if (sdev->opened || sdev->keep_rx_without_open ||
+	    (sdev->allow_write && mhi_sahara_keep_prepared_on_release))
+		list_add_tail(&rx->node, &sdev->pending_rx);
+	else
+		kfree(rx->data);
+	spin_unlock_bh(&sdev->rx_lock);
+}
+
 static void mhi_sahara_discard_rx_buf(struct mhi_sahara_dev *sdev,
 				       struct mhi_sahara_buf *rx, const char *reason)
 {
+	bool async_rx = mhi_sahara_async_rx_enabled(sdev);
 	int free_before;
 	int free_after;
 	int ret;
 
-	if (!mhi_sahara_requeue_discarded_rx) {
+	if (!mhi_sahara_requeue_discarded_rx && !async_rx) {
 		kfree(rx->data);
 		return;
 	}
@@ -556,9 +606,10 @@ static void mhi_sahara_discard_rx_buf(struct mhi_sahara_dev *sdev,
 	}
 
 	free_after = mhi_get_free_desc_count(sdev->mhi_dev, DMA_FROM_DEVICE);
-	dev_info(&sdev->mhi_dev->dev,
-		 "SAHARA requeued discarded RX buffer reason=%s free_before=%d free_after=%d\n",
-		 reason, free_before, free_after);
+	if (!async_rx)
+		dev_info(&sdev->mhi_dev->dev,
+			 "SAHARA requeued discarded RX buffer reason=%s free_before=%d free_after=%d\n",
+			 reason, free_before, free_after);
 }
 
 static void mhi_sahara_maybe_queue_hello_resp(struct mhi_sahara_dev *sdev,
@@ -951,9 +1002,13 @@ static ssize_t mhi_sahara_read(struct file *file, char __user *buf,
 	spin_unlock_bh(&sdev->rx_lock);
 
 	if (!sdev->cur_rx) {
-		ret = mhi_sahara_queue_rx_buf(sdev, rx);
-		if (ret)
-			dev_warn(&sdev->mhi_dev->dev, "failed to requeue RX buffer: %d\n", ret);
+		if (rx->recycle_after_read) {
+			ret = mhi_sahara_queue_rx_buf(sdev, rx);
+			if (ret)
+				dev_warn(&sdev->mhi_dev->dev, "failed to requeue RX buffer: %d\n", ret);
+		} else {
+			kfree(rx->data);
+		}
 	}
 
 	mutex_unlock(&sdev->lock);
@@ -1137,12 +1192,16 @@ static void mhi_sahara_dl_xfer_cb(struct mhi_device *mhi_dev,
 					  struct mhi_result *result)
 {
 	struct mhi_sahara_dev *sdev = dev_get_drvdata(&mhi_dev->dev);
+	struct mhi_sahara_buf *pending_rx;
 	struct mhi_sahara_buf *rx;
+	bool async_rx;
+	int ret;
 
 	if (!result->buf_addr)
 		return;
 
 	rx = mhi_sahara_rx_from_data(sdev, result->buf_addr);
+	async_rx = mhi_sahara_async_rx_enabled(sdev);
 	spin_lock_bh(&sdev->rx_lock);
 	if (rx->queued) {
 		list_del_init(&rx->queued_node);
@@ -1158,27 +1217,31 @@ static void mhi_sahara_dl_xfer_cb(struct mhi_device *mhi_dev,
 
 	if (!result->bytes_xferd) {
 		mhi_sahara_discard_rx_buf(sdev, rx, "empty");
-		wake_up_all(&sdev->read_wq);
+		if (!async_rx)
+			wake_up_all(&sdev->read_wq);
 		return;
 	}
 
 	if (!mhi_sahara_rx_packet_valid(result->buf_addr, result->bytes_xferd)) {
-		mhi_sahara_log_rx_packet(sdev, result->buf_addr, result->bytes_xferd);
-		dev_info(&mhi_dev->dev, "SAHARA dropping invalid RX packet len %zu\n",
-			 result->bytes_xferd);
-		if (sdev->allow_write && mhi_sahara_restart_cancel_on_invalid_rx &&
-		    mhi_sahara_restart_after_ul_completion &&
-		    cancel_delayed_work(&sdev->restart_work))
-			dev_info(&mhi_dev->dev,
-				 "SAHARA canceled pending channel restart after invalid RX packet\n");
+		if (!async_rx) {
+			mhi_sahara_log_rx_packet(sdev, result->buf_addr, result->bytes_xferd);
+			dev_info(&mhi_dev->dev, "SAHARA dropping invalid RX packet len %zu\n",
+				 result->bytes_xferd);
+			if (sdev->allow_write && mhi_sahara_restart_cancel_on_invalid_rx &&
+			    mhi_sahara_restart_after_ul_completion &&
+			    cancel_delayed_work(&sdev->restart_work))
+				dev_info(&mhi_dev->dev,
+					 "SAHARA canceled pending channel restart after invalid RX packet\n");
+		}
 		mhi_sahara_discard_rx_buf(sdev, rx, "invalid");
-		wake_up_all(&sdev->read_wq);
+		if (!async_rx)
+			wake_up_all(&sdev->read_wq);
 		return;
 	}
 
 	mhi_sahara_note_rx_for_restart(sdev, result->buf_addr, result->bytes_xferd);
 
-	if (sdev->allow_write && mhi_sahara_restart_after_ul_completion &&
+	if (!async_rx && sdev->allow_write && mhi_sahara_restart_after_ul_completion &&
 	    cancel_delayed_work(&sdev->restart_work))
 		dev_info(&mhi_dev->dev,
 			 "SAHARA canceled pending channel restart after DL packet\n");
@@ -1189,14 +1252,26 @@ static void mhi_sahara_dl_xfer_cb(struct mhi_device *mhi_dev,
 	mhi_sahara_log_rx_packet(sdev, rx->data, rx->len);
 	mhi_sahara_maybe_queue_hello_resp(sdev, rx->data, rx->len);
 
-	spin_lock_bh(&sdev->rx_lock);
-	if (sdev->opened || sdev->keep_rx_without_open ||
-	    (sdev->allow_write && mhi_sahara_keep_prepared_on_release))
-		list_add_tail(&rx->node, &sdev->pending_rx);
-	else
-		kfree(result->buf_addr);
-	spin_unlock_bh(&sdev->rx_lock);
+	if (async_rx) {
+		pending_rx = mhi_sahara_clone_rx_packet(rx->data, rx->len);
+		if (pending_rx) {
+			ret = mhi_sahara_queue_rx_buf(sdev, rx);
+			if (ret)
+				dev_warn(&mhi_dev->dev,
+					 "SAHARA failed async RX requeue ret=%d\n", ret);
+			mhi_sahara_deliver_rx_buf(sdev, pending_rx);
+			if (mhi_dev->dev.power.wakeup)
+				pm_wakeup_hard_event(&mhi_dev->dev);
+			wake_up_all(&sdev->read_wq);
+			return;
+		}
+		dev_warn(&mhi_dev->dev, "SAHARA failed to clone RX packet len %zu\n",
+			 result->bytes_xferd);
+	}
 
+	mhi_sahara_deliver_rx_buf(sdev, rx);
+	if (mhi_dev->dev.power.wakeup)
+		pm_wakeup_hard_event(&mhi_dev->dev);
 	wake_up_all(&sdev->read_wq);
 }
 
@@ -1215,7 +1290,8 @@ static void mhi_sahara_ul_xfer_cb(struct mhi_device *mhi_dev,
 		if (!result->transaction_status && mhi_sahara_ring_dl_db_after_ul)
 			mhi_sahara_ring_chan_db_now(sdev, mhi_dev->dl_chan,
 							    "UL completion DL re-ring");
-		if (!result->transaction_status && mhi_sahara_restart_after_ul_completion) {
+		if (!result->transaction_status && mhi_sahara_restart_after_ul_completion &&
+		    !mhi_sahara_async_rx_enabled(sdev)) {
 			u32 image = 0;
 			size_t remaining = 0;
 			bool suppress_after_read = false;

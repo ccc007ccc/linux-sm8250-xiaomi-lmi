@@ -698,6 +698,22 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M103 否定继续围绕 full channel restart 做 suppress/delay 精细门控作为主路线；这类门控既不能稳定保留 SBL 进度，也会把停点从 image40 回退到 image34。下一阶段应停止新增 restart_suppress/delay 参数，改为对齐 Android downstream UCI/MHI 生命周期：一次 open 贯穿 SAHARA image transfer，维持深 RX ring，invalid/zero RX 静默丢弃后立即 requeue 并只做必要 DL doorbell/runtime wake；同时对照 downstream ESOC `IMG_XFER_DONE`/`BOOT_DONE`/sideband 状态，而不是继续依赖 `mhi_unprepare_from_transfer()` / `mhi_prepare_for_transfer()` 踢下一包。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M104 UCI-style async RX requeue 负结果
+
+含义：M104 按 Android downstream UCI 生命周期改造 `mhi_sahara_diag` 的 SAHARA RX 路径：有效 DL packet 先 clone 给 userspace，原 RX buffer 在 completion 回调中立即重新排队；empty/invalid RX 在 async 模式下静默消化并补回 RX ring；UL completion 不再触发 full `mhi_unprepare_from_transfer()` / `mhi_prepare_for_transfer()` restart。目标是验证此前“一包一开”的节拍是否只是 RX ring 不够深或 read 后 requeue 太晚。
+
+当前影响：M104 boot-only 镜像只刷 `boot` 后启动正常，`async_rx_requeue=Y` 默认生效；纯 async 长连接测试只收到首个 48 字节 HELLO，host 回 HELLO_RESP 后 300 秒无 `READ_DATA`。随后运行时只打开 `ring_dl_db_after_ul=Y` 时可踢出一个 image34 `READ_DATA offset=0 length=40`，再打开 UL+DL doorbell 时可再踢出一个 image34 `READ_DATA offset=40 length=1596`，但每次都只推进一个 packet 后 idle。该结果说明 UCI-style 深 RX requeue 是更正确的底层语义，但单独不足以让 SBL 连续推进；普通 UL/DL data doorbell 也不能替代缺失的 channel/device-side progression。
+
+后续处理：M104 的 async RX requeue 保留为新的安全基线，因为它避免了 invalid/empty RX 消耗 ring、减少 full restart 依赖，并更接近 downstream UCI；但不要把 plain doorbell 当作修复路线。后续应继续比较 Android downstream MHI channel START/RESET 生命周期、event/TRE pointer 同步、runtime wake 与 ESOC sideband，而不是回到固定 delay 或每包 full restart。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
+### M105 SAHARA START kick 负结果
+
+含义：M105 在 M104 async RX 基线上临时验证“UL completion 后对已经 running 的 SAHARA UL/DL channel 发送 `MHI_CMD_START_CHAN`”是否就是此前 close/reopen 或 full restart 中真正缺失的轻量 kick。该开关只用于实机诊断，默认关闭；验证后已从源码清理，不作为后续可选路径保留。
+
+当前影响：首轮 M105 测试因 loader 漏传 `--continuous`，被默认 close/reopen restart 行为污染，不作为结论。修正后的 M105b 使用 `--continuous --sessions 1`、`async_rx_requeue=Y`、`sbl_bad_tre_complete=Y`、`restart_after_ul_completion=N` 和 `start_chans_after_ul_completion=Y`，只收到 HELLO/HELLO_RESP，dmesg 记录 `SAHARA UL completion UL START kick ret=0` 与 `SAHARA UL completion DL START kick ret=0`，但 300 秒内没有 image34 `READ_DATA`。close 时 DL channel RESET 超时，SDX55M 进入 `SYS_ERROR` / `INVALID_EE`，说明 START-on-running 不但不推进 Sahara，还会污染后续 DL START/RESET 状态。
+
+后续处理：M105 否定“对 running channel 再发 START 命令”作为轻量推进机制；这一路线比 plain doorbell 更危险，后续不要再启用或保留 START kick 诊断。设备处于该失败态时只用普通 Linux reboot 恢复，不使用 EDL/firehose、不 erase、不写 modem/NV/dtbo/recovery/vbmeta。下一步应在 M104 async RX 基线上继续查真正的 downstream 差异：channel START 发生的时机、event ring completion 顺序、ESOC `IMG_XFER_DONE`/`BOOT_DONE` 和 AP2MDM/MDM2AP sideband 是否给 SBL 一个非 MHI data doorbell 的阶段确认。调制解调器仍停在 SBL/Sahara，未出现 `CMD_READY`、Mission/AMSS、MDM2AP_STATUS 拉高、QRTR/QMI、SIM、语音或蜂窝数据。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
