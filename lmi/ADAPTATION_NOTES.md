@@ -658,6 +658,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：该参数保持默认关闭，只作为后续确认 RX ring 深度的诊断工具，不作为修复路线。fresh M98 同时重新复现 chan3 `MHI_EV_CC_BAD_TRE`（ptr `0xfffb4010`）和 post-image34 zero RX，下一步应回到 BAD_TRE/event ring RP、channel TRE RP、restart 后 context/doorbell 同步和 post-image34 channel lifecycle，而不是继续围绕 invalid buffer 回收加逻辑。仍不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M99 BAD_TRE failed-completion 诊断
+
+含义：M99 在 MHI core 中加入默认关闭的 `mhi.sbl_bad_tre_complete` 参数，只在 SBL boot channel 收到 `MHI_EV_CC_BAD_TRE`、BAD_TRE 指针等于当前 `tre_ring->rp` 且存在用户回调时，把当前 transfer 以 `-EIO` 完成并推进 buffer/TRE ring，用来验证 M98 中 chan3 BAD_TRE 卡在当前 RP 是否会污染后续 restart/channel state。
+
+当前影响：M99 boot-only 镜像只刷 `boot` 后参数可见，内核构建和实机启动正常。第一次手动测试因 loader 少传 `--done-wait-timeout`，只在 image34 `END_OF_IMAGE` 后发送 `DONE` 并按默认 terminal 逻辑退出，不作为 modem 结论；随后用后台 `nohup` 完整复测，打开 `sbl_bad_tre_complete=Y`、保持 `sbl_bad_tre_ring_db=N` / `requeue_discarded_rx=N`，并沿用 200ms restart、`restart_resync_db_val=Y`、`restart_ring_ul_db=N` 的 M94b/M97 等价节拍。该轮没有触发 `BAD_TRE`，也没有出现 `completing BAD_TRE as failed transfer` 日志，因此 M99 新分支没有被执行；Sahara 流程仍为 HELLO/HELLO_RESP、image34 live `mdmddr` 两段、`END_OF_IMAGE`、host `DONE`、post-DONE HELLO/HELLO_RESP，然后收到 20 字节全零 RX 并 idle，没有进入 image40。
+
+后续处理：`sbl_bad_tre_complete` 保持默认关闭，仅作为 BAD_TRE 复现时的窄范围诊断工具；M99 不能证明 BAD_TRE failed-completion 可以推进 modem。下一步应把 M100 聚焦到 post-image34 `DONE` 后重新 HELLO/HELLO_RESP 窗口、zero RX 与 channel restart/doorbell/context 同步差异：对照 M97 能到 image40 offset 0 length 52 的路径，精确比较 post-DONE HELLO_RESP 前后是否需要不同的 restart suppress/resync 策略。仍不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。

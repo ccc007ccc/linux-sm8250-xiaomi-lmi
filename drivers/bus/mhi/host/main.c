@@ -53,6 +53,12 @@ module_param_named(sbl_bad_tre_ring_db, mhi_sbl_bad_tre_ring_db, bool, 0644);
 MODULE_PARM_DESC(sbl_bad_tre_ring_db,
 		 "Re-ring SBL boot channel doorbell after BAD_TRE events");
 
+static bool mhi_sbl_bad_tre_complete;
+module_param_named(sbl_bad_tre_complete,
+		   mhi_sbl_bad_tre_complete, bool, 0644);
+MODULE_PARM_DESC(sbl_bad_tre_complete,
+		 "Complete current SBL BAD_TRE as a failed transfer and advance channel rings");
+
 #define MHI_SBL_SAHARA_MIN_LEN		8
 #define MHI_SBL_SAHARA_MAX_LEN		4096
 #define MHI_SBL_SAHARA_CMD_HELLO		1
@@ -975,6 +981,40 @@ static int parse_xfer_event(struct mhi_controller *mhi_cntrl,
 		else
 			dev_err(dev, "BAD_TRE event 0x%x ptr 0x%llx\n",
 				ev_code, (unsigned long long)ptr);
+
+		if (mhi_is_sbl_boot_chan(mhi_chan) && mhi_sbl_bad_tre_complete &&
+		    bad_tre && bad_tre == tre_ring->rp) {
+			struct mhi_buf_info *buf_info = buf_ring->rp;
+
+			if (buf_info->cb_buf && mhi_chan->xfer_cb) {
+				result.buf_addr = buf_info->cb_buf;
+				result.bytes_xferd = 0;
+				result.dir = mhi_chan->dir;
+				result.transaction_status = -EIO;
+
+				if (likely(!buf_info->pre_mapped))
+					mhi_cntrl->unmap_single(mhi_cntrl, buf_info);
+
+				mhi_del_ring_element(mhi_cntrl, buf_ring);
+				mhi_del_ring_element(mhi_cntrl, tre_ring);
+				dev_warn(dev,
+					 "SBL channel %u completing BAD_TRE as failed transfer ptr 0x%llx\n",
+					 mhi_chan->chan, (unsigned long long)ptr);
+
+				write_unlock_irqrestore(&mhi_chan->lock, flags);
+				mhi_chan->xfer_cb(mhi_chan->mhi_dev, &result);
+				if (mhi_chan->dir == DMA_TO_DEVICE) {
+					atomic_dec(&mhi_cntrl->pending_pkts);
+					mhi_cntrl->runtime_put(mhi_cntrl);
+				}
+				write_lock_irqsave(&mhi_chan->lock, flags);
+			} else {
+				dev_warn(dev,
+					 "SBL channel %u cannot complete BAD_TRE ptr 0x%llx cb_buf=%px cb=%ps\n",
+					 mhi_chan->chan, (unsigned long long)ptr,
+					 buf_info->cb_buf, mhi_chan->xfer_cb);
+			}
+		}
 
 		if (mhi_is_sbl_boot_chan(mhi_chan) && mhi_sbl_bad_tre_ring_db) {
 			read_lock_irqsave(&mhi_cntrl->pm_lock, pm_lock_flags);
