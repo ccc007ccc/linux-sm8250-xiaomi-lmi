@@ -655,6 +655,13 @@ def run_session(fat, args, index):
                 log("session", f"{index} eof packets={packets} bytes_sent={bytes_sent}")
                 return packets, bytes_sent, "eof"
             packets += 1
+            if args.ks_strict_done_resp and ks_pending_phase == "done_resp":
+                words = pack_words(data)
+                cmd = words[0] if words else 0
+                pkt_len = words[1] if len(words) > 1 else len(data)
+                if cmd == CMD_HELLO:
+                    log("ks_strict", f"discard_out_of_sequence_hello len={len(data)} pkt_len={pkt_len}")
+                    continue
             hello_mode_override = None
             if restart_deadline is not None and restart_action == "done_restart" and \
                args.done_hello_mode >= 0 and args.done_hello_mode_image >= -1 and \
@@ -806,6 +813,7 @@ def parse_args():
     parser.add_argument("--diag-after-read-data-image", type=int, default=-1)
     parser.add_argument("--diag-after-read-data-min-offset", type=int, default=0)
     parser.add_argument("--ks-pending-timeout", type=float, default=0.0)
+    parser.add_argument("--ks-strict-done-resp", action="store_true")
     parser.add_argument("--empty-limit", type=int, default=4)
     parser.add_argument("--read-size", type=int, default=4096)
     parser.add_argument("--chunk-size", type=int, default=65536)

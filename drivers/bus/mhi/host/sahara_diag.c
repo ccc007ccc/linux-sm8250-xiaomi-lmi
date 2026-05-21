@@ -404,7 +404,7 @@ static void mhi_sahara_note_rx_for_restart(struct mhi_sahara_dev *sdev,
 	bool track_read;
 	bool suppress_after_read;
 
-	if (!sdev->allow_write || len < MHI_SAHARA_READ_DATA_LEN)
+	if (!sdev->allow_write || len < 2 * sizeof(*words))
 		return;
 
 	cmd = le32_to_cpu(words[0]);
@@ -416,6 +416,9 @@ static void mhi_sahara_note_rx_for_restart(struct mhi_sahara_dev *sdev,
 		spin_unlock_irqrestore(&sdev->restart_lock, flags);
 		return;
 	}
+
+	if (len < MHI_SAHARA_READ_DATA_LEN)
+		return;
 
 	image = le32_to_cpu(words[2]);
 	length = le32_to_cpu(words[4]);

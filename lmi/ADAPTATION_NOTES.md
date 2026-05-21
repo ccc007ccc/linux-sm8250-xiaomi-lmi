@@ -626,6 +626,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M94b 证明 M93 的 cached doorbell stale 是实际影响因素之一，也证明显式 resync 比空 UL re-ring 更安全；后续测试应保留 `restart_resync_db_val=Y`、避免 `restart_ring_ul_db=Y`。当前新阻塞点是 image23/AOP `END_OF_IMAGE` 后 host 发送 `DONE`，modem 再发新 HELLO，HELLO_RESP 完成后 240 秒无后续 `READ_DATA`、`CMD_READY`、Mission/AMSS 或 MDM2AP_STATUS 拉高。下一步应继续对照 Android ESOC/`ks` 在 AOP 后是否还有 image 序列、`IMG_XFER_DONE`/`BOOT_DONE` 或 channel lifecycle 差异；仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M95/M95b HELLO_RESP restart 抑制诊断
+
+含义：M95/M95b 针对 M94b 卡在 image23/AOP 后新 HELLO/HELLO_RESP 的现象，测试“HELLO_RESP UL completion 后不做 SAHARA channel restart”是否能让 SBL 自然继续。M95 首版是全局抑制 HELLO_RESP 后 restart；M95b 改成默认关闭的按 `END_OF_IMAGE` image id 门控，只在指定 image 之后的 HELLO_RESP 抑制 restart。同时 loader 新增 `--ks-strict-done-resp`，用于模拟 Android `/vendor/bin/ks` 在等待 `DONE_RESP` 时把乱序 HELLO 丢弃的行为。
+
+当前影响：M95 全局抑制会在首个 HELLO/HELLO_RESP 后 300 秒无 `READ_DATA`，说明初始 HELLO_RESP 后仍需要现有 restart/progression 动作。M95b 按 image23/AOP 门控的版本未能稳定跑到 image23；gate-disabled 对照、1000ms delay 对照和 `--ks-strict-done-resp` 对照都退回到 image34 后的新 HELLO/HELLO_RESP 停住，低于 M94b。进一步把门控设到 image34 后实际命中抑制，结果 post-image34 HELLO_RESP 后 300 秒没有 image40，直接证伪“某个 image 后 HELLO_RESP 不 restart 就能推进下一张 image”的假设。`--ks-strict-done-resp` 没有改善进度，但保留为用户态状态机对照；失败的内核 HELLO_RESP 门控参数、EOI 记录和 UL completion 分支已从 `mhi_sahara_diag` 清理，回到 M94b-like restart 行为，内核重编译通过。
+
+后续处理：不要继续沿 HELLO_RESP restart 抑制方向堆 gate。下一步应保留 M94b 证明有效的 `restart_resync_db_val=Y`、`restart_ring_ul_db=N`，并转向 MHI data event / RX TRE 处理差异：Android downstream 会按 event 指针推进并回调中间 TRE，而当前主线诊断路径对 skipped RX TRE 仍以零包/推断方式处理，可能在 full restart 与多 TRE completion 组合下造成 SBL 节拍失真。后续仍只被动响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
