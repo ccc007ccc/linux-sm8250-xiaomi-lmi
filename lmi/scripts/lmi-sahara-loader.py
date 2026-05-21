@@ -285,6 +285,17 @@ def write_all(fd, data, label, timeout):
         done += n
 
 
+def write_grouped_chunks(fd, chunks_iter, label, timeout):
+    chunks = []
+    total = 0
+    for chunk in chunks_iter:
+        chunks.append(chunk)
+        total += len(chunk)
+    if total:
+        write_all(fd, b"".join(chunks), label, timeout)
+    return total, len(chunks)
+
+
 def send_hello_resp(fd, words, args, mode_override=None):
     version = words[2] if len(words) > 2 else 2
     compatible = words[3] if len(words) > 3 else 1
@@ -431,23 +442,22 @@ def stream_image(fd, fat, image, offset, length, args):
     if length > args.max_request:
         raise RuntimeError(f"request too large image={image} length={length} max={args.max_request}")
     raw_path = raw_image_path(image, args)
-    sent = 0
     if raw_path and os.path.exists(raw_path):
         log("read_data", f"image={image} offset={offset} length={length} source={raw_path} raw=1")
-        for chunk in iter_raw_range(raw_path, offset, length, args.chunk_size):
-            write_all(fd, chunk, f"image{image}", args.write_timeout)
-            sent += len(chunk)
-        log("tx", f"image={image} bytes={sent}")
+        sent, chunks = write_grouped_chunks(
+            fd, iter_raw_range(raw_path, offset, length, args.chunk_size),
+            f"image{image}", args.write_timeout)
+        log("tx", f"image={image} bytes={sent} grouped=1 chunks={chunks}")
         return sent
     path = IMAGE_PATHS[image]
     size = fat.file_size(path)
     if raw_path:
         log("source_fallback", f"image={image} missing_raw={raw_path} source={path}")
     log("read_data", f"image={image} offset={offset} length={length} source={path} size={size}")
-    for chunk in fat.iter_range(path, offset, length, args.chunk_size):
-        write_all(fd, chunk, f"image{image}", args.write_timeout)
-        sent += len(chunk)
-    log("tx", f"image={image} bytes={sent}")
+    sent, chunks = write_grouped_chunks(
+        fd, fat.iter_range(path, offset, length, args.chunk_size),
+        f"image{image}", args.write_timeout)
+    log("tx", f"image={image} bytes={sent} grouped=1 chunks={chunks}")
     return sent
 
 

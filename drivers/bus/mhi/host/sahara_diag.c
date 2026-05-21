@@ -91,6 +91,12 @@ struct mhi_sahara_buf {
 	bool queued;
 };
 
+struct mhi_sahara_tx_chunk {
+	struct list_head node;
+	void *data;
+	size_t len;
+};
+
 struct mhi_sahara_dev {
 	struct mhi_device *mhi_dev;
 	struct miscdevice miscdev;
@@ -522,6 +528,17 @@ static void mhi_sahara_free_rx_list(struct list_head *list)
 	}
 }
 
+static void mhi_sahara_free_tx_chunks(struct list_head *list)
+{
+	struct mhi_sahara_tx_chunk *chunk, *tmp;
+
+	list_for_each_entry_safe(chunk, tmp, list, node) {
+		list_del(&chunk->node);
+		kfree(chunk->data);
+		kfree(chunk);
+	}
+}
+
 static void mhi_sahara_purge_rx(struct mhi_sahara_dev *sdev)
 {
 	struct mhi_sahara_buf *rx, *tmp;
@@ -831,10 +848,17 @@ out_unlock:
 }
 
 static ssize_t mhi_sahara_write(struct file *file, const char __user *buf,
-					size_t count, loff_t *ppos)
+					    size_t count, loff_t *ppos)
 {
 	struct mhi_sahara_dev *sdev = file->private_data;
-	void *kbuf;
+	struct mhi_sahara_tx_chunk *chunk, *tmp;
+	const char __user *pos = buf;
+	struct mhi_chan *ul_chan;
+	LIST_HEAD(chunks);
+	size_t needed_desc;
+	size_t capacity;
+	size_t remaining;
+	int free_desc;
 	int ret;
 
 	if (!count)
@@ -843,19 +867,55 @@ static ssize_t mhi_sahara_write(struct file *file, const char __user *buf,
 	if (!sdev->allow_write)
 		return -EOPNOTSUPP;
 
-	if (count > sdev->mtu)
+	if (!sdev->mtu)
+		return -EINVAL;
+
+	needed_desc = DIV_ROUND_UP(count, sdev->mtu);
+	if (needed_desc > INT_MAX)
 		return -EMSGSIZE;
+
+	ul_chan = sdev->mhi_dev->ul_chan;
+	if (!ul_chan || ul_chan->tre_ring.elements <= 1)
+		return -ENODEV;
+
+	capacity = ul_chan->tre_ring.elements - 1;
+	if (needed_desc > capacity)
+		return -EMSGSIZE;
+
+	remaining = count;
+	while (remaining) {
+		size_t xfer_size = min_t(size_t, remaining, sdev->mtu);
+
+		chunk = kzalloc(sizeof(*chunk), GFP_KERNEL);
+		if (!chunk) {
+			ret = -ENOMEM;
+			goto out_free_chunks;
+		}
+
+		chunk->data = memdup_user(pos, xfer_size);
+		if (IS_ERR(chunk->data)) {
+			ret = PTR_ERR(chunk->data);
+			kfree(chunk);
+			goto out_free_chunks;
+		}
+
+		chunk->len = xfer_size;
+		list_add_tail(&chunk->node, &chunks);
+		pos += xfer_size;
+		remaining -= xfer_size;
+	}
 
 	ret = mutex_lock_interruptible(&sdev->lock);
 	if (ret)
-		return ret;
+		goto out_free_chunks;
 
 	if (!sdev->present || !sdev->opened) {
 		ret = -ENODEV;
 		goto out_unlock;
 	}
 
-	while (mhi_get_free_desc_count(sdev->mhi_dev, DMA_TO_DEVICE) <= 0) {
+	while ((free_desc = mhi_get_free_desc_count(sdev->mhi_dev,
+							 DMA_TO_DEVICE)) < (int)needed_desc) {
 		if (file->f_flags & O_NONBLOCK) {
 			ret = -EAGAIN;
 			goto out_unlock;
@@ -866,13 +926,13 @@ static ssize_t mhi_sahara_write(struct file *file, const char __user *buf,
 				!READ_ONCE(sdev->present) ||
 				!READ_ONCE(sdev->opened) ||
 				mhi_get_free_desc_count(sdev->mhi_dev,
-							DMA_TO_DEVICE) > 0);
+							DMA_TO_DEVICE) >= (int)needed_desc);
 		if (ret)
-			return ret;
+			goto out_free_chunks;
 
 		ret = mutex_lock_interruptible(&sdev->lock);
 		if (ret)
-			return ret;
+			goto out_free_chunks;
 
 		if (!sdev->present || !sdev->opened) {
 			ret = -ENODEV;
@@ -880,25 +940,38 @@ static ssize_t mhi_sahara_write(struct file *file, const char __user *buf,
 		}
 	}
 
-	kbuf = memdup_user(buf, count);
-	if (IS_ERR(kbuf)) {
-		ret = PTR_ERR(kbuf);
-		goto out_unlock;
-	}
-
 	if (count >= MHI_SAHARA_HELLO_LEN) {
-		const __le32 *words = kbuf;
+		chunk = list_first_entry(&chunks, struct mhi_sahara_tx_chunk, node);
+		if (chunk->len >= MHI_SAHARA_HELLO_LEN) {
+			const __le32 *words = chunk->data;
 
-		if (le32_to_cpu(words[0]) == MHI_SAHARA_CMD_HELLO_RESP &&
-		    le32_to_cpu(words[1]) == MHI_SAHARA_HELLO_LEN)
-			mhi_sahara_dump_words(sdev, "HELLO_RESP", words, count);
+			if (le32_to_cpu(words[0]) == MHI_SAHARA_CMD_HELLO_RESP &&
+			    le32_to_cpu(words[1]) == MHI_SAHARA_HELLO_LEN)
+				mhi_sahara_dump_words(sdev, "HELLO_RESP", words, count);
+		}
 	}
 
-	ret = mhi_queue_buf(sdev->mhi_dev, DMA_TO_DEVICE, kbuf, count, MHI_EOT);
-	if (ret) {
-		kfree(kbuf);
-		goto out_unlock;
+	list_for_each_entry_safe(chunk, tmp, &chunks, node) {
+		enum mhi_flags flags = list_is_last(&chunk->node, &chunks) ?
+			MHI_EOT : MHI_CHAIN;
+
+		ret = mhi_queue_buf(sdev->mhi_dev, DMA_TO_DEVICE, chunk->data,
+					    chunk->len, flags);
+		if (ret) {
+			kfree(chunk->data);
+			list_del(&chunk->node);
+			kfree(chunk);
+			goto out_unlock;
+		}
+
+		list_del(&chunk->node);
+		kfree(chunk);
 	}
+
+	if (needed_desc > 1)
+		dev_info(&sdev->mhi_dev->dev,
+			 "SAHARA queued grouped UL transfer bytes=%zu desc=%zu mtu=%zu free_desc=%d\n",
+			 count, needed_desc, sdev->mtu, free_desc);
 
 	mutex_unlock(&sdev->lock);
 
@@ -906,6 +979,8 @@ static ssize_t mhi_sahara_write(struct file *file, const char __user *buf,
 
 out_unlock:
 	mutex_unlock(&sdev->lock);
+out_free_chunks:
+	mhi_sahara_free_tx_chunks(&chunks);
 	return ret;
 }
 
