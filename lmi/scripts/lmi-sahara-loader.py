@@ -481,7 +481,7 @@ def stream_image(fd, fat, image, offset, length, args):
     return sent
 
 
-def handle_packet(fd, fat, data, args, hello_mode_override=None):
+def handle_packet(fd, fat, data, args, hello_mode_override=None, ks_pending_phase=None):
     words = pack_words(data)
     cmd = words[0] if words else 0
     pkt_len = words[1] if len(words) > 1 else len(data)
@@ -538,7 +538,8 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
             send_done(fd, args.write_timeout)
             if args.keep_prepared_after_done or not args.unsafe_done_restart:
                 enable_keep_prepared(args)
-            if args.ks_pending_timeout > 0:
+            if args.ks_pending_timeout > 0 and \
+               (args.ks_pending_image < 0 or args.ks_pending_image == image):
                 return "ks_pending_wait_done_resp", 0, None
             if args.continuous:
                 return "progress", 0, None
@@ -560,7 +561,8 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
         if image_tx_pending == SAHARA_MODE_IMAGE_TX_PENDING:
             if args.keep_prepared_after_done_resp or not args.unsafe_done_restart:
                 enable_keep_prepared(args)
-            if args.ks_pending_timeout > 0:
+            if args.ks_pending_timeout > 0 and \
+               (args.ks_pending_image < 0 or ks_pending_phase == "done_resp"):
                 return "ks_pending_wait_hello", 0, None
             if args.done_resp_follow_timeout > 0:
                 return "done_resp_follow", 0, None
@@ -694,7 +696,7 @@ def run_session(fat, args, index):
                args.done_hello_mode >= 0 and args.done_hello_mode_image >= -1 and \
                (args.done_hello_mode_image < 0 or args.done_hello_mode_image == restart_image):
                 hello_mode_override = args.done_hello_mode
-            action, sent, image = handle_packet(fd, fat, data, args, hello_mode_override)
+            action, sent, image = handle_packet(fd, fat, data, args, hello_mode_override, ks_pending_phase)
             bytes_sent += sent
             if action == "empty":
                 continue
@@ -842,6 +844,7 @@ def parse_args():
     parser.add_argument("--diag-after-read-data-image", type=int, default=-1)
     parser.add_argument("--diag-after-read-data-min-offset", type=int, default=0)
     parser.add_argument("--ks-pending-timeout", type=float, default=0.0)
+    parser.add_argument("--ks-pending-image", type=int, default=-1)
     parser.add_argument("--ks-strict-done-resp", action="store_true")
     parser.add_argument("--empty-limit", type=int, default=4)
     parser.add_argument("--ignore-unknown-rx", action="store_true")

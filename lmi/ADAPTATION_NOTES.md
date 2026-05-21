@@ -746,6 +746,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M109 证明 ESOC notify/state 诊断通路可用，但尚未证明 `ESOC_IMG_XFER_DONE` 本身能推进 SBL，因为当前没有一轮测试合法到达 image-transfer complete。后续应先恢复或替换 M94b 最大进展所依赖的 stage-aware progression，再在真实 complete `DONE_RESP` 后观察 MDM2AP_STATUS 和 ESOC_BOOT_STATE；不要把手动 `reset_state` 计数误解为 loader 已发送 `IMG_XFER_DONE`。
 
+### M110-M112 Android `ks` strict DONE_RESP / image-gated pending 诊断
+
+含义：继续反编译 Android `/vendor/bin/ks` 后确认，`ks` 在 `SAHARA_WAIT_DONE_RESP` 状态下会把过早到达的 HELLO 视为 out-of-sequence 并丢弃；只有收到 `DONE_RESP image_tx_pending=0` 后才回到 HELLO wait。loader 因此新增 `--ks-pending-image`，rootfs wrapper 同步暴露 `KS_PENDING_IMAGE` 与 `KS_STRICT_DONE_RESP`，用于只在指定 image 的 `END_OF_IMAGE` 后启用严格 pending 窗口，避免把 image34/image40 等前半段的 M94b cadence 一起改坏。
+
+当前影响：M111 把严格 DONE_RESP 从 image34 开始启用，结果完成 image34 两段、`END_OF_IMAGE image=34`、host `DONE`、`DONE_RESP image_tx_pending=0` 和下一次 HELLO/HELLO_RESP 后 150 秒 idle，未进入 image40，说明 strict pending 不能从 image34 全局启用。M112 改成 `--ks-pending-image 23`，理论上只在 AOP/image23 后模拟 Android `ks` 的严格窗口；实测本轮完成 image34、image40/APDP、image41/devcfg，并到达 image25/TZ offset 0 length 52 后 300 秒 idle，未到 image23，因此严格 image23 逻辑尚未被真正 exercised。同一份 `/tmp/lmi-sahara-loader-m112.py` 关闭 strict/pending 后跑 M94b 控制组，参数为 `async_rx_requeue=N`、`restart_after_ul_completion=Y`、`restart_after_ul_delay_ms=200`、`restart_track_read_data_len=4096`、`restart_suppress_read_data_len=131072`、`restart_resync_db_val=Y`、`restart_ring_ul_db=N`，但该轮反而在 image34 `DONE` 后的新 HELLO/HELLO_RESP 后收到 invalid zero RX 并 idle，没有进入 image40。三轮最终状态均保持 `AP2MDM_STATUS=1`、`MDM2AP_STATUS=0`、`SECONDARY BOOTLOADER/M0`，没有 `CMD_READY`、Mission/AMSS、QRTR/QMI、SIM、语音或蜂窝数据。
+
+后续处理：M112 说明 image-gated strict 开关本身没有直接造成 image25 停顿，但当前 M94b 最大进展并不稳定，不能据此判断 AOP/image23 后 strict DONE_RESP 是否正确。下一步应先恢复可重复到达 image23/AOP 的 baseline，再只在 image23 后测试 Android `ks` strict behavior；同时继续比较 post-DONE HELLO/HELLO_RESP 后的 invalid zero RX、BAD_TRE、event/TRE pointer、restart/resync 与 ESOC 状态变化。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
