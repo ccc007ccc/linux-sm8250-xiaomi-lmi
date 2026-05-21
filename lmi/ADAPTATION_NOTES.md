@@ -754,6 +754,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M112 说明 image-gated strict 开关本身没有直接造成 image25 停顿，但当前 M94b 最大进展并不稳定，不能据此判断 AOP/image23 后 strict DONE_RESP 是否正确。下一步应先恢复可重复到达 image23/AOP 的 baseline，再只在 image23 后测试 Android `ks` strict behavior；同时继续比较 post-DONE HELLO/HELLO_RESP 后的 invalid zero RX、BAD_TRE、event/TRE pointer、restart/resync 与 ESOC 状态变化。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M113-M121 BAD_TRE / invalid RX / async RX 收敛诊断
+
+含义：M113-M121 继续围绕 M94b/M112 之后的不稳定点做收敛，重点区分三类因素：一是同 loader、同参数下的 continuous/control cadence 是否能恢复 image40/image23 baseline；二是 SBL `BAD_TRE` failed-completion、discarded RX requeue 和 invalid RX cancel 是否是 post-DONE 停点根因；三是去掉 full restart、改用 true async RX / UCI-style 长连接是否能自然推进 Sahara。
+
+当前影响：M113 修正控制组后确认 `--continuous --active-read-drain` 仍可能只停在 image34 `DONE_RESP pending` 后的 HELLO/HELLO_RESP，dmesg 同期出现 chan3 `BAD_TRE`，说明 M94b 最大进展不可稳定复现。M114 打开 BAD_TRE completion 与 discarded RX requeue 后仍停在 image34，但同一阶段出现的 wrapper-style 日志曾到 image23/AOP，提示 direct/manual cadence 与 wrapper cadence 仍不等价。M115 通过已部署 wrapper 的 strict image23 尝试无效，因为设备上的 wrapper 没有实际传入 `KS_PENDING_IMAGE` / `KS_STRICT_DONE_RESP`；但该轮仍提供一个线索：到 image23/AOP `END_OF_IMAGE` 后，SBL 可能直接发 HELLO 而不是先发 `DONE_RESP`。M116/M117 用最新 direct loader 正确传入 strict image23 和全 READ_DATA 状态采样，但都回退到 image34，未真正验证 AOP strict 分支。M118 暴露参数命名空间错误：`sbl_bad_tre_complete` 属于 `/sys/module/mhi/parameters`，不是 `mhi_sahara_diag`；M119 改到正确 host namespace 后确认 BAD_TRE completion 生效，但仍停在 image34，且 post-image34 HELLO_RESP 的 UL completion 会调度 200ms restart，随后 invalid zero RX 与 pending restart 的关系成为新线索。M120 打开 `restart_cancel_on_invalid_rx=Y` 后证明 invalid zero RX 可以取消 pending restart 并 requeue buffer，但依然没有恢复 image40。M121 关闭 UL-completion restart、使用 `async_rx_requeue=Y` 的纯长连接路径只收到初始 HELLO/HELLO_RESP 后 idle，证明 pure async RX without restart/kick 不足以推进 SBL。
+
+后续处理：当前阶段暂时按用户要求搁置调制解调器适配，后续恢复时不要从“单个 BAD_TRE/requeue/cancel 开关就是修复”继续推进。已确认的边界是：host BAD_TRE completion 参数位置必须在 `mhi` 模块；invalid RX cancel 安全但不足够；pure async RX 会回退到首个 HELLO；`/usr/local/sbin/lmi-sahara-test` 的部署版本可能落后于源码，严肃复测必须上传最新 wrapper/loader 或先更新 rootfs。恢复 modem 工作时应优先重建可重复到达 image23/AOP 的 baseline，并比较 wrapper cadence、RX ring 深度、multi-TRE completion、restart/resync 和 Android `ks` 在 AOP 后 HELLO/DONE_RESP 的真实顺序；仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0` 作为并行 watcher，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
