@@ -690,6 +690,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M102 证明 invalid RX cancel 分支有效且安全，但不足以推进到 image41；当前停点进一步定位为 post-image40 HELLO_RESP 自身的 UL completion restart，而不是 image40 DONE 后 invalid RX 的旧 restart。M103 应新增更窄的默认关闭诊断：在刚处理过 post-image DONE/HELLO 的情况下，抑制或延后 HELLO_RESP UL completion 触发的 full channel restart，观察 modem 是否在同一 channel 上下文继续发 image41/devcfg 或 `CMD_READY`。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M103 HELLO_RESP restart 抑制负结果
+
+含义：M103 临时验证 `restart_suppress_hello_resp_after_image` 这类更窄的 stage-aware 抑制：先尝试只抑制 image40 `END_OF_IMAGE` 后 HELLO_RESP 的 UL-completion restart；若进不了目标窗口，再把抑制点前移到 image34，确认“保留同一 SAHARA channel 上下文、不做 full restart”是否能自然推进后续 READ_DATA。
+
+当前影响：M103 boot-only 镜像只刷 `boot` 后启动正常，但 `restart_suppress_hello_resp_after_image=40` 首轮未进入 image40：image34/mdmddr 完成后只收到 post-image34 HELLO/HELLO_RESP，240 秒 idle，没有 image40。重启后把抑制点改为 image34 时，image34 `DONE_RESP pending` 和 post-image34 HELLO 正常出现，内核确认打印 `SAHARA armed HELLO_RESP restart suppress after image=34`、`SAHARA will suppress channel restart after HELLO_RESP image=34`、`SAHARA suppressing channel restart after HELLO_RESP image=34`，说明抑制机制本身生效；但随后 chan3 仍出现 BAD_TRE failed-completion，240 秒 idle，仍没有 image40、image41/devcfg、`CMD_READY`、Mission/AMSS 或 MDM2AP_STATUS 拉高。
+
+后续处理：M103 否定继续围绕 full channel restart 做 suppress/delay 精细门控作为主路线；这类门控既不能稳定保留 SBL 进度，也会把停点从 image40 回退到 image34。下一阶段应停止新增 restart_suppress/delay 参数，改为对齐 Android downstream UCI/MHI 生命周期：一次 open 贯穿 SAHARA image transfer，维持深 RX ring，invalid/zero RX 静默丢弃后立即 requeue 并只做必要 DL doorbell/runtime wake；同时对照 downstream ESOC `IMG_XFER_DONE`/`BOOT_DONE`/sideband 状态，而不是继续依赖 `mhi_unprepare_from_transfer()` / `mhi_prepare_for_transfer()` 踢下一包。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
