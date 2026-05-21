@@ -568,6 +568,9 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
     if cmd == CMD_RESET:
         log("reset", "received RESET")
         return "stop", 0, None
+    if args.ignore_unknown_rx:
+        log("unknown_rx", f"cmd={cmd} len={len(data)} pkt_len={pkt_len}")
+        return "empty", 0, None
     raise RuntimeError(f"unhandled cmd {cmd}")
 
 
@@ -818,6 +821,7 @@ def parse_args():
     parser.add_argument("--ks-pending-timeout", type=float, default=0.0)
     parser.add_argument("--ks-strict-done-resp", action="store_true")
     parser.add_argument("--empty-limit", type=int, default=4)
+    parser.add_argument("--ignore-unknown-rx", action="store_true")
     parser.add_argument("--read-size", type=int, default=4096)
     parser.add_argument("--chunk-size", type=int, default=65536)
     parser.add_argument("--max-request", type=int, default=268435456)

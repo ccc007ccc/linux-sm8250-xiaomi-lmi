@@ -722,6 +722,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：runtime PM hold 和普通 UL/DL data doorbell 都不是缺失的连续推进机制；保留 default-off 参数方便继续对照，但不要把 MHI runtime PM hold、plain doorbell 或 START-on-running 当成修复路线。下一步继续查 downstream ESOC image-transfer 完成通知、MDM2AP/AP2MDM sideband、以及 Android `ks`/`mdm_helper` 在 `DONE_RESP pending` 后是否通过 ESOC ioctl 而非 MHI data doorbell 推进阶段。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M107 UCI-style requeue-after-read 负结果
+
+含义：M107 在 M104 async clone/requeue 基线上新增默认关闭的 `mhi_sahara_diag.uci_rx_lifecycle`，让 SAHARA DL completion 更贴近 Android downstream `mhi_uci.c`：成功的非空 RX buffer 原样交给 userspace，读取完成后再重新排队；同时禁止 async clone 的立即 requeue，避免同时启用两套 RX 生命周期。用户态 `lmi-sahara-loader.py` 新增 `--ignore-unknown-rx`，用于在该 raw RX 模式下安全忽略 dummy/invalid packet，不把未知 RX 误当成需要回复的 Sahara 命令。
+
+当前影响：M107 源码构建通过，boot-only 镜像 `/home/ccc007/Android/Kernel/lmi/sm8250-xiaomi-lmi-boot/builds/ubuntu-console/M107-sdx55m-uci-rx-20260521-215746/boot-linux-copydown-lmi.img` 已只刷 `boot` 并启动；默认参数为 `uci_rx_lifecycle=N`、`async_rx_requeue=Y`、`sbl_bad_tre_complete=N`，`/dev/mhi_sahara0` 与 `/dev/mhi_bl0` 均恢复存在，ESOC 状态仍为 `AP2MDM_STATUS=1 MDM2AP_STATUS=0 cached/reg=SECONDARY BOOTLOADER/M0 pm_state=0x4`。实机打开 `sbl_bad_tre_complete=Y`、`uci_rx_lifecycle=Y`、关闭 async/requeue/hold/restart 后，纯 UCI RX lifecycle 只收到 HELLO/HELLO_RESP 并 180 秒 idle；再打开 `ring_dl_db_after_ul=Y` 只踢出 image34 `READ_DATA offset=0 length=40`；同时打开 `ring_ul_db_after_ul=Y` 也只踢出 image34 `READ_DATA offset=40 length=1596`。三轮测试结束后 MDM2AP_STATUS 仍为 0，MHI 仍停在 SBL/M0，没有 `CMD_READY`、Mission/AMSS、QRTR/QMI、SIM、语音或蜂窝数据。
+
+后续处理：M107 排除“只要像 downstream UCI 一样 raw RX 交给 userspace、读完再 requeue 就能连续推进 SBL”作为根因；它和 M104/M106 一样仍表现为普通 doorbell 每次只能踢出一个 packet。后续不要继续在 clone-vs-raw RX lifecycle、runtime PM hold 或 plain UL/DL doorbell 上堆参数；应把重点转回 downstream MHI core/channel/event 生命周期差异、ESOC request-engine 状态通知，以及是否存在比 full channel restart 更安全的 SDX55M-specific progression 点。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
