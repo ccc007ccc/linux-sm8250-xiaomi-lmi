@@ -91,6 +91,12 @@ module_param_named(restart_ring_ul_db,
 MODULE_PARM_DESC(restart_ring_ul_db,
 		 "Ring the SAHARA UL channel doorbell after restart");
 
+static bool mhi_sahara_requeue_discarded_rx;
+module_param_named(requeue_discarded_rx,
+		   mhi_sahara_requeue_discarded_rx, bool, 0644);
+MODULE_PARM_DESC(requeue_discarded_rx,
+		 "Requeue successful empty or invalid SAHARA RX buffers instead of freeing them");
+
 static bool mhi_sahara_bl_auto_start;
 module_param_named(bl_auto_start, mhi_sahara_bl_auto_start, bool, 0644);
 MODULE_PARM_DESC(bl_auto_start, "Automatically start the read-only BL diagnostic channel");
@@ -520,6 +526,33 @@ static int mhi_sahara_alloc_queue_rx(struct mhi_sahara_dev *sdev)
 	rx->data = data;
 
 	return mhi_sahara_queue_rx_buf(sdev, rx);
+}
+
+static void mhi_sahara_discard_rx_buf(struct mhi_sahara_dev *sdev,
+				       struct mhi_sahara_buf *rx, const char *reason)
+{
+	int free_before;
+	int free_after;
+	int ret;
+
+	if (!mhi_sahara_requeue_discarded_rx) {
+		kfree(rx->data);
+		return;
+	}
+
+	free_before = mhi_get_free_desc_count(sdev->mhi_dev, DMA_FROM_DEVICE);
+	ret = mhi_sahara_queue_rx_buf(sdev, rx);
+	if (ret) {
+		dev_warn(&sdev->mhi_dev->dev,
+			 "SAHARA failed to requeue discarded RX buffer reason=%s ret=%d free_before=%d\n",
+			 reason, ret, free_before);
+		return;
+	}
+
+	free_after = mhi_get_free_desc_count(sdev->mhi_dev, DMA_FROM_DEVICE);
+	dev_info(&sdev->mhi_dev->dev,
+		 "SAHARA requeued discarded RX buffer reason=%s free_before=%d free_after=%d\n",
+		 reason, free_before, free_after);
 }
 
 static void mhi_sahara_maybe_queue_hello_resp(struct mhi_sahara_dev *sdev,
@@ -1111,8 +1144,14 @@ static void mhi_sahara_dl_xfer_cb(struct mhi_device *mhi_dev,
 	}
 	spin_unlock_bh(&sdev->rx_lock);
 
-	if (result->transaction_status || !result->bytes_xferd) {
+	if (result->transaction_status) {
 		kfree(result->buf_addr);
+		wake_up_all(&sdev->read_wq);
+		return;
+	}
+
+	if (!result->bytes_xferd) {
+		mhi_sahara_discard_rx_buf(sdev, rx, "empty");
 		wake_up_all(&sdev->read_wq);
 		return;
 	}
@@ -1121,7 +1160,7 @@ static void mhi_sahara_dl_xfer_cb(struct mhi_device *mhi_dev,
 		mhi_sahara_log_rx_packet(sdev, result->buf_addr, result->bytes_xferd);
 		dev_info(&mhi_dev->dev, "SAHARA dropping invalid RX packet len %zu\n",
 			 result->bytes_xferd);
-		kfree(result->buf_addr);
+		mhi_sahara_discard_rx_buf(sdev, rx, "invalid");
 		wake_up_all(&sdev->read_wq);
 		return;
 	}

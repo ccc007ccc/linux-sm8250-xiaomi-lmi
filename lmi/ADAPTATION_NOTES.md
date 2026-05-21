@@ -650,6 +650,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：BAD_TRE 详细日志和默认关闭的 re-ring 开关保留为诊断工具，但 M97 的可复现主因已转为 image40 首个 52 字节请求后的零 RX / RX requeue / channel restart 状态同步问题。下一步应对照 M94b 成功越过 image40 52 字节后的日志，重点比较 `parse_xfer_event()` 的 event ring RP、channel TRE RP、RX requeue、invalid RX drop、restart 后 context/doorbell resync 与自定义 event drain 是否错误推进空事件；仍不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M98 discarded RX buffer requeue 诊断
+
+含义：M98 在 `mhi_sahara_diag` 中加入默认关闭的 `requeue_discarded_rx` 参数，只对 transaction 成功但因 zero length 或 Sahara packet invalid 被丢弃的 DL RX buffer 尝试重新排队，用来验证 M97 image40 后 20 字节全零无效 RX 是否会让 DL ring 变浅。
+
+当前影响：M98 boot-only 镜像只刷 `boot` 后参数可见。按 M94b/M97 等价节拍打开 `requeue_discarded_rx=Y` 后，实机确实记录到 `SAHARA requeued discarded RX buffer reason=invalid free_before=1 free_after=0`，但流程仍只到 image34 两段、`END_OF_IMAGE`、`DONE_RESP pending`、post-DONE HELLO/HELLO_RESP，然后收到 20 字节全零 invalid RX 并 idle，没有进入 image40；同一内核重启后 `requeue_discarded_rx=N` 控制组也得到相同结果。M98 因此否定“discarded RX buffer 不回收就是 image40/后续 image 不稳定根因”这一分支。
+
+后续处理：该参数保持默认关闭，只作为后续确认 RX ring 深度的诊断工具，不作为修复路线。fresh M98 同时重新复现 chan3 `MHI_EV_CC_BAD_TRE`（ptr `0xfffb4010`）和 post-image34 zero RX，下一步应回到 BAD_TRE/event ring RP、channel TRE RP、restart 后 context/doorbell 同步和 post-image34 channel lifecycle，而不是继续围绕 invalid buffer 回收加逻辑。仍不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
