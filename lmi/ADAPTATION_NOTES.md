@@ -674,6 +674,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：`--hello-resp-delay` 保留为默认关闭的用户态诊断参数，不作为基线修复手段。M101 应继续聚焦 image40 52/96 或 image41 后的 zero RX/idle：比较 first-M100、corrected 6ms repeat 和 0ms control 的 event ring RP、channel TRE RP、RX requeue、BAD_TRE、restart 后 context WP 和 cached doorbell 同步，而不是继续增加固定 HELLO_RESP delay。仍不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M101 BAD_TRE failed-completion + RX requeue 组合诊断
+
+含义：M101 不改代码、不刷分区，只在 M99/M100 诊断内核上组合打开 `mhi.sbl_bad_tre_complete=Y` 与 `mhi_sahara_diag.requeue_discarded_rx=Y`，保持 `--hello-resp-delay 0`、200ms UL completion restart、`restart_resync_db_val=Y`、`restart_ring_ul_db=N`，用于验证 BAD_TRE failed-completion 与 invalid RX buffer requeue 同时启用时能否稳定越过 image40 52/96 或进入 image41。
+
+当前影响：本轮真实命中 chan3 `BAD_TRE` 两次并执行 `SBL channel 3 completing BAD_TRE as failed transfer`，同时两次执行 `SAHARA requeued discarded RX buffer`。Sahara 流程从 image34/mdmddr、`DONE_RESP pending` 和 post-image34 HELLO 继续推进，完成 image40/APDP offset 0/52、52/96、4096/6712、12288/1220 与 `END_OF_IMAGE image=40 status=0`；image40 `DONE` 后 SBL 再次发送 HELLO，host 回 `HELLO_RESP`，随后收到 20 字节全零 invalid RX packet，requeue 后仍触发 channel restart/resync 并在 240 秒 idle timeout 结束。全程没有 image41/devcfg、`CMD_READY`、Mission/AMSS、MDM2AP_STATUS 拉高、`SYS_ERROR` 或 timeout。
+
+后续处理：M101 证明 BAD_TRE failed-completion 与 discarded RX requeue 可以作为安全诊断手段推进部分 ring 状态，但不是最终修复；当前停点进一步收敛到 image40 `DONE` 后 post-image40 HELLO/HELLO_RESP 之后的 20 字节全零 RX 与 pending restart/resync 生命周期。M102 应重点比较 Android `ks` 在 post-image DONE/HELLO 后是否保持同一 SAHARA channel 上下文、是否避免 HELLO_RESP 后立刻 full restart、以及 invalid zero RX 是否应取消或延后 restart，而不是继续增加固定 delay、空 doorbell re-ring 或单独 requeue。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
