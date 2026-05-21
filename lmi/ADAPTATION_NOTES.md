@@ -738,6 +738,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M108 排除“downstream 每轮处理后都 ring event-ring DB，而 upstream 只在消费 event 时 ring DB”作为单独根因；空 poll re-ring 只会制造高频 no-event DB 日志，不能形成连续 Sahara progression。该参数保留 default-off 作为对照工具，不应默认启用或继续围绕 no-event ER DB re-ring 堆组合。下一步应继续查真实 event 生成/消费语义、SBL channel lifecycle、ESOC request-engine 状态通知，以及是否存在 Android downstream 在 image 阶段之间执行的更安全 SDX55M-specific progression 点。
 
+### M109 ESOC notify/state 诊断
+
+含义：M109 在 SDX55M PCI 设备上新增 `sdx55m_esoc_diag_notify` 写入口，和已有 `sdx55m_esoc_diag_state` 一起建模 Android downstream ESOC 的 `ESOC_REQ_IMG`、`ESOC_IMG_XFER_DONE`、`ESOC_BOOT_STATE`、`ESOC_BOOT_DONE` 与 `ESOC_RUN_STATE`。loader 和 rootfs wrapper 同步新增 `--esoc-notify-path`、`--notify-img-xfer-done` 与 `NOTIFY_IMG_XFER_DONE`，只在真实 `DONE_RESP` 表示 image-transfer complete 后才写入 `img_xfer_done`，不主动推送未请求 payload，也不写 NV/modem/dtbo/recovery/vbmeta。
+
+当前影响：boot-only M109 已只刷 `boot` 并启动，运行内核为 `7.1.0-rc4-gb4b0987c677e-dirty #127`；`sdx55m_esoc_diag_notify` 存在，写入 `reset_state` 可重置诊断状态并递增 `notify_count`。修正后的 release cadence 可到 image34 两段、host `DONE`、post-DONE HELLO/HELLO_RESP，并服务 image40/APDP offsets 0/52、52/96、4096/6712、12288/1220，但未收到 image40 `END_OF_IMAGE` 或 complete `DONE_RESP`，因此 loader 没有合法触发 `IMG_XFER_DONE`。M94b/M102-style restart 复测还确认 `async_rx_requeue=Y` 会跳过 UL completion restart 分支，`restart_cancel_on_invalid_rx=Y` 会在 image34 后 invalid zero RX 处取消 pending restart；关闭该 cancel 后当前 M109 200ms restart baseline 仍未恢复 image40。最终仍为 `MDM2AP_STATUS=0`、`SECONDARY BOOTLOADER/M0`，没有 `CMD_READY`、Mission/AMSS、QRTR/QMI、SIM、语音或蜂窝数据。
+
+后续处理：M109 证明 ESOC notify/state 诊断通路可用，但尚未证明 `ESOC_IMG_XFER_DONE` 本身能推进 SBL，因为当前没有一轮测试合法到达 image-transfer complete。后续应先恢复或替换 M94b 最大进展所依赖的 stage-aware progression，再在真实 complete `DONE_RESP` 后观察 MDM2AP_STATUS 和 ESOC_BOOT_STATE；不要把手动 `reset_state` 计数误解为 loader 已发送 `IMG_XFER_DONE`。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。

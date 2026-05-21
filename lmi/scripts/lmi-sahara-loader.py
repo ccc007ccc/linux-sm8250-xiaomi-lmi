@@ -73,6 +73,23 @@ def log_diag_state(args, stage):
         log("diag_state", f"{stage} {path}: {text}")
 
 
+def write_esoc_notify(args, value, stage):
+    if not args.esoc_notify_path:
+        return
+    paths = sorted(glob.glob(args.esoc_notify_path))
+    if not paths and not glob.has_magic(args.esoc_notify_path):
+        paths = [args.esoc_notify_path]
+    for path in paths:
+        try:
+            with open(path, "w", encoding="utf-8") as file:
+                file.write(value + "\n")
+            log("esoc_notify", f"{stage} {path}: {value}")
+            return
+        except OSError as exc:
+            log("esoc_notify_error", f"{stage} {path}: {exc}")
+    log("esoc_notify_error", f"{stage} no_path pattern={args.esoc_notify_path}")
+
+
 def u16(buf, off):
     return struct.unpack_from("<H", buf, off)[0]
 
@@ -552,8 +569,12 @@ def handle_packet(fd, fat, data, args, hello_mode_override=None):
             if args.unsafe_done_restart:
                 return "done_resp_restart", 0, None
             return "stop", 0, None
-        if image_tx_pending == SAHARA_MODE_IMAGE_TX_COMPLETE and args.done_resp_follow_timeout > 0:
-            return "done_resp_follow", 0, None
+        if image_tx_pending == SAHARA_MODE_IMAGE_TX_COMPLETE:
+            if args.notify_img_xfer_done:
+                write_esoc_notify(args, "img_xfer_done", "done_resp_complete")
+                log_diag_state(args, "after_img_xfer_done_notify")
+            if args.done_resp_follow_timeout > 0:
+                return "done_resp_follow", 0, None
         return "stop", 0, None
     if cmd == CMD_READY:
         handle_cmd_ready(fd, args)
@@ -816,6 +837,8 @@ def parse_args():
     parser.add_argument("--stop-after-read-data-image", type=int, default=-2)
     parser.add_argument("--stop-after-read-data-min-offset", type=int, default=0)
     parser.add_argument("--diag-state-path", default="/sys/bus/pci/devices/*/sdx55m_esoc_diag_state")
+    parser.add_argument("--esoc-notify-path", default="/sys/bus/pci/devices/*/sdx55m_esoc_diag_notify")
+    parser.add_argument("--notify-img-xfer-done", action="store_true")
     parser.add_argument("--diag-after-read-data-image", type=int, default=-1)
     parser.add_argument("--diag-after-read-data-min-offset", type=int, default=0)
     parser.add_argument("--ks-pending-timeout", type=float, default=0.0)

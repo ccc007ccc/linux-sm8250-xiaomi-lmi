@@ -30,6 +30,7 @@
 #define MHI_SDX55M_ESOC_REQ_IMG_WINDOW_MS 0
 #define MHI_SDX55M_ESOC_POLL_INTERVAL_MS 500
 #define MHI_SDX55M_ESOC_POLL_SAMPLES 24
+#define MHI_SDX55M_MDM2AP_STATUS_TIMEOUT_MS 120000
 #define MHI_SDX55M_MODEM_PON_BASE 0x800
 #define MHI_SDX55M_PON_SW_RST_S2_CTL 0x62
 #define MHI_SDX55M_PON_SW_RST_S2_CTL2 0x63
@@ -1230,8 +1231,15 @@ struct mhi_sdx55m_esoc_diag {
 	struct gpio_desc *mdm2ap_status;
 	struct gpio_desc *mdm2ap_errfatal;
 	struct delayed_work poll_work;
+	struct delayed_work status_check_work;
 	unsigned int poll_count;
+	unsigned int notify_count;
 	bool enabled;
+	bool req_img;
+	bool img_xfer_done;
+	bool boot_state;
+	bool boot_done;
+	bool run_state;
 };
 
 struct mhi_pci_device {
@@ -1246,6 +1254,10 @@ struct mhi_pci_device {
 
 static void mhi_sdx55m_esoc_diag_start_poll(struct mhi_pci_device *mhi_pdev);
 static void mhi_sdx55m_esoc_diag_stop(struct mhi_pci_device *mhi_pdev);
+static void mhi_sdx55m_esoc_diag_log(struct mhi_pci_device *mhi_pdev,
+					    const char *stage, bool read_regs);
+static void mhi_sdx55m_esoc_diag_mark_boot_state(struct mhi_pci_device *mhi_pdev,
+						 const char *stage);
 
 static int mhi_pci_read_reg(struct mhi_controller *mhi_cntrl,
 			    void __iomem *addr, u32 *out)
@@ -1570,20 +1582,79 @@ static ssize_t sdx55m_esoc_diag_state_show(struct device *dev,
 	}
 
 	return sysfs_emit(buf,
-			  "enabled=%d AP2MDM_STATUS=%d AP2MDM_ERRFATAL=%d MDM2AP_STATUS=%d MDM2AP_ERRFATAL=%d cached_ee=%s cached_state=%s reg_ee=%s reg_state=%s pm_state=0x%x\n",
+			  "enabled=%d AP2MDM_STATUS=%d AP2MDM_ERRFATAL=%d MDM2AP_STATUS=%d MDM2AP_ERRFATAL=%d ESOC_REQ_IMG=%d IMG_XFER_DONE=%d BOOT_STATE=%d BOOT_DONE=%d RUN_STATE=%d notify_count=%u cached_ee=%s cached_state=%s reg_ee=%s reg_state=%s pm_state=0x%x\n",
 			  diag->enabled,
 			  mhi_sdx55m_gpio_get_value(diag->ap2mdm_status),
 			  mhi_sdx55m_gpio_get_value(diag->ap2mdm_errfatal),
 			  mhi_sdx55m_gpio_get_value(diag->mdm2ap_status),
 			  mhi_sdx55m_gpio_get_value(diag->mdm2ap_errfatal),
+			  diag->req_img, diag->img_xfer_done, diag->boot_state,
+			  diag->boot_done, diag->run_state, diag->notify_count,
 			  TO_MHI_EXEC_STR(mhi_cntrl->ee),
 			  mhi_state_str(mhi_cntrl->dev_state), TO_MHI_EXEC_STR(reg_ee),
 			  mhi_state_str(reg_state), mhi_cntrl->pm_state);
 }
 static DEVICE_ATTR_RO(sdx55m_esoc_diag_state);
 
+static ssize_t sdx55m_esoc_diag_notify_store(struct device *dev,
+						     struct device_attribute *attr,
+						     const char *buf, size_t count)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mhi_pci_device *mhi_pdev = pci_get_drvdata(pdev);
+	struct mhi_sdx55m_esoc_diag *diag;
+
+	if (!mhi_pdev)
+		return -ENODEV;
+
+	diag = &mhi_pdev->esoc_diag;
+	if (!diag->enabled)
+		return -ENODEV;
+
+	diag->notify_count++;
+
+	if (sysfs_streq(buf, "img_xfer_done")) {
+		diag->img_xfer_done = true;
+		if (mhi_sdx55m_gpio_get_value(diag->mdm2ap_status) > 0) {
+			mhi_sdx55m_esoc_diag_mark_boot_state(mhi_pdev,
+							     "ESOC_IMG_XFER_DONE status already high");
+			return count;
+		}
+
+		dev_info(&pdev->dev,
+			 "SDX55M ESOC diag: ESOC_IMG_XFER_DONE; waiting %u ms for MDM2AP_STATUS\n",
+			 MHI_SDX55M_MDM2AP_STATUS_TIMEOUT_MS);
+		schedule_delayed_work(&diag->status_check_work,
+				      msecs_to_jiffies(MHI_SDX55M_MDM2AP_STATUS_TIMEOUT_MS));
+		mhi_sdx55m_esoc_diag_log(mhi_pdev, "ESOC_IMG_XFER_DONE", true);
+		return count;
+	}
+
+	if (sysfs_streq(buf, "boot_done")) {
+		diag->boot_done = true;
+		diag->run_state = true;
+		mhi_sdx55m_esoc_diag_log(mhi_pdev, "ESOC_BOOT_DONE/RUN_STATE", true);
+		return count;
+	}
+
+	if (sysfs_streq(buf, "reset_state")) {
+		cancel_delayed_work(&diag->status_check_work);
+		diag->req_img = true;
+		diag->img_xfer_done = false;
+		diag->boot_state = false;
+		diag->boot_done = false;
+		diag->run_state = false;
+		mhi_sdx55m_esoc_diag_log(mhi_pdev, "ESOC diagnostic state reset", true);
+		return count;
+	}
+
+	return -EINVAL;
+}
+static DEVICE_ATTR_WO(sdx55m_esoc_diag_notify);
+
 static struct attribute *mhi_sdx55m_esoc_diag_attrs[] = {
 	&dev_attr_sdx55m_esoc_diag_state.attr,
+	&dev_attr_sdx55m_esoc_diag_notify.attr,
 	NULL,
 };
 
@@ -1616,6 +1687,39 @@ static void mhi_sdx55m_esoc_diag_log(struct mhi_pci_device *mhi_pdev,
 		 mhi_cntrl->pm_state);
 }
 
+static void mhi_sdx55m_esoc_diag_mark_boot_state(struct mhi_pci_device *mhi_pdev,
+						 const char *stage)
+{
+	struct mhi_sdx55m_esoc_diag *diag = &mhi_pdev->esoc_diag;
+
+	if (diag->boot_state)
+		return;
+
+	diag->boot_state = true;
+	cancel_delayed_work(&diag->status_check_work);
+	mhi_sdx55m_esoc_diag_log(mhi_pdev, stage, true);
+}
+
+static void mhi_sdx55m_esoc_status_check_work(struct work_struct *work)
+{
+	struct mhi_sdx55m_esoc_diag *diag = container_of(to_delayed_work(work),
+							struct mhi_sdx55m_esoc_diag,
+							status_check_work);
+	struct mhi_pci_device *mhi_pdev = container_of(diag, struct mhi_pci_device,
+						      esoc_diag);
+
+	if (!diag->enabled || !diag->img_xfer_done)
+		return;
+
+	if (mhi_sdx55m_gpio_get_value(diag->mdm2ap_status) > 0)
+		mhi_sdx55m_esoc_diag_mark_boot_state(mhi_pdev,
+							     "ESOC_BOOT_STATE after IMG_XFER_DONE wait");
+	else
+		mhi_sdx55m_esoc_diag_log(mhi_pdev,
+					      "ESOC_IMG_XFER_DONE timeout waiting MDM2AP_STATUS",
+					      true);
+}
+
 static irqreturn_t mhi_sdx55m_esoc_gpio_irq(int irq, void *data)
 {
 	struct mhi_sdx55m_esoc_diag *diag = data;
@@ -1624,6 +1728,8 @@ static irqreturn_t mhi_sdx55m_esoc_gpio_irq(int irq, void *data)
 
 	mhi_sdx55m_esoc_diag_log(mhi_pdev, "sideband IRQ",
 				       test_bit(MHI_PCI_DEV_STARTED, &mhi_pdev->status));
+	if (mhi_sdx55m_gpio_get_value(diag->mdm2ap_status) > 0)
+		mhi_sdx55m_esoc_diag_mark_boot_state(mhi_pdev, "ESOC_BOOT_STATE IRQ");
 
 	return IRQ_HANDLED;
 }
@@ -1670,6 +1776,8 @@ static void mhi_sdx55m_esoc_poll_work(struct work_struct *work)
 
 	diag->poll_count++;
 	mhi_sdx55m_esoc_diag_log(mhi_pdev, "ESOC_REQ_IMG/SBL poll", true);
+	if (mhi_sdx55m_gpio_get_value(diag->mdm2ap_status) > 0)
+		mhi_sdx55m_esoc_diag_mark_boot_state(mhi_pdev, "ESOC_BOOT_STATE poll");
 
 	if (diag->poll_count < MHI_SDX55M_ESOC_POLL_SAMPLES)
 		schedule_delayed_work(&diag->poll_work,
@@ -1692,8 +1800,10 @@ static void mhi_sdx55m_esoc_diag_start_poll(struct mhi_pci_device *mhi_pdev)
 
 static void mhi_sdx55m_esoc_diag_stop(struct mhi_pci_device *mhi_pdev)
 {
-	if (mhi_pdev->esoc_diag.enabled)
+	if (mhi_pdev->esoc_diag.enabled) {
 		cancel_delayed_work_sync(&mhi_pdev->esoc_diag.poll_work);
+		cancel_delayed_work_sync(&mhi_pdev->esoc_diag.status_check_work);
+	}
 }
 
 static int mhi_sdx55m_spmi_write(struct spmi_device *sdev, u16 addr, u8 val)
@@ -1786,6 +1896,11 @@ static void mhi_sdx55m_esoc_diag_sequence(struct mhi_pci_device *mhi_pdev,
 	}
 
 	diag->enabled = true;
+	diag->req_img = true;
+	diag->img_xfer_done = false;
+	diag->boot_state = false;
+	diag->boot_done = false;
+	diag->run_state = false;
 	mhi_sdx55m_esoc_request_irq(mhi_pdev, diag->mdm2ap_status,
 					 "sdx55m-mdm2ap-status");
 	mhi_sdx55m_esoc_request_irq(mhi_pdev, diag->mdm2ap_errfatal,
@@ -1832,6 +1947,8 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	INIT_WORK(&mhi_pdev->recovery_work, mhi_pci_recovery_work);
 	INIT_DELAYED_WORK(&mhi_pdev->esoc_diag.poll_work, mhi_sdx55m_esoc_poll_work);
+	INIT_DELAYED_WORK(&mhi_pdev->esoc_diag.status_check_work,
+			  mhi_sdx55m_esoc_status_check_work);
 
 	if (pdev->is_virtfn && info->vf_config)
 		mhi_cntrl_config = info->vf_config;
