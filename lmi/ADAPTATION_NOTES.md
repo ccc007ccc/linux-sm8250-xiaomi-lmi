@@ -618,6 +618,14 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP 后的 restart，并抑制所有 READ_DATA payload 后的 restart：image34 offset 0/40 写入后内核记录 `SAHARA suppressing channel restart after READ_DATA image=34 remaining=0`，随后不再出现 image34 offset 40/1596 并 idle timeout。该结果说明某种 post-UL progression 动作仍是必要的；但当前的 full unprepare/prepare restart 又会造成 context/doorbell stale 风险。M94 不应继续盲目堆固定 delay，应测试更轻量的 post-UL 推进或显式 context/doorbell resync，并按阶段限制 full restart 使用范围。仍保持只响应真实 `READ_DATA`、不读 `/dev/mhi_bl0`、不进入 EDL、不发送 firehose、不写 NV/modem/dtbo/recovery/vbmeta、不提交 firmware blob。
 
+### M94 SAHARA restart doorbell resync 诊断
+
+含义：M94 在 `mhi_sahara_diag` 中加入默认关闭的 `restart_resync_db_val` 和 `restart_ring_ul_db` 参数。前者在 SAHARA full restart 后把 UL/DL channel 的 cached `db_cfg.db_val` 显式同步到 device-visible context WP；后者仅用于对照测试，在 restart 后额外敲一次 UL doorbell，验证 M93 发现的 stale doorbell 是否需要 re-ring 才能推进。
+
+当前影响：M94 boot-only 镜像只刷 `boot` 后可启动。`restart_resync_db_val=Y` 且 `restart_ring_ul_db=Y` 的首轮测试在 image34/mdmddr 完整、`DONE_RESP pending` 和新 HELLO/HELLO_RESP 后停止，未推进到 image40，说明 restart 后空敲 UL doorbell 会回退当前节拍。干净重启后的 M94b resync-only 对照保持 `restart_resync_db_val=Y`、`restart_ring_ul_db=N`，使用 M90-like `restart_after_ul_delay_ms=200`、`restart_track_read_data_len=4096`、`restart_suppress_read_data_len=131072`、`--continuous --active-read-drain`，已推进到 image34/mdmddr、image40/APDP、image41/devcfg、image25/TZ、image33/HYP 和 image23/AOP，并收到 image23 `END_OF_IMAGE status=0`；其中 image25 884736 字节和 image23 142384 字节都通过 grouped write / `MHI_CHAIN` + final `MHI_EOT` 完整传输。dmesg 确认 restart 后 UL/DL 的 `ctx_wp`、host WP、`ctxt_wp` 和 cached `db_val` 已重新对齐，例如 `SAHARA restart resync UL chan2 resync_db_val=0xfffb5000` 后 `db_val=0xfffb5000`。
+
+后续处理：M94b 证明 M93 的 cached doorbell stale 是实际影响因素之一，也证明显式 resync 比空 UL re-ring 更安全；后续测试应保留 `restart_resync_db_val=Y`、避免 `restart_ring_ul_db=Y`。当前新阻塞点是 image23/AOP `END_OF_IMAGE` 后 host 发送 `DONE`，modem 再发新 HELLO，HELLO_RESP 完成后 240 秒无后续 `READ_DATA`、`CMD_READY`、Mission/AMSS 或 MDM2AP_STATUS 拉高。下一步应继续对照 Android ESOC/`ks` 在 AOP 后是否还有 image 序列、`IMG_XFER_DONE`/`BOOT_DONE` 或 channel lifecycle 差异；仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。

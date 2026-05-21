@@ -79,6 +79,18 @@ module_param_named(restart_suppress_read_data_len,
 MODULE_PARM_DESC(restart_suppress_read_data_len,
 		 "Suppress SAHARA channel restart after READ_DATA payloads at least this large");
 
+static bool mhi_sahara_restart_resync_db_val;
+module_param_named(restart_resync_db_val,
+		   mhi_sahara_restart_resync_db_val, bool, 0644);
+MODULE_PARM_DESC(restart_resync_db_val,
+		 "Resync cached SAHARA channel doorbell values after restart");
+
+static bool mhi_sahara_restart_ring_ul_db;
+module_param_named(restart_ring_ul_db,
+		   mhi_sahara_restart_ring_ul_db, bool, 0644);
+MODULE_PARM_DESC(restart_ring_ul_db,
+		 "Ring the SAHARA UL channel doorbell after restart");
+
 static bool mhi_sahara_bl_auto_start;
 module_param_named(bl_auto_start, mhi_sahara_bl_auto_start, bool, 0644);
 MODULE_PARM_DESC(bl_auto_start, "Automatically start the read-only BL diagnostic channel");
@@ -285,6 +297,31 @@ static void mhi_sahara_ring_chan_db_now(struct mhi_sahara_dev *sdev,
 
 	dev_info(&sdev->mhi_dev->dev, "SAHARA %s chan%u ring_db db_valid=%u\n",
 		 tag, mhi_chan->chan, db_valid);
+	mhi_sahara_log_chan(sdev, mhi_chan, tag);
+}
+
+static void mhi_sahara_resync_chan_db_val(struct mhi_sahara_dev *sdev,
+						   struct mhi_chan *mhi_chan,
+						   const char *tag)
+{
+	struct mhi_ring *ring;
+	unsigned long flags;
+	dma_addr_t db = 0;
+
+	if (!mhi_chan)
+		return;
+
+	ring = &mhi_chan->tre_ring;
+	write_lock_irqsave(&mhi_chan->lock, flags);
+	if (ring->ctxt_wp)
+		db = le64_to_cpu(*ring->ctxt_wp);
+	else if (ring->base)
+		db = ring->iommu_base + (ring->wp - ring->base);
+	mhi_chan->db_cfg.db_val = db;
+	write_unlock_irqrestore(&mhi_chan->lock, flags);
+
+	dev_info(&sdev->mhi_dev->dev, "SAHARA %s chan%u resync_db_val=0x%llx\n",
+		 tag, mhi_chan->chan, (u64)db);
 	mhi_sahara_log_chan(sdev, mhi_chan, tag);
 }
 
@@ -671,6 +708,16 @@ static void mhi_sahara_restart_work(struct work_struct *work)
 		mhi_sahara_purge_rx(sdev);
 		goto warn;
 	}
+
+	if (mhi_sahara_restart_resync_db_val) {
+		mhi_sahara_resync_chan_db_val(sdev, sdev->mhi_dev->ul_chan,
+						   "restart resync UL");
+		mhi_sahara_resync_chan_db_val(sdev, sdev->mhi_dev->dl_chan,
+						   "restart resync DL");
+	}
+	if (mhi_sahara_restart_ring_ul_db)
+		mhi_sahara_ring_chan_db_now(sdev, sdev->mhi_dev->ul_chan,
+					       "restart UL re-ring");
 
 	mhi_sahara_schedule_drain(sdev);
 	mhi_sahara_log_state(sdev, "restart after");
