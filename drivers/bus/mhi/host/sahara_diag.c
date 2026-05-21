@@ -55,6 +55,30 @@ static bool mhi_sahara_ring_dl_db_after_ul;
 module_param_named(ring_dl_db_after_ul, mhi_sahara_ring_dl_db_after_ul, bool, 0644);
 MODULE_PARM_DESC(ring_dl_db_after_ul, "Ring the SAHARA DL channel doorbell after UL completion");
 
+static bool mhi_sahara_restart_after_ul_completion;
+module_param_named(restart_after_ul_completion,
+		   mhi_sahara_restart_after_ul_completion, bool, 0644);
+MODULE_PARM_DESC(restart_after_ul_completion,
+		 "Restart the SAHARA channel after each successful UL completion");
+
+static unsigned int mhi_sahara_restart_after_ul_delay_ms;
+module_param_named(restart_after_ul_delay_ms,
+		   mhi_sahara_restart_after_ul_delay_ms, uint, 0644);
+MODULE_PARM_DESC(restart_after_ul_delay_ms,
+		 "Delay before restarting the SAHARA channel after UL completion");
+
+static unsigned int mhi_sahara_restart_track_read_data_len;
+module_param_named(restart_track_read_data_len,
+		   mhi_sahara_restart_track_read_data_len, uint, 0644);
+MODULE_PARM_DESC(restart_track_read_data_len,
+		 "Track READ_DATA payload bytes and defer restart until completion for payloads at least this large");
+
+static unsigned int mhi_sahara_restart_suppress_read_data_len;
+module_param_named(restart_suppress_read_data_len,
+		   mhi_sahara_restart_suppress_read_data_len, uint, 0644);
+MODULE_PARM_DESC(restart_suppress_read_data_len,
+		 "Suppress SAHARA channel restart after READ_DATA payloads at least this large");
+
 static bool mhi_sahara_bl_auto_start;
 module_param_named(bl_auto_start, mhi_sahara_bl_auto_start, bool, 0644);
 MODULE_PARM_DESC(bl_auto_start, "Automatically start the read-only BL diagnostic channel");
@@ -75,6 +99,8 @@ struct mhi_sahara_dev {
 	spinlock_t rx_lock;
 	struct delayed_work drain_work;
 	struct delayed_work start_work;
+	struct delayed_work restart_work;
+	spinlock_t restart_lock;
 	wait_queue_head_t read_wq;
 	wait_queue_head_t write_wq;
 	struct list_head pending_rx;
@@ -91,6 +117,10 @@ struct mhi_sahara_dev {
 	bool keep_rx_without_open;
 	bool auto_hello_resp;
 	bool auto_hello_sent;
+	bool restart_suppress_active;
+	u32 restart_suppress_image;
+	bool restart_suppress_after_read;
+	size_t restart_suppress_remaining;
 };
 
 static void mhi_sahara_put(struct mhi_sahara_dev *sdev)
@@ -279,6 +309,99 @@ static void mhi_sahara_log_rx_packet(struct mhi_sahara_dev *sdev,
 	mhi_sahara_log_state(sdev, "RX short packet");
 }
 
+static bool mhi_sahara_rx_packet_valid(const void *buf, size_t len)
+{
+	const __le32 *words = buf;
+	u32 cmd, pkt_len;
+
+	if (len < 2 * sizeof(*words))
+		return false;
+
+	cmd = le32_to_cpu(words[0]);
+	pkt_len = le32_to_cpu(words[1]);
+
+	return cmd && pkt_len >= 2 * sizeof(*words) && pkt_len <= len;
+}
+
+static void mhi_sahara_note_rx_for_restart(struct mhi_sahara_dev *sdev,
+						   const void *buf, size_t len)
+{
+	const __le32 *words = buf;
+	unsigned long flags;
+	u32 cmd, image, length;
+	bool track_read;
+	bool suppress_after_read;
+
+	if (!sdev->allow_write || len < MHI_SAHARA_READ_DATA_LEN)
+		return;
+
+	cmd = le32_to_cpu(words[0]);
+	if (cmd != MHI_SAHARA_CMD_READ_DATA) {
+		spin_lock_irqsave(&sdev->restart_lock, flags);
+		sdev->restart_suppress_active = false;
+		sdev->restart_suppress_after_read = false;
+		sdev->restart_suppress_remaining = 0;
+		spin_unlock_irqrestore(&sdev->restart_lock, flags);
+		return;
+	}
+
+	image = le32_to_cpu(words[2]);
+	length = le32_to_cpu(words[4]);
+	track_read = mhi_sahara_restart_track_read_data_len &&
+		length >= mhi_sahara_restart_track_read_data_len;
+	suppress_after_read = mhi_sahara_restart_suppress_read_data_len &&
+		length >= mhi_sahara_restart_suppress_read_data_len;
+
+	spin_lock_irqsave(&sdev->restart_lock, flags);
+	if (track_read || suppress_after_read) {
+		sdev->restart_suppress_active = true;
+		sdev->restart_suppress_image = image;
+		sdev->restart_suppress_after_read = suppress_after_read;
+		sdev->restart_suppress_remaining = length;
+	} else {
+		sdev->restart_suppress_active = false;
+		sdev->restart_suppress_after_read = false;
+		sdev->restart_suppress_remaining = 0;
+	}
+	spin_unlock_irqrestore(&sdev->restart_lock, flags);
+
+	if (track_read || suppress_after_read)
+		dev_info(&sdev->mhi_dev->dev,
+			 "SAHARA tracking restart for READ_DATA image=%u length=%u track_threshold=%u suppress_threshold=%u suppress_after=%u\n",
+			 image, length, mhi_sahara_restart_track_read_data_len,
+			 mhi_sahara_restart_suppress_read_data_len, suppress_after_read);
+}
+
+static bool mhi_sahara_restart_deferred_for_ul(struct mhi_sahara_dev *sdev,
+						       size_t bytes, u32 *image,
+						       size_t *remaining,
+						       bool *suppress_after_read)
+{
+	unsigned long flags;
+	bool deferred = false;
+
+	*suppress_after_read = false;
+	spin_lock_irqsave(&sdev->restart_lock, flags);
+	if (sdev->restart_suppress_active) {
+		*image = sdev->restart_suppress_image;
+		if (bytes >= sdev->restart_suppress_remaining)
+			sdev->restart_suppress_remaining = 0;
+		else
+			sdev->restart_suppress_remaining -= bytes;
+		*remaining = sdev->restart_suppress_remaining;
+		*suppress_after_read = !sdev->restart_suppress_remaining &&
+			sdev->restart_suppress_after_read;
+		deferred = sdev->restart_suppress_remaining || *suppress_after_read;
+		if (!sdev->restart_suppress_remaining) {
+			sdev->restart_suppress_active = false;
+			sdev->restart_suppress_after_read = false;
+		}
+	}
+	spin_unlock_irqrestore(&sdev->restart_lock, flags);
+
+	return deferred;
+}
+
 static int mhi_sahara_queue_rx_buf(struct mhi_sahara_dev *sdev,
 					   struct mhi_sahara_buf *rx)
 {
@@ -424,6 +547,7 @@ static void mhi_sahara_purge_rx(struct mhi_sahara_dev *sdev)
 static void mhi_sahara_stop_locked(struct mhi_sahara_dev *sdev)
 {
 	sdev->opened = false;
+	cancel_delayed_work(&sdev->restart_work);
 	if (sdev->allow_write)
 		sdev->keep_rx_without_open = false;
 	if (sdev->prepared) {
@@ -466,6 +590,53 @@ static void mhi_sahara_start_work(struct work_struct *work)
 warn:
 	dev_warn(&sdev->mhi_dev->dev, "failed to delayed auto-start /dev/%s: %d\n",
 		 sdev->miscdev.name, ret);
+
+out_unlock:
+	mutex_unlock(&sdev->lock);
+}
+
+static void mhi_sahara_restart_work(struct work_struct *work)
+{
+	struct mhi_sahara_dev *sdev = container_of(to_delayed_work(work),
+							struct mhi_sahara_dev, restart_work);
+	int ret;
+
+	mutex_lock(&sdev->lock);
+	if (!sdev->present || !sdev->opened || !sdev->prepared)
+		goto out_unlock;
+
+	dev_info(&sdev->mhi_dev->dev, "SAHARA restarting channel after UL completion\n");
+	mhi_sahara_log_state(sdev, "restart before");
+	cancel_delayed_work_sync(&sdev->drain_work);
+	mhi_unprepare_from_transfer(sdev->mhi_dev);
+	sdev->prepared = false;
+	mhi_sahara_purge_rx(sdev);
+	sdev->auto_hello_sent = false;
+
+	ret = mhi_prepare_for_transfer(sdev->mhi_dev);
+	if (ret)
+		goto warn;
+
+	sdev->prepared = true;
+	ret = mhi_sahara_refill_rx(sdev);
+	if (ret) {
+		mhi_unprepare_from_transfer(sdev->mhi_dev);
+		sdev->prepared = false;
+		mhi_sahara_purge_rx(sdev);
+		goto warn;
+	}
+
+	mhi_sahara_schedule_drain(sdev);
+	mhi_sahara_log_state(sdev, "restart after");
+	wake_up_all(&sdev->read_wq);
+	wake_up_all(&sdev->write_wq);
+	goto out_unlock;
+
+warn:
+	dev_warn(&sdev->mhi_dev->dev, "failed to restart SAHARA channel after UL completion: %d\n",
+		 ret);
+	wake_up_all(&sdev->read_wq);
+	wake_up_all(&sdev->write_wq);
 
 out_unlock:
 	mutex_unlock(&sdev->lock);
@@ -792,6 +963,22 @@ static void mhi_sahara_dl_xfer_cb(struct mhi_device *mhi_dev,
 		return;
 	}
 
+	if (!mhi_sahara_rx_packet_valid(result->buf_addr, result->bytes_xferd)) {
+		mhi_sahara_log_rx_packet(sdev, result->buf_addr, result->bytes_xferd);
+		dev_info(&mhi_dev->dev, "SAHARA dropping invalid RX packet len %zu\n",
+			 result->bytes_xferd);
+		kfree(result->buf_addr);
+		wake_up_all(&sdev->read_wq);
+		return;
+	}
+
+	mhi_sahara_note_rx_for_restart(sdev, result->buf_addr, result->bytes_xferd);
+
+	if (sdev->allow_write && mhi_sahara_restart_after_ul_completion &&
+	    cancel_delayed_work(&sdev->restart_work))
+		dev_info(&mhi_dev->dev,
+			 "SAHARA canceled pending channel restart after DL packet\n");
+
 	rx->data = result->buf_addr;
 	rx->len = result->bytes_xferd;
 
@@ -824,6 +1011,30 @@ static void mhi_sahara_ul_xfer_cb(struct mhi_device *mhi_dev,
 		if (!result->transaction_status && mhi_sahara_ring_dl_db_after_ul)
 			mhi_sahara_ring_chan_db_now(sdev, mhi_dev->dl_chan,
 							    "UL completion DL re-ring");
+		if (!result->transaction_status && mhi_sahara_restart_after_ul_completion) {
+			u32 image = 0;
+			size_t remaining = 0;
+			bool suppress_after_read = false;
+
+			if (!result->bytes_xferd) {
+				dev_info(&mhi_dev->dev,
+					 "SAHARA not scheduling channel restart after zero-byte UL completion\n");
+			} else if (mhi_sahara_restart_deferred_for_ul(sdev,
+									 result->bytes_xferd,
+									 &image, &remaining,
+									 &suppress_after_read)) {
+				dev_info(&mhi_dev->dev,
+					 "SAHARA %s channel restart after READ_DATA image=%u remaining=%zu\n",
+					 suppress_after_read ? "suppressing" : "deferring",
+					 image, remaining);
+			} else {
+				dev_info(&mhi_dev->dev,
+					 "SAHARA scheduling channel restart after UL completion delay_ms=%u\n",
+					 mhi_sahara_restart_after_ul_delay_ms);
+				mod_delayed_work(system_wq, &sdev->restart_work,
+						 msecs_to_jiffies(mhi_sahara_restart_after_ul_delay_ms));
+			}
+		}
 	}
 
 	kfree(result->buf_addr);
@@ -880,8 +1091,10 @@ static int mhi_sahara_probe(struct mhi_device *mhi_dev,
 	refcount_set(&sdev->refs, 1);
 	mutex_init(&sdev->lock);
 	spin_lock_init(&sdev->rx_lock);
+	spin_lock_init(&sdev->restart_lock);
 	INIT_DELAYED_WORK(&sdev->drain_work, mhi_sahara_drain_work);
 	INIT_DELAYED_WORK(&sdev->start_work, mhi_sahara_start_work);
+	INIT_DELAYED_WORK(&sdev->restart_work, mhi_sahara_restart_work);
 	init_waitqueue_head(&sdev->read_wq);
 	init_waitqueue_head(&sdev->write_wq);
 	INIT_LIST_HEAD(&sdev->pending_rx);
@@ -936,6 +1149,7 @@ static void mhi_sahara_remove(struct mhi_device *mhi_dev)
 	struct mhi_sahara_dev *sdev = dev_get_drvdata(&mhi_dev->dev);
 
 	cancel_delayed_work_sync(&sdev->start_work);
+	cancel_delayed_work_sync(&sdev->restart_work);
 	misc_deregister(&sdev->miscdev);
 
 	mutex_lock(&sdev->lock);

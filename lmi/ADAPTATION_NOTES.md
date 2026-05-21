@@ -554,6 +554,54 @@ MHI core 补充对比：Android downstream `mhi_boot.c` 在 firmware load 后等
 
 后续处理：M84 排除了“缺少 downstream-style queue-time trigger-resume”以及“doorbell 必须在 channel lock 下敲”作为当前一包一开的直接根因。当前 SBL 阶段已经处于 M0 且 DB access valid，继续堆叠 queue doorbell 变体的价值较低；下一步应回到 ESOC/request-engine 生命周期、image-transfer done 通知语义、或 channel START/RESET cadence 差异，而不是把这些 M84 诊断开关作为默认修复。
 
+### M85 SAHARA channel restart-after-UL 诊断
+
+含义：M85 在 `mhi_sahara_diag` 中新增默认关闭的 `restart_after_ul_completion` 诊断参数，在 SAHARA UL completion 成功后由内核主动执行一次 channel unprepare/prepare/restart，验证此前依赖 userspace close/reopen 的 RESET/START 副作用能否在同一 fd 生命周期内推进 SBL 的下一条 Sahara 包。
+
+当前影响：M85 证明 channel restart 确实能推进 same-fd Sahara progression，但立即 restart 会和 modem 刚产生的 DL packet 竞争：实机能看到 image34 `END_OF_IMAGE`、host `DONE`、后续 HELLO/HELLO_RESP 以及 kernel 侧 image40 请求线索，但过早 restart 可能 purge 或错过 pending RX，导致 userspace 没有稳定收到 image40。
+
+后续处理：M85 把阻塞点从“必须 close/reopen 才有下一包”推进到“channel restart cadence 可以触发下一包但时序敏感”。该 restart 仍只是诊断手段，不作为最终修复；后续应让 restart 可延迟、可取消，并避免在有效 DL packet 已到达时继续 reset channel。
+
+### M86 delayed/cancellable SAHARA restart 诊断
+
+含义：M86 在 M85 基础上新增 `restart_after_ul_delay_ms`，并在收到有效 DL packet 时取消 pending restart，用于降低 UL completion 后立刻 RESET/START 抢跑的概率。
+
+当前影响：50ms delayed/cancellable restart 能稳定推进到 image34、image40 和 image41/devcfg 首段之后，说明同 fd 内由内核控制的 SAHARA channel restart 可以替代一部分 close/reopen cadence；但 image41 后出现 20 字节全零 RX，仍没有进入 Mission/AMSS。
+
+后续处理：M86 说明需要区分有效 Sahara packet 与无效零包。后续应丢弃 invalid RX，且 invalid RX 不应取消 pending restart；同时继续保持只响应真实 `READ_DATA`，不主动推送未请求 payload、不读 BL、不写 NV/modem 分区。
+
+### M87 invalid zero RX drop 与大 payload 观察
+
+含义：M87 增加 Sahara packet validator，只接受非零 cmd、合理 packet length 且长度不超过实际 RX 的包；20 字节全零 RX 会被记录并丢弃，不再送到用户态，也不取消 pending restart。
+
+当前影响：50ms cadence 在一次重启后回退到 image40 首段附近，但 200ms/2000ms cadence 能继续推进到 image25/TZ 的完整 913408 字节 payload 传输；当时仍没有稳定收到 image25 `END_OF_IMAGE`。120000ms no-tail-restart 对照又会在 HELLO/HELLO_RESP 后停住，证明早期 restart 仍是当前诊断路径推进 SBL 的必要条件，单纯长时间 hold fd 不是解法。
+
+后续处理：M87 排除了“20 字节零包就是有效 Sahara 控制包”的分支，并证明固定 delay 太短会抢跑、太长或完全 suppress 又会停在早期阶段。下一步应在大 `READ_DATA` payload 传输期间抑制或推迟 restart，避免 channel restart 打断多 completion 的 payload 写入。
+
+### M88 large READ_DATA restart suppression 诊断
+
+含义：M88 新增 `restart_suppress_read_data_len`，在收到长度超过阈值的 `READ_DATA` 后抑制其后的 restart，用于保护 image25/TZ 这类大 payload 不被 RESET/START 打断。
+
+当前影响：M88 能进入 image25 offset 4096/20512 等后续阶段，但实测显示大 payload 写入可能分成多次 UL completion；如果只在收到 READ_DATA 时打一个 suppress 标记，而不跟踪剩余字节，restart 仍可能在 partial UL completion 后触发，提前打断当前 payload。
+
+后续处理：M88 证明“是否大包”判断不够，必须按 READ_DATA request 长度跟踪已完成 UL 字节数。后续应记录 image id、剩余长度，并在整个 READ_DATA 完成前 defers restart。
+
+### M89 full READ_DATA tracking 诊断
+
+含义：M89 为 restart suppression 增加 per-READ_DATA 剩余字节跟踪，按每次 UL completion 的 `bytes_xferd` 扣减，只有当前 READ_DATA 全部写完后才允许恢复 restart cadence。
+
+当前影响：M89 仍暴露固定全局 delay 的不稳定性：200ms/500ms 在 image34 与 image40 后回退到 image41 首段或零包，5000ms 又停在 image40 tail，没有简单“把 delay 拉长”即可解决的趋势。该结果说明 restart cadence 需要按 Sahara 阶段和 request 大小区分，而不能只有一个全局毫秒值。
+
+后续处理：M89 的 request tracking 方向正确，但应把“跟踪大 READ_DATA 完整性”和“READ_DATA 完成后是否继续 suppress restart”拆开；否则不同 image 的 tail、`END_OF_IMAGE` 与 post-DONE HELLO 阶段会互相牵制。
+
+### M90 track/suppress split SAHARA restart 诊断
+
+含义：M90 将 `restart_track_read_data_len` 与 `restart_suppress_read_data_len` 拆成两个阈值：前者只负责跟踪 READ_DATA 的完整 UL completion，后者才在完成后继续 suppress restart；同时保留 delayed restart 与 invalid RX drop。
+
+当前影响：M90 boot-only 镜像只刷 `boot` 后，使用 `restart_after_ul_delay_ms=200`、`restart_track_read_data_len=4096`、`restart_suppress_read_data_len=131072`、`--continuous --active-read-drain` 实测取得当前最大进展：image34/mdmddr 完整并收到 `END_OF_IMAGE`，image40/APDP 完整并收到 `END_OF_IMAGE`，image41/devcfg 完整并收到 `END_OF_IMAGE`，image25/TZ 完整并收到 `END_OF_IMAGE image=25 status=0`，image33/HYP 完整并收到 `END_OF_IMAGE image=33 status=0`；随后 `DONE_RESP image_tx_pending=0`、新 HELLO/HELLO_RESP 和一次 200ms restart 都完成，但没有继续出现后续 READ_DATA、`CMD_READY` 或 Mission/AMSS。只读状态仍为 `AP2MDM_STATUS=1 AP2MDM_ERRFATAL=0 MDM2AP_STATUS=0 MDM2AP_ERRFATAL=0 cached/reg=SECONDARY BOOTLOADER/M0 pm_state=0x4`。同一 M90 在 1000ms delay 下反而回退到 image41 offset 0/52 后的 20 字节零包，restart 未恢复后续包。
+
+后续处理：M90 是实质进展，但也证明全局固定 restart delay 仍不是最终修复。下一步应设计 stage-aware restart policy 或更轻量的 SAHARA channel lifecycle 操作：早期 HELLO/DONE_RESP 后需要 restart 推进，READ_DATA payload 内必须跟踪完整写入，大 payload 后可能要 suppress，`END_OF_IMAGE`/`DONE`/post-DONE HELLO 后则需要按 image 阶段单独处理。modem 当前仍只属于 SBL/Sahara 诊断阶段，未进入 Mission/AMSS；不扩大到 SIM、APN、IMS、VoLTE、ModemManager，也继续不读 `/dev/mhi_bl0`、不进入 EDL、不发送 firehose、不写 NV/modem/dtbo/recovery/vbmeta、不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
