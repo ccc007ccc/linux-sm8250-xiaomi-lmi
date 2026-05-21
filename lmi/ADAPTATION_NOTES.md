@@ -634,6 +634,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：不要继续沿 HELLO_RESP restart 抑制方向堆 gate。下一步应保留 M94b 证明有效的 `restart_resync_db_val=Y`、`restart_ring_ul_db=N`，并转向 MHI data event / RX TRE 处理差异：Android downstream 会按 event 指针推进并回调中间 TRE，而当前主线诊断路径对 skipped RX TRE 仍以零包/推断方式处理，可能在 full restart 与多 TRE completion 组合下造成 SBL 节拍失真。后续仍只被动响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M96 RX skipped TRE downstream-style 对照
+
+含义：M96 对照 Android downstream `mhi_main.c` 的 data event loop，测试把 SBL boot channel 的 skipped RX TRE 按完整 RX buffer 长度回调给 `mhi_sahara_diag`，而不是沿用当前主线诊断路径的 Sahara 短包头推断长度。
+
+当前影响：开启 `mhi.sbl_rx_full_skipped_tre_completion=Y` 后，image34/mdmddr 两段 payload 可完成，但 skipped RX TRE 被作为 32768 字节全零 packet 上报：`SAHARA RX packet len 32768 cmd 0 pkt_len 0`，随后只收到 post-image34 HELLO/HELLO_RESP 并 idle，没有推进到 image40。关闭该开关后，用 M94b 等价参数和 loader 节拍重测仍只到 image34 `DONE_RESP pending` 与后续 HELLO/HELLO_RESP，dmesg 在同一区间出现 chan3 `code 0x11` / `Unknown event 0x11`。因此“直接把 skipped RX TRE 按 full buffer length 回调”不是修复方向，且默认关闭的诊断参数已从源码清理，不保留到后续基线。
+
+后续处理：继续保留 M94b 的 skipped RX 短包推断/零长度处理和 `restart_resync_db_val=Y`、`restart_ring_ul_db=N` 路线。下一步不要再模拟整块全零 RX buffer；应更精确比较 upstream 与 Android downstream 在 multi-TRE completion 后如何推进 event ring RP、channel TRE RP、RX requeue 和 BAD_TRE 恢复，并重点处理 chan3 `MHI_EV_CC_BAD_TRE` 对后续 image 请求节拍的影响。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
