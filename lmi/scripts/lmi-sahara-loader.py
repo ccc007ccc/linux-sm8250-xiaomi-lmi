@@ -302,6 +302,9 @@ def send_hello_resp(fd, words, args, mode_override=None):
     target_mode = words[5] if len(words) > 5 else 0
     mode = mode_override if mode_override is not None else target_mode if args.echo_hello_mode else args.hello_mode
     resp = struct.pack("<12I", CMD_HELLO_RESP, SAHARA_HELLO_LEN, version, compatible, 0, mode, 0, 0, 0, 0, 0, 0)
+    if args.hello_resp_delay > 0:
+        log("tx_delay", f"HELLO_RESP delay={args.hello_resp_delay}")
+        time.sleep(args.hello_resp_delay)
     write_all(fd, resp, "hello_resp", args.write_timeout)
     override = " override=1" if mode_override is not None else ""
     log("tx", f"HELLO_RESP version={version} compatible={compatible} target_mode={target_mode} mode={mode}{override}")
@@ -825,6 +828,7 @@ def parse_args():
     parser.add_argument("--image34", default="/dev/disk/by-partlabel/mdmddr")
     parser.add_argument("--image40", default="/dev/disk/by-partlabel/msadp")
     parser.add_argument("--hello-mode", type=int, default=0)
+    parser.add_argument("--hello-resp-delay", type=float, default=0.0)
     parser.add_argument("--echo-hello-mode", action="store_true")
     parser.add_argument("--mode3-close-delay", type=float, default=2.0)
     parser.add_argument("--after-mode3-delay", type=float, default=34.0)

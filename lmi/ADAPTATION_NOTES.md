@@ -666,6 +666,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：`sbl_bad_tre_complete` 保持默认关闭，仅作为 BAD_TRE 复现时的窄范围诊断工具；M99 不能证明 BAD_TRE failed-completion 可以推进 modem。下一步应把 M100 聚焦到 post-image34 `DONE` 后重新 HELLO/HELLO_RESP 窗口、zero RX 与 channel restart/doorbell/context 同步差异：对照 M97 能到 image40 offset 0 length 52 的路径，精确比较 post-DONE HELLO_RESP 前后是否需要不同的 restart suppress/resync 策略。仍不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M100 post-DONE HELLO zero RX timing 诊断
+
+含义：M100 在用户态 `lmi-sahara-loader.py` 中加入默认 `0` 的 `--hello-resp-delay`，只在收到真实 Sahara `HELLO` 后延迟发送对应 `HELLO_RESP`，用于验证 M99 停在 image34 `DONE` 后 post-DONE HELLO/HELLO_RESP 与 20 字节全零 RX 是否由 host 回 HELLO_RESP 过快触发。该选项不主动推送 firmware/image bytes，也不改变只响应真实 `READ_DATA` 的边界。
+
+当前影响：首轮 `--hello-resp-delay 0.006` 实测越过 M99 的 post-image34 zero RX 停点，完成 image40/APDP 多段传输和 `END_OF_IMAGE`，并进入 image41/devcfg offset 0/52 与 52/128；同轮 dmesg 仍出现 chan3 `BAD_TRE`，说明 BAD_TRE 不一定单独终止后续进度。随后修正 reboot harness，等待 `/proc/sys/kernel/random/boot_id` 变化后复测：6ms repeat 仍越过 image34 后停点，但只到 image40 offset 0/52 和 52/96 后 channel restart/close；同参数 0ms 控制组也能越过 image34 后停点并到 image40 offset 52/96，之后收到 20 字节全零 RX。因此 M100 不能把 6ms HELLO_RESP delay 视为充分因果或修复，只能说明 zero RX/idle 停点会随 SAHARA channel lifecycle、restart/context/doorbell 同步状态在 post-image34、image40 52/96 和 image41 之间漂移。
+
+后续处理：`--hello-resp-delay` 保留为默认关闭的用户态诊断参数，不作为基线修复手段。M101 应继续聚焦 image40 52/96 或 image41 后的 zero RX/idle：比较 first-M100、corrected 6ms repeat 和 0ms control 的 event ring RP、channel TRE RP、RX requeue、BAD_TRE、restart 后 context WP 和 cached doorbell 同步，而不是继续增加固定 HELLO_RESP delay。仍不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
