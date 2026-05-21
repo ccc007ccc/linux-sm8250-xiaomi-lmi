@@ -59,6 +59,12 @@ module_param_named(sbl_bad_tre_complete,
 MODULE_PARM_DESC(sbl_bad_tre_complete,
 		 "Complete current SBL BAD_TRE as a failed transfer and advance channel rings");
 
+static bool mhi_sbl_event_ring_db_always;
+module_param_named(sbl_event_ring_db_always,
+		   mhi_sbl_event_ring_db_always, bool, 0644);
+MODULE_PARM_DESC(sbl_event_ring_db_always,
+		 "Re-ring SBL event ring doorbells after data event polling even when no events were consumed");
+
 #define MHI_SBL_SAHARA_MIN_LEN		8
 #define MHI_SBL_SAHARA_MAX_LEN		4096
 #define MHI_SBL_SAHARA_CMD_HELLO		1
@@ -1344,6 +1350,7 @@ int mhi_process_data_event_ring(struct mhi_controller *mhi_cntrl,
 	u32 chan;
 	struct mhi_chan *mhi_chan;
 	dma_addr_t ptr = le64_to_cpu(er_ctxt->rp);
+	bool sahara_er = mhi_sahara_event_ring_used(mhi_cntrl, mhi_event->er_index);
 
 	if (unlikely(MHI_EVENT_ACCESS_INVALID(mhi_cntrl->pm_state)))
 		return -EIO;
@@ -1364,7 +1371,7 @@ int mhi_process_data_event_ring(struct mhi_controller *mhi_cntrl,
 
 		chan = MHI_TRE_GET_EV_CHID(local_rp);
 
-		if (mhi_sahara_event_ring_used(mhi_cntrl, mhi_event->er_index))
+		if (sahara_er)
 			dev_info(&mhi_cntrl->mhi_dev->dev,
 				 "SAHARA data er%u event: type 0x%x chan %u code 0x%x len %u ptr 0x%llx local_rp 0x%llx ctxt_rp 0x%llx ctxt_wp 0x%llx er_type 0x%x msivec %u irq %u linux_irq %d intmod 0x%x\n",
 				 mhi_event->er_index, type, chan,
@@ -1414,9 +1421,14 @@ int mhi_process_data_event_ring(struct mhi_controller *mhi_cntrl,
 	}
 	read_lock_bh(&mhi_cntrl->pm_lock);
 
-	/* Ring EV DB only if there is any pending element to process */
-	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl)) && count)
+	if (likely(MHI_DB_ACCESS_VALID(mhi_cntrl)) &&
+	    (count || (sahara_er && mhi_sbl_event_ring_db_always))) {
+		if (!count)
+			dev_info_ratelimited(&mhi_cntrl->mhi_dev->dev,
+					     "SAHARA data er%u re-ring event DB without new events\n",
+					     mhi_event->er_index);
 		mhi_ring_er_db(mhi_event);
+	}
 	read_unlock_bh(&mhi_cntrl->pm_lock);
 
 	return count;

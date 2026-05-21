@@ -730,6 +730,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M107 排除“只要像 downstream UCI 一样 raw RX 交给 userspace、读完再 requeue 就能连续推进 SBL”作为根因；它和 M104/M106 一样仍表现为普通 doorbell 每次只能踢出一个 packet。后续不要继续在 clone-vs-raw RX lifecycle、runtime PM hold 或 plain UL/DL doorbell 上堆参数；应把重点转回 downstream MHI core/channel/event 生命周期差异、ESOC request-engine 状态通知，以及是否存在比 full channel restart 更安全的 SDX55M-specific progression 点。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
 
+### M108 SBL event-ring DB re-ring 负结果
+
+含义：M108 对照 Android downstream MHI data event ring 处理路径，新增默认关闭的 `mhi.sbl_event_ring_db_always`。该开关只影响包含 SBL boot channel（`SAHARA` 或 `BL`）的 event ring，在 data event poll 没有消费新 event 时也重新敲 event-ring DB，用来验证 upstream 只在 `count > 0` 时 ring ER DB 是否导致 SDX55M SBL 卡住。
+
+当前影响：M108 源码构建通过，boot-only 镜像 `/home/ccc007/Android/Kernel/lmi/sm8250-xiaomi-lmi-boot/builds/ubuntu-console/M108-sdx55m-event-erdb-20260521-223305/boot-linux-copydown-lmi.img` 已只刷 `boot` 并启动；运行内核为 `7.1.0-rc4-gcfbc01c255a8-dirty #126`，`/sys/module/mhi/parameters/sbl_event_ring_db_always` 存在且默认 `N`。实机打开 `sbl_event_ring_db_always=Y` 后，dmesg 持续出现 `SAHARA data er1 re-ring event DB without new events`，证明诊断分支确实执行；但纯 M108 长连接只收到 HELLO/HELLO_RESP 并 180 秒 idle。继续叠加 `ring_dl_db_after_ul=Y` 只踢出 image34 `READ_DATA offset=0 length=40`；再叠加 `ring_ul_db_after_ul=Y` 只踢出 image34 `READ_DATA offset=40 length=1596`。三轮测试结束后 ESOC 仍为 `AP2MDM_STATUS=1 MDM2AP_STATUS=0`，MHI cached/reg 仍为 `SECONDARY BOOTLOADER/M0 pm_state=0x4`，没有 `CMD_READY`、Mission/AMSS、QRTR/QMI、SIM、语音或蜂窝数据。
+
+后续处理：M108 排除“downstream 每轮处理后都 ring event-ring DB，而 upstream 只在消费 event 时 ring DB”作为单独根因；空 poll re-ring 只会制造高频 no-event DB 日志，不能形成连续 Sahara progression。该参数保留 default-off 作为对照工具，不应默认启用或继续围绕 no-event ER DB re-ring 堆组合。下一步应继续查真实 event 生成/消费语义、SBL channel lifecycle、ESOC request-engine 状态通知，以及是否存在 Android downstream 在 image 阶段之间执行的更安全 SDX55M-specific progression 点。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。
