@@ -714,6 +714,14 @@ M93b suppress-all-READ_DATA 复测在干净启动后只保留 HELLO/HELLO_RESP �
 
 后续处理：M105 否定“对 running channel 再发 START 命令”作为轻量推进机制；这一路线比 plain doorbell 更危险，后续不要再启用或保留 START kick 诊断。设备处于该失败态时只用普通 Linux reboot 恢复，不使用 EDL/firehose、不 erase、不写 modem/NV/dtbo/recovery/vbmeta。下一步应在 M104 async RX 基线上继续查真正的 downstream 差异：channel START 发生的时机、event ring completion 顺序、ESOC `IMG_XFER_DONE`/`BOOT_DONE` 和 AP2MDM/MDM2AP sideband 是否给 SBL 一个非 MHI data doorbell 的阶段确认。调制解调器仍停在 SBL/Sahara，未出现 `CMD_READY`、Mission/AMSS、MDM2AP_STATUS 拉高、QRTR/QMI、SIM、语音或蜂窝数据。
 
+### M106 SAHARA runtime PM hold 负结果
+
+含义：M106 在 M104 async RX 基线上新增默认关闭的 `hold_runtime_pm_on_prepare`，在可写 SAHARA 设备 open/prepared 期间额外持有 MHI runtime PM，验证 upstream `mhi_queue()` 对 RX queue 后立即 `runtime_put()` 是否让 SBL 缺少运行时唤醒。该参数只影响 `/dev/mhi_sahara0` 诊断通道，不读 `/dev/mhi_bl0`，不改变 firmware/image 来源。
+
+当前影响：首版把 `runtime_get()` 返回正数误判为失败，M106b 改成只把负数视为错误；实机确认 `SAHARA open runtime PM hold acquired ret=1 pm_state=0x4` 和 close/restart release 正常。纯 hold 长连接只收到 HELLO/HELLO_RESP，300 秒无 `READ_DATA`；hold+DL doorbell 只踢出 image34 `READ_DATA offset=0 length=40` 后 180 秒 idle；hold+UL+DL doorbell 在上一段状态下只踢出 image34 `READ_DATA offset=40 length=1596` 后仍 idle。SDX55M 保持 SBL/M0，MDM2AP_STATUS/ERRFATAL 为 0，没有 `CMD_READY`、Mission/AMSS 或 QRTR/QMI。
+
+后续处理：runtime PM hold 和普通 UL/DL data doorbell 都不是缺失的连续推进机制；保留 default-off 参数方便继续对照，但不要把 MHI runtime PM hold、plain doorbell 或 START-on-running 当成修复路线。下一步继续查 downstream ESOC image-transfer 完成通知、MDM2AP/AP2MDM sideband、以及 Android `ks`/`mdm_helper` 在 `DONE_RESP pending` 后是否通过 ESOC ioctl 而非 MHI data doorbell 推进阶段。仍只响应真实 `READ_DATA`，不读 `/dev/mhi_bl0`，不进入 EDL，不发送 firehose，不写 NV/modem/dtbo/recovery/vbmeta，不提交 firmware blob。
+
 ### `qcom-pcie 1c10000.pcie: supply vdda/vddpe-3v3 not found, using dummy regulator`
 
 含义：PCIe2 host driver 请求可选的 root complex 供电名，但当前 lmi DTS 只给 modem PCIe PHY 建模了 `vdda-phy` 和 `vdda-pll`。

@@ -104,6 +104,12 @@ module_param_named(async_rx_requeue,
 MODULE_PARM_DESC(async_rx_requeue,
 		 "Copy valid SAHARA RX packets to userspace and immediately requeue MHI RX buffers");
 
+static bool mhi_sahara_hold_runtime_pm_on_prepare;
+module_param_named(hold_runtime_pm_on_prepare,
+		   mhi_sahara_hold_runtime_pm_on_prepare, bool, 0644);
+MODULE_PARM_DESC(hold_runtime_pm_on_prepare,
+		 "Hold MHI runtime PM while the writable SAHARA device is open and prepared");
+
 static bool mhi_sahara_restart_cancel_on_invalid_rx;
 module_param_named(restart_cancel_on_invalid_rx,
 			   mhi_sahara_restart_cancel_on_invalid_rx, bool, 0644);
@@ -149,6 +155,7 @@ struct mhi_sahara_dev {
 	bool present;
 	bool opened;
 	bool prepared;
+	bool runtime_held;
 	bool allow_write;
 	bool auto_start;
 	bool delayed_auto_start;
@@ -173,6 +180,47 @@ static void mhi_sahara_put(struct mhi_sahara_dev *sdev)
 static bool mhi_sahara_async_rx_enabled(struct mhi_sahara_dev *sdev)
 {
 	return sdev->allow_write && mhi_sahara_async_rx_requeue;
+}
+
+static int mhi_sahara_runtime_hold_get(struct mhi_sahara_dev *sdev,
+					       const char *tag)
+{
+	struct mhi_controller *mhi_cntrl = sdev->mhi_dev->mhi_cntrl;
+	int ret;
+
+	if (!sdev->allow_write || !sdev->opened ||
+	    !mhi_sahara_hold_runtime_pm_on_prepare || sdev->runtime_held)
+		return 0;
+
+	ret = mhi_cntrl->runtime_get(mhi_cntrl);
+	if (ret < 0) {
+		dev_warn(&sdev->mhi_dev->dev,
+			 "SAHARA %s runtime PM hold get failed ret=%d pm_state=0x%x\n",
+			 tag, ret, mhi_cntrl->pm_state);
+		return ret;
+	}
+
+	sdev->runtime_held = true;
+	dev_info(&sdev->mhi_dev->dev,
+		 "SAHARA %s runtime PM hold acquired ret=%d pm_state=0x%x\n",
+		 tag, ret, mhi_cntrl->pm_state);
+
+	return 0;
+}
+
+static void mhi_sahara_runtime_hold_put(struct mhi_sahara_dev *sdev,
+					       const char *tag)
+{
+	struct mhi_controller *mhi_cntrl = sdev->mhi_dev->mhi_cntrl;
+
+	if (!sdev->runtime_held)
+		return;
+
+	mhi_cntrl->runtime_put(mhi_cntrl);
+	sdev->runtime_held = false;
+	dev_info(&sdev->mhi_dev->dev,
+		 "SAHARA %s runtime PM hold released pm_state=0x%x\n",
+		 tag, mhi_cntrl->pm_state);
 }
 
 static void mhi_sahara_schedule_drain(struct mhi_sahara_dev *sdev)
@@ -730,6 +778,7 @@ static void mhi_sahara_stop_locked(struct mhi_sahara_dev *sdev)
 		cancel_delayed_work_sync(&sdev->drain_work);
 		mhi_unprepare_from_transfer(sdev->mhi_dev);
 		sdev->prepared = false;
+		mhi_sahara_runtime_hold_put(sdev, "stop");
 	}
 	mhi_sahara_purge_rx(sdev);
 	wake_up_all(&sdev->read_wq);
@@ -786,6 +835,7 @@ static void mhi_sahara_restart_work(struct work_struct *work)
 	cancel_delayed_work_sync(&sdev->drain_work);
 	mhi_unprepare_from_transfer(sdev->mhi_dev);
 	sdev->prepared = false;
+	mhi_sahara_runtime_hold_put(sdev, "restart unprepare");
 	mhi_sahara_purge_rx(sdev);
 	sdev->auto_hello_sent = false;
 
@@ -794,10 +844,19 @@ static void mhi_sahara_restart_work(struct work_struct *work)
 		goto warn;
 
 	sdev->prepared = true;
+	ret = mhi_sahara_runtime_hold_get(sdev, "restart prepare");
+	if (ret) {
+		mhi_unprepare_from_transfer(sdev->mhi_dev);
+		sdev->prepared = false;
+		mhi_sahara_purge_rx(sdev);
+		goto warn;
+	}
+
 	ret = mhi_sahara_refill_rx(sdev);
 	if (ret) {
 		mhi_unprepare_from_transfer(sdev->mhi_dev);
 		sdev->prepared = false;
+		mhi_sahara_runtime_hold_put(sdev, "restart refill failed");
 		mhi_sahara_purge_rx(sdev);
 		goto warn;
 	}
@@ -837,6 +896,7 @@ static void mhi_sahara_close_locked(struct mhi_sahara_dev *sdev)
 	    (sdev->allow_write && mhi_sahara_keep_prepared_on_release)) {
 		if (sdev->allow_write && mhi_sahara_keep_prepared_on_release) {
 			sdev->keep_rx_without_open = true;
+			mhi_sahara_runtime_hold_put(sdev, "close keep-prepared");
 			dev_info(&sdev->mhi_dev->dev, "SAHARA keeping transfer prepared on close\n");
 		}
 		sdev->opened = false;
@@ -890,12 +950,20 @@ static int mhi_sahara_open(struct inode *inode, struct file *file)
 			goto err_put;
 		sdev->prepared = true;
 
+		ret = mhi_sahara_runtime_hold_get(sdev, "open");
+		if (ret)
+			goto err_close;
+
 		ret = mhi_sahara_refill_rx(sdev);
 		if (ret)
 			goto err_close;
 
 		mhi_sahara_schedule_drain(sdev);
 	} else if (sdev->prepared) {
+		ret = mhi_sahara_runtime_hold_get(sdev, "open prepared");
+		if (ret)
+			goto err_close;
+
 		ret = mhi_sahara_refill_rx(sdev);
 		if (ret && ret != -ENOSPC)
 			dev_warn(&sdev->mhi_dev->dev, "failed to refill prepared SAHARA RX buffers: %d\n", ret);
