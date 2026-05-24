@@ -1938,6 +1938,11 @@ static int mhi_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	unsigned int dma_data_width;
 	int err;
 
+	if (pdev->vendor == PCI_VENDOR_ID_QCOM && pdev->device == 0x0306 &&
+	    pdev->subsystem_vendor == PCI_VENDOR_ID_QCOM &&
+	    pdev->subsystem_device == 0x010c)
+		return -ENODEV;
+
 	dev_info(&pdev->dev, "MHI PCI device found: %s\n", info->name);
 
 	/* mhi_pdev.mhi_cntrl must be zero-initialized */

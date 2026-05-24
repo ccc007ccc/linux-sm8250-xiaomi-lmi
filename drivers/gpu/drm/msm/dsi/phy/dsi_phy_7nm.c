@@ -493,6 +493,9 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
 	int rc;
 
+	if (unlikely(pll_7nm->phy->pll_on || !pll_7nm->phy->enabled))
+		return 0;
+
 	dsi_pll_enable_pll_bias(pll_7nm);
 	if (pll_7nm->slave)
 		dsi_pll_enable_pll_bias(pll_7nm->slave);
@@ -545,6 +548,9 @@ static void dsi_pll_disable_sub(struct dsi_pll_7nm *pll)
 static void dsi_pll_7nm_vco_unprepare(struct clk_hw *hw)
 {
 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
+
+	if (unlikely(!pll_7nm->phy->pll_on))
+		return;
 
 	/*
 	 * To avoid any stray glitches while abruptly powering down the PLL

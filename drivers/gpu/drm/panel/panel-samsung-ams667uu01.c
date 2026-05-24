@@ -15,6 +15,7 @@
 #include <drm/drm_panel.h>
 
 #define AMS667UU01_NUM_SUPPLIES 2
+#define AMS667UU01_MAX_BRIGHTNESS 2047
 
 struct ams667uu01 {
 	struct drm_panel panel;
@@ -22,6 +23,7 @@ struct ams667uu01 {
 	struct regulator_bulk_data supplies[AMS667UU01_NUM_SUPPLIES];
 	struct gpio_desc *reset_gpio;
 	enum drm_panel_orientation orientation;
+	u16 brightness;
 };
 
 static const char * const ams667uu01_supply_names[] = {
@@ -45,6 +47,7 @@ static void ams667uu01_reset(struct ams667uu01 *ctx)
 static int ams667uu01_on(struct ams667uu01 *ctx)
 {
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+	int ret;
 
 	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
 	mipi_dsi_usleep_range(&dsi_ctx, 10000, 11000);
@@ -70,12 +73,18 @@ static int ams667uu01_on(struct ams667uu01 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0xa5, 0xa5);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
 				     0x20);
-	mipi_dsi_dcs_set_display_brightness_multi(&dsi_ctx, 0x0000);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_POWER_SAVE, 0x00);
 	mipi_dsi_msleep(&dsi_ctx, 67);
 	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
+	mipi_dsi_msleep(&dsi_ctx, 20);
+	if (dsi_ctx.accum_err)
+		return dsi_ctx.accum_err;
 
-	return dsi_ctx.accum_err;
+	ret = mipi_dsi_dcs_set_display_brightness_large(ctx->dsi, ctx->brightness);
+	if (ret < 0)
+		return ret;
+
+	return 0;
 }
 
 static int ams667uu01_off(struct ams667uu01 *ctx)
@@ -199,16 +208,18 @@ static const struct drm_panel_funcs ams667uu01_panel_funcs = {
 static int ams667uu01_bl_update_status(struct backlight_device *bl)
 {
 	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	struct ams667uu01 *ctx = mipi_dsi_get_drvdata(dsi);
 	u16 brightness = backlight_get_brightness(bl);
 	int ret;
 
 	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
 
 	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 	if (ret < 0)
 		return ret;
 
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	ctx->brightness = brightness;
 
 	return 0;
 }
@@ -216,18 +227,9 @@ static int ams667uu01_bl_update_status(struct backlight_device *bl)
 static int ams667uu01_bl_get_brightness(struct backlight_device *bl)
 {
 	struct mipi_dsi_device *dsi = bl_get_data(bl);
-	u16 brightness;
-	int ret;
+	struct ams667uu01 *ctx = mipi_dsi_get_drvdata(dsi);
 
-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
-
-	ret = mipi_dsi_dcs_get_display_brightness_large(dsi, &brightness);
-	if (ret < 0)
-		return ret;
-
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
-
-	return brightness;
+	return ctx->brightness;
 }
 
 static const struct backlight_ops ams667uu01_bl_ops = {
@@ -241,8 +243,8 @@ ams667uu01_create_backlight(struct mipi_dsi_device *dsi)
 	struct device *dev = &dsi->dev;
 	const struct backlight_properties props = {
 		.type = BACKLIGHT_RAW,
-		.brightness = 2047,
-		.max_brightness = 2047,
+		.brightness = AMS667UU01_MAX_BRIGHTNESS,
+		.max_brightness = AMS667UU01_MAX_BRIGHTNESS,
 	};
 
 	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
@@ -273,6 +275,7 @@ static int ams667uu01_probe(struct mipi_dsi_device *dsi)
 				     "Failed to get reset-gpios\n");
 
 	ctx->dsi = dsi;
+	ctx->brightness = AMS667UU01_MAX_BRIGHTNESS;
 	mipi_dsi_set_drvdata(dsi, ctx);
 
 	ret = of_drm_get_panel_orientation(dev->of_node, &ctx->orientation);

@@ -117,6 +117,7 @@ struct msm_dsi_phy {
 
 	struct clk_hw *vco_hw;
 	bool pll_on;
+	bool enabled;
 
 	struct clk_hw_onecell_data *provided_clocks;
 

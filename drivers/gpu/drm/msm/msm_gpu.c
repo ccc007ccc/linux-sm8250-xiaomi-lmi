@@ -1059,12 +1059,12 @@ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 		gpu->ebi1_clk = NULL;
 
 	/* Acquire regulators: */
-	gpu->gpu_reg = devm_regulator_get(&pdev->dev, "vdd");
+	gpu->gpu_reg = devm_regulator_get_optional(&pdev->dev, "vdd");
 	DBG("gpu_reg: %p", gpu->gpu_reg);
 	if (IS_ERR(gpu->gpu_reg))
 		gpu->gpu_reg = NULL;
 
-	gpu->gpu_cx = devm_regulator_get(&pdev->dev, "vddcx");
+	gpu->gpu_cx = devm_regulator_get_optional(&pdev->dev, "vddcx");
 	DBG("gpu_cx: %p", gpu->gpu_cx);
 	if (IS_ERR(gpu->gpu_cx))
 		gpu->gpu_cx = NULL;

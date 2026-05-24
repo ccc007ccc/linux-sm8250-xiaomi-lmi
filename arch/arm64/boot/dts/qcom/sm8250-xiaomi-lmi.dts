@@ -473,6 +473,8 @@
 
 &pcie2 {
 	pinctrl-0 = <&pcie2_default_state &mdm2ap_default &ap2mdm_default>;
+	vdda-supply = <&vreg_l9a_1p2>;
+	vddpe-3v3-supply = <&vreg_l11c_3p3>;
 	status = "okay";
 };
 

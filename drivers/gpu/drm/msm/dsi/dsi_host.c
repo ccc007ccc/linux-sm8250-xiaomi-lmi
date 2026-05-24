@@ -744,6 +744,39 @@ static void dsi_intr_ctrl(struct msm_dsi_host *msm_host, u32 mask, int enable)
 	spin_unlock_irqrestore(&msm_host->intr_lock, flags);
 }
 
+static void dsi_clear_error_status(struct msm_dsi_host *msm_host)
+{
+	u32 status;
+
+	status = dsi_read(msm_host, REG_DSI_ACK_ERR_STATUS);
+	if (status) {
+		dsi_write(msm_host, REG_DSI_ACK_ERR_STATUS, status);
+		dsi_write(msm_host, REG_DSI_ACK_ERR_STATUS, 0);
+	}
+
+	status = dsi_read(msm_host, REG_DSI_TIMEOUT_STATUS);
+	if (status)
+		dsi_write(msm_host, REG_DSI_TIMEOUT_STATUS, status);
+
+	status = dsi_read(msm_host, REG_DSI_DLN0_PHY_ERR);
+	if (status)
+		dsi_write(msm_host, REG_DSI_DLN0_PHY_ERR, status);
+
+	status = dsi_read(msm_host, REG_DSI_FIFO_STATUS);
+	if (status)
+		dsi_write(msm_host, REG_DSI_FIFO_STATUS, status);
+
+	status = dsi_read(msm_host, REG_DSI_STATUS0);
+	if (status & DSI_STATUS0_INTERLEAVE_OP_CONTENTION)
+		dsi_write(msm_host, REG_DSI_STATUS0, status);
+
+	status = dsi_read(msm_host, REG_DSI_CLK_STATUS);
+	if (status & DSI_CLK_STATUS_PLL_UNLOCKED)
+		dsi_write(msm_host, REG_DSI_CLK_STATUS, status);
+
+	msm_host->err_work_state = 0;
+}
+
 static inline enum dsi_traffic_mode dsi_get_traffic_mode(const u32 mode_flags)
 {
 	if (mode_flags & MIPI_DSI_MODE_VIDEO_BURST)
@@ -893,8 +926,6 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 	/* allow only ack-err-status to generate interrupt */
 	dsi_write(msm_host, REG_DSI_ERR_INT_MASK0, 0x13ff3fe0);
 
-	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
-
 	dsi_write(msm_host, REG_DSI_CLK_CTRL, DSI_CLK_CTRL_ENABLE_CLKS);
 
 	data = DSI_CTRL_CLK_EN;
@@ -921,6 +952,9 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 
 	if (msm_host->cphy_mode)
 		dsi_write(msm_host, REG_DSI_CPHY_MODE_CTRL, BIT(0));
+
+	dsi_clear_error_status(msm_host);
+	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
 }
 
 static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mode)

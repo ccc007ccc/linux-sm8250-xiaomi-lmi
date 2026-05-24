@@ -782,6 +782,8 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 		}
 	}
 
+	phy->enabled = true;
+
 	return 0;
 
 pll_restor_fail:
@@ -800,6 +802,7 @@ void msm_dsi_phy_disable(struct msm_dsi_phy *phy)
 	if (!phy || !phy->cfg->ops.disable)
 		return;
 
+	phy->enabled = false;
 	phy->cfg->ops.disable(phy);
 
 	regulator_bulk_disable(phy->cfg->num_regulators, phy->supplies);
