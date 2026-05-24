@@ -2683,6 +2683,7 @@ static int wsa_macro_probe(struct platform_device *pdev)
 	int ret, def_count;
 
 	flags = (kernel_ulong_t)device_get_match_data(dev);
+	dev_info(dev, "probe start flags=0x%lx\n", flags);
 
 	wsa = devm_kzalloc(dev, sizeof(*wsa), GFP_KERNEL);
 	if (!wsa)
@@ -2710,11 +2711,21 @@ static int wsa_macro_probe(struct platform_device *pdev)
 	if (IS_ERR(wsa->fsgen))
 		return dev_err_probe(dev, PTR_ERR(wsa->fsgen), "unable to get fsgen clock\n");
 
+	dev_info(dev, "clocks macro=%s dcodec=%s mclk=%s npl=%s fsgen=%s\n",
+		 wsa->macro ? __clk_get_name(wsa->macro) : "none",
+		 wsa->dcodec ? __clk_get_name(wsa->dcodec) : "none",
+		 __clk_get_name(wsa->mclk),
+		 wsa->npl ? __clk_get_name(wsa->npl) : "none",
+		 __clk_get_name(wsa->fsgen));
+
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
-		return PTR_ERR(base);
+		return dev_err_probe(dev, PTR_ERR(base), "unable to map registers\n");
 
 	wsa->codec_version = lpass_macro_get_codec_version();
+	dev_info(dev, "codec version %s (%d)\n",
+		 lpass_macro_get_codec_version_string(wsa->codec_version),
+		 wsa->codec_version);
 	struct reg_default *reg_defaults __free(kfree) = NULL;
 
 	switch (wsa->codec_version) {
@@ -2764,35 +2775,46 @@ static int wsa_macro_probe(struct platform_device *pdev)
 
 	wsa->regmap = devm_regmap_init_mmio(dev, base, reg_config);
 	if (IS_ERR(wsa->regmap))
-		return PTR_ERR(wsa->regmap);
+		return dev_err_probe(dev, PTR_ERR(wsa->regmap), "unable to init regmap\n");
 
 	dev_set_drvdata(dev, wsa);
 
 	wsa->dev = dev;
 
-	/* set MCLK and NPL rates */
-	clk_set_rate(wsa->mclk, WSA_MACRO_MCLK_FREQ);
-	clk_set_rate(wsa->npl, WSA_MACRO_MCLK_FREQ);
+	ret = clk_set_rate(wsa->mclk, WSA_MACRO_MCLK_FREQ);
+	dev_info(dev, "set mclk rate ret=%d rate=%lu\n", ret, clk_get_rate(wsa->mclk));
+	ret = clk_set_rate(wsa->npl, WSA_MACRO_MCLK_FREQ);
+	dev_info(dev, "set npl rate ret=%d rate=%lu\n", ret, clk_get_rate(wsa->npl));
 
 	ret = clk_prepare_enable(wsa->macro);
-	if (ret)
+	if (ret) {
+		dev_err_probe(dev, ret, "unable to enable macro clock\n");
 		goto err;
+	}
 
 	ret = clk_prepare_enable(wsa->dcodec);
-	if (ret)
+	if (ret) {
+		dev_err_probe(dev, ret, "unable to enable dcodec clock\n");
 		goto err_dcodec;
+	}
 
 	ret = clk_prepare_enable(wsa->mclk);
-	if (ret)
+	if (ret) {
+		dev_err_probe(dev, ret, "unable to enable mclk clock\n");
 		goto err_mclk;
+	}
 
 	ret = clk_prepare_enable(wsa->npl);
-	if (ret)
+	if (ret) {
+		dev_err_probe(dev, ret, "unable to enable npl clock\n");
 		goto err_npl;
+	}
 
 	ret = clk_prepare_enable(wsa->fsgen);
-	if (ret)
+	if (ret) {
+		dev_err_probe(dev, ret, "unable to enable fsgen clock\n");
 		goto err_fsgen;
+	}
 
 	/* reset swr ip */
 	regmap_update_bits(wsa->regmap, CDC_WSA_CLK_RST_CTRL_SWR_CONTROL,
@@ -2808,8 +2830,10 @@ static int wsa_macro_probe(struct platform_device *pdev)
 	ret = devm_snd_soc_register_component(dev, &wsa_macro_component_drv,
 					      wsa_macro_dai,
 					      ARRAY_SIZE(wsa_macro_dai));
-	if (ret)
+	if (ret) {
+		dev_err_probe(dev, ret, "unable to register component\n");
 		goto err_clkout;
+	}
 
 	pm_runtime_set_autosuspend_delay(dev, 3000);
 	pm_runtime_use_autosuspend(dev);
@@ -2818,8 +2842,12 @@ static int wsa_macro_probe(struct platform_device *pdev)
 	pm_runtime_enable(dev);
 
 	ret = wsa_macro_register_mclk_output(wsa);
-	if (ret)
+	if (ret) {
+		dev_err_probe(dev, ret, "unable to register mclk output\n");
 		goto err_clkout;
+	}
+
+	dev_info(dev, "probe complete\n");
 
 	return 0;
 

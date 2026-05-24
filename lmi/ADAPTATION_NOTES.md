@@ -180,6 +180,38 @@
 
 后续处理：如果后续找到原厂 BT address 的独立持久化来源，或主线 QCA 路径获得设备专用 NVM 地址解析，再替换当前 WLAN+1 派生策略。
 
+## Audio / QDSP6 / TFA9874
+
+当前状态：TFA9874 主扬声器首版内置支持已验证。`nxp,tfa9874` 能在 `i2c3 @ 0x34` 绑定，SM8250 sound card 注册为 `Xiaomi lmi`，`MultiMedia1` / `MultiMedia2` / `MultiMedia3` PCM 均出现；通过 `PRI_MI2S_RX Audio Mixer MultiMedia1` 路由和 `hw:0,0` 48 kHz S16_LE stereo、period 480、buffer 960 的 1 kHz 测试音，已验证 Q6ASM、Q6AFE、Q6ADM routing、PCM 和 TFA9874 I2S/TDM 基本链路，并在实机主扬声器听到物理声音。
+
+TFA9874 当前有声配置来自 2026-05-22 实机运行时寄存器对照：清 `AUDIO_CTR.DPSA`、置 `SYS_CTRL1.MANSCONF`，并在 I2S/TDM 格式下清 `TDM_CONFIG1.TDMDEL`。未做这些设置时，`PRI_MI2S_RX` 软件播放可成功返回但物理无声。该主扬声器输出增益偏高，bring-up 测试应优先使用低 PCM 振幅短音，后续再补安全音量策略和 smart amp profile/calibration。
+
+路线区分结果：`PRI_MI2S_RX -> TFA9874` 是当前唯一已确认有物理声音的路线；`WSA_CODEC_DMA_RX_0` 软件播放可返回成功但实机未听到声音，且不是 3.5mm 路线；`RX_CODEC_DMA_RX_0` / `RX_CODEC_DMA_RX_1` 当前返回 `EINVAL`，需要先接入 WCD9380 RX/TX SoundWire 与 WCD playback/capture dai-link 后再验证听筒、3.5mm 和麦克风。
+
+### `Direct firmware load for qcom/sm8250/adsp.mbn failed with error -2`
+
+含义：SM8250 QDSP6 音频依赖 ADSP remoteproc。没有 `qcom/sm8250/adsp.mbn` 和对应 split firmware 时，`q6afe` / `q6asm` / `q6adm` 相关 APR 服务不会建立，sound card 会持续 deferred probe。
+
+当前影响：已验证修复；设备匹配的 ADSP firmware 放在 initramfs ignored `local/firmware` 路径后，ADSP 能启动，APR audio service 具备继续枚举条件。
+
+后续处理：继续只把签名 firmware 放在 `sm8250-xiaomi-lmi-initramfs/local/firmware/qcom/sm8250/` 这类 ignored local 路径，不提交 firmware blob。如果错误重新出现，优先检查 initramfs local firmware 是否被重新打包进镜像。
+
+### `snd-sm8250: MultiMedia1: error getting cpu dai name`
+
+含义：`sm8250.dtsi` 中带 `qcom,protection-domain` 的 APR 子服务不会在 `apr_probe()` 初始阶段直接创建；必须等 PDR 通过 QMI/QRTR 收到 `msm/adsp/audio_pd` up 事件后，才会添加 `q6core`、`q6afe`、`q6asm` 和 `q6adm` 子设备。仅有 `apr_audio_svc` rpmsg 设备不等于 audio APR 子服务已经可用。
+
+当前影响：已验证修复；内置 `CONFIG_QCOM_PD_MAPPER=y` 和 `CONFIG_QRTR_SMD=y` 后，`IPCRTR` rpmsg 设备绑定到 `qcom_smd_qrtr`，PDR 收到 `msm/adsp/audio_pd` indication，`aprsvc:service:4:3/4/7/8` 创建，`Xiaomi lmi` ALSA card 注册成功。
+
+后续处理：为了保持 lmi 内核即插即用、无需 rootfs 导入模块，继续保持 PD mapper、QRTR core 和 `QRTR_SMD` 为 built-in。如果 sound card 再次 deferred probe，先检查 `IPCRTR -> qcom_smd_qrtr`、`/proc/net/qrtr`、PDR audio_pd indication 和 `aprsvc` 子设备，再怀疑 sound card DTS。
+
+### `q6asm-dai ... Memory_map_regions failed`
+
+含义：当前 Q6ASM PCM 路径对默认 ALSA period/buffer 参数敏感；默认参数可能在 prepare 阶段触发 DSP `Memory_map_regions failed`，上层表现为 `hw_params: Cannot allocate memory (-12)`。
+
+当前影响：非致命；48 kHz、S16_LE、2 channels、period 480、buffer 960 的低音量测试已经成功播放 1 秒，说明 Q6ASM/AFE/routing/PCM 主链路可运行。该结果不等于常规播放器、较大 buffer、音量曲线或 smart amp profile 已完整可用。
+
+后续处理：后续接入常规 userspace 播放前，需要继续调整 Q6ASM buffer/period 约束或播放器默认参数，并补足 TFA9874 专用 profile/calibration/安全音量策略。当前只把该问题记录为首版 bring-up 限制，不回退主扬声器基础支持状态。
+
 ## Modem / SDX55M / X55 5G
 
 当前状态：M16 起启用 SM8250 PCIe2 和 modem PCIe PHY 后，SDX55M endpoint `17cb:0306` / subsystem `17cb:010c` 能以 PCIe Gen3 x2 枚举；M17 将该 endpoint 的 MHI 匹配改到 `qcom-sdx55m` 配置后，`mhi-pci-generic` 会请求 `qcom/sdx55m/sbl1.mbn`。M18 已把设备匹配的 signed `sbl1.mbn` 放入 ignored initramfs local firmware，MHI 能加载 SBL，regdump 显示 `Device EE: SECONDARY_BOOTLOADER state: M0`。M19/M20 验证 AP/MDM sideband GPIO 静态电平后仍不能进入 Mission/AMSS；M21 加入 SBL `SAHARA` channel 2/3 后仍未生成 MHI 设备；M22 临时轮询硬件 EE 并手动排队 SBL transition 后出现 `mhi0_SAHARA`；M24 额外强制 host 进入 `MHI_PM_M0` 后，`mhi_sahara_diag` 才能完成 probe 并注册 `/dev/mhi_sahara0`。M27/M28 确认 SAHARA START completion 和 48 字节 HELLO event 已写入 event ring，但主线 IRQ/tasklet 路径没有及时处理，强制 shared MSI 也不足以修复。M29-M32 的主动 drain 验证了事件解析和 callback 路径本身可用：START/RESET command completion 可从 er0 处理，DL `SAHARA` 可读出 48 字节 HELLO；M39 在 SDX55M profile 中补 downstream-like SBL `BL` channel 25，并扩展诊断 client 后，`mhi0_BL` / `/dev/mhi_bl0` 可出现，读取到 2358 字节 SBL boot log；M42 在 PCI endpoint 枚举后、MHI power-up 前执行 AP2MDM_STATUS low→150ms→high，实测 MDM2AP_STATUS/ERRFATAL 仍为 0，BL/HELLO 行为不变，HELLO_RESP 后仍无后续 READ_DATA/下一包；M43 进一步在 AP2MDM_STATUS 拉低期间通过 modem PMIC USID8 PON S2 序列触发 warm reset，实测 AP 未异常重启，PCIe2 endpoint、MHI SBL/M0、BL log 和 Sahara HELLO 基线仍可用，但 MDM2AP_STATUS/ERRFATAL 仍为 0，HELLO_RESP 后仍无 READ_DATA/后续包；M44 在诊断 client 中加入 20ms 周期 event drain 后，确认 BL/SAHARA 的 START completion、RX event、HELLO_RESP UL completion 和 RESET completion 都能被轮询处理，但 SDX55M event MSI 计数仍为 0，HELLO_RESP 后仍无 READ_DATA/后续包；M46 确认 event context 本身为 VALID，er1 `msivec=2` / `irq=2` 映射到 Linux IRQ 190，PCI sysfs 也已分配 188-194 七个 MSI，但 SDX55M event MSI 计数仍为 0；M47 在诊断 client 中收到 48 字节 HELLO 后立即由内核自动 queue HELLO_RESP，且 er1 上能看到 ch2 UL completion，但仍无 READ_DATA/后续包；M48 证明过早 auto-start SAHARA 会触发 SYS_ERROR 和 BL START timeout，不能作为修复路线；M49 改为先让 BL auto-start、2 秒后延迟 auto-start SAHARA，BL log 和 HELLO_RESP UL completion 恢复但仍无 READ_DATA/后续包；M50 注册 MDM2AP_STATUS/ERRFATAL IRQ 并在 ESOC_REQ_IMG/SBL 阶段轮询，AP2MDM_STATUS 拉高后 MDM2AP_STATUS/ERRFATAL 仍全程为 0，设备保持 SBL/M0；M51 按 Android downstream `kona-mhi.dtsi` 对齐 SDX55M channel/event profile 后分配到 10 个 MSI vector 和 17 个 event ring，但 SDX55M event IRQ 189-197 仍全 0，HELLO_RESP 后仍无 READ_DATA/后续包；M52 解析当前 Sahara HELLO 为 `cmd=1 length=48 version=2 compatible=1 max_cmd_len=1024 mode=0`，自动 HELLO_RESP 为 `cmd=2 length=48 version=2 compatible=1 status=0 mode=0`，UL completion `status 0 bytes 48`，10 秒观察后仍保持 SBL/M0 且无 READ_DATA/后续包；M53 在 AP2MDM_STATUS 拉高并标记 ESOC_REQ_IMG 后等待 2 秒再启动 MHI，等待窗口结束时 MDM2AP_STATUS/ERRFATAL 仍为 0，随后仍能进入 SBL/M0 并复现 BL/SAHARA/HELLO_RESP 基线，但 HELLO_RESP 后仍无 READ_DATA/后续包。M54 将 HELLO_RESP 的 mode 改为标准 Sahara command mode `3`，SBL HELLO 仍为 `mode=0`，HELLO_RESP 仍有 ch2 UL completion，但 10 秒内没有任何 command-mode 短包、READ_DATA 或下一包。M58 改为更接近 Android downstream `mhi_uci` 的 open-time SAHARA start、近满 DL RX ring 预排和 close unprepare 后，首次 open 仍是 HELLO→HELLO_RESP→timeout，但第二次 channel restart 后出现真实 `READ_DATA`：`3 20 34 0 40`，随后旧探测脚本误把 20 字节包当作不完整 HELLO 并写入 HELLO_RESP，收到 `END_OF_IMAGE`：`4 16 34 0`。当前缺口已经从“完全没有 READ_DATA”收窄为 image 34 / `TRDATA` / `mdmddr` 的被动传输和后续 ESOC/MDM2AP/Mission 时序，而不是 PCIe、SBL firmware、BL/SAHARA ring 数据、HELLO_RESP 字段、HELLO_RESP mode=0、HELLO_RESP 用户态响应延迟、MHI profile 规模/MSI 数量、host event context 映射、ESOC_REQ_IMG 到 MHI power-up 之间的简单等待窗口，或单独切 Sahara command-mode。

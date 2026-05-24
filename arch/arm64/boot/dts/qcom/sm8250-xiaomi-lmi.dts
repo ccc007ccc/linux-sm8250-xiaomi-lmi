@@ -1,6 +1,8 @@
 /dts-v1/;
 
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
 #include <dt-bindings/usb/pd.h>
 #include "sm8250.dtsi"
 #include "pm8150.dtsi"
@@ -362,6 +364,11 @@
 	};
 };
 
+&adsp {
+	firmware-name = "qcom/sm8250/adsp.mbn";
+	status = "okay";
+};
+
 &gmu {
 	status = "okay";
 };
@@ -453,9 +460,31 @@
 	};
 };
 
+&gpi_dma0 {
+	status = "okay";
+};
+
 &gpi_dma1 {
 	qcom,gpi-ee-offset = <0x6000>;
 	status = "okay";
+};
+
+&i2c3 {
+	clock-frequency = <100000>;
+	status = "okay";
+
+	tfa9874: codec@34 {
+		compatible = "nxp,tfa9874";
+		reg = <0x34>;
+
+		reset-gpios = <&tlmm 114 GPIO_ACTIVE_HIGH>;
+
+		pinctrl-0 = <&smartpa_int_active &smartpa_enable_active>;
+		pinctrl-names = "default";
+
+		sound-name-prefix = "Speaker";
+		#sound-dai-cells = <0>;
+	};
 };
 
 &i2c13 {
@@ -553,6 +582,124 @@
 };
 
 &qupv3_id_1 {
+	status = "okay";
+};
+
+&q6afedai {
+	dai@16 {
+		reg = <PRIMARY_MI2S_RX>;
+		qcom,sd-lines = <0>;
+	};
+};
+
+&q6asmdai {
+	dai@0 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
+	};
+
+	dai@1 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA2>;
+	};
+
+	dai@2 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA3>;
+		is-compress-dai;
+	};
+};
+
+&sound {
+	compatible = "qcom,sm8250-sndcard";
+	pinctrl-0 = <&pri_mi2s_active>;
+	pinctrl-names = "default";
+	model = "Xiaomi lmi";
+	audio-routing =
+		"SpkrLeft IN", "WSA_SPK1 OUT",
+		"SpkrRight IN", "WSA_SPK2 OUT";
+
+	mm1-dai-link {
+		link-name = "MultiMedia1";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+		};
+	};
+
+	mm2-dai-link {
+		link-name = "MultiMedia2";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
+		};
+	};
+
+	mm3-dai-link {
+		link-name = "MultiMedia3";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA3>;
+		};
+	};
+
+	speaker-dai-link {
+		link-name = "TFA9874 Playback";
+		no-pcm;
+
+		cpu {
+			sound-dai = <&q6afedai PRIMARY_MI2S_RX>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai = <&tfa9874>;
+		};
+	};
+
+	wsa-dai-link {
+		link-name = "WSA Playback";
+		no-pcm;
+
+		cpu {
+			sound-dai = <&q6afedai WSA_CODEC_DMA_RX_0>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai = <&left_spkr>, <&right_spkr>, <&swr0 0>, <&wsamacro 0>;
+		};
+	};
+};
+
+&swr0 {
+	status = "okay";
+
+	left_spkr: speaker@0,3 {
+		compatible = "sdw10217211000";
+		reg = <0 3>;
+		powerdown-gpios = <&tlmm 26 GPIO_ACTIVE_LOW>;
+		#thermal-sensor-cells = <0>;
+		qcom,port-mapping = <1 2 3 7>;
+		sound-name-prefix = "SpkrLeft";
+		#sound-dai-cells = <0>;
+	};
+
+	right_spkr: speaker@0,4 {
+		compatible = "sdw10217211000";
+		reg = <0 4>;
+		powerdown-gpios = <&tlmm 127 GPIO_ACTIVE_LOW>;
+		#thermal-sensor-cells = <0>;
+		qcom,port-mapping = <4 5 6 8>;
+		sound-name-prefix = "SpkrRight";
+		#sound-dai-cells = <0>;
+	};
+};
+
+&wsamacro {
 	status = "okay";
 };
 
@@ -701,5 +848,21 @@
 		function = "gpio";
 		drive-strength = <2>;
 		bias-pull-up;
+	};
+
+	smartpa_enable_active: smartpa-enable-active-state {
+		pins = "gpio114";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+
+	smartpa_int_active: smartpa-int-active-state {
+		pins = "gpio100";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
 	};
 };
