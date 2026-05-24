@@ -1,89 +1,87 @@
 # linux-sm8250-xiaomi-lmi
 
+> 100% AI 编写：本文档由 AI 生成和整理。
+
 这是 Redmi K30 Pro / POCO F2 Pro（代号 `lmi`，Qualcomm SM8250 / Snapdragon 865）的主线 Linux 内核适配仓库。
 
-目标是让普通 Linux 发行版 rootfs 尽量保持纯净，把硬件适配、启动菜单和早期启动支持放在内核、DTS、initramfs 与配套支持层中完成。
+目标是让普通 Linux 发行版 rootfs 尽量保持纯净，把硬件适配放在内核、DTS、initramfs 和必要支持层中完成，而不是长期依赖发行版 rootfs hack。
 
-## 基本状况
+## 当前状态
 
-当前系统已经可以从 UFS 上的 Linux rootfs 启动，使用 initramfs 菜单选择系统或维护入口，并进入桌面环境。release 配置面向日常发行版使用，同时启用了 Docker、LXC、nftables/cgroup 等服务器场景需要的内核能力。
+当前适配已经能从手机 UFS 上的 Linux rootfs 启动，通过 initramfs 菜单选择系统或维护入口，并进入 Ubuntu 26.04 Server。release 配置面向日常发行版和小型服务器场景，已经补齐 Docker、nftables/iptables、cgroup v2、overlayfs、zram、常见文件系统和网络能力。
 
-更细的进展记录见：
+当前主要验证组合：
 
-- [`lmi/HARDWARE_SUPPORT.md`](lmi/HARDWARE_SUPPORT.md)：硬件支持状态表
-- [`lmi/ADAPTATION_NOTES.md`](lmi/ADAPTATION_NOTES.md)：适配过程与诊断记录
-- [`lmi/configs/m1.config`](lmi/configs/m1.config)：通用 lmi 配置片段
-- [`lmi/configs/m1-release.config`](lmi/configs/m1-release.config)：release 启动配置片段
+- 设备：Redmi K30 Pro / POCO F2 Pro，代号 `lmi`。
+- 系统：Ubuntu 26.04 Server arm64 rootfs。
+- 启动：Android boot image + copydown bootshim + 内嵌 initramfs + UFS rootfs。
+- rootfs：推荐 `/dev/sda34`，标签 `ubuntu-rootfs`。
+- 刷写：推荐 recovery fastbootd，不推荐把 bootloader fastboot 当作主刷写路径。
 
-## 相关仓库
+这仍是进行中的主线适配项目，不是完整量产手机 ROM。硬件状态以实机验证为准。
 
-| 仓库 | 用途 |
+## 先读什么
+
+| 需求 | 文档 |
 | --- | --- |
-| `linux-sm8250-xiaomi-lmi` | 主线 Linux 内核、DTS、lmi 配置和硬件适配记录。 |
-| `sm8250-xiaomi-lmi-initramfs` | 早期启动、rootfs 自动发现、系统选择菜单、维护入口和 next-boot 支持。 |
-| `sm8250-xiaomi-lmi-boot` | Android boot image 打包、bootshim、fastboot/fastbootd 测试和 boot manifest 工具。 |
-| `sm8250-xiaomi-lmi-rootfs` | Ubuntu debug rootfs 与 Fedora/KDE rootfs 构建辅助脚本；硬件适配不长期依赖这里。 |
+| 只想使用现有 boot 跑 Linux rootfs | [`lmi/docs/USAGE.md`](lmi/docs/USAGE.md) |
+| 想自己编译内核并打包 boot | [`lmi/docs/BUILD_AND_PACKAGING.md`](lmi/docs/BUILD_AND_PACKAGING.md) |
+| 想看哪些硬件能用 | [`lmi/HARDWARE_SUPPORT.md`](lmi/HARDWARE_SUPPORT.md) |
+| 想看适配细节和历史诊断 | [`lmi/ADAPTATION_NOTES.md`](lmi/ADAPTATION_NOTES.md) |
+| 想看 lmi 文档目录 | [`lmi/docs/README.md`](lmi/docs/README.md) |
 
-## 已支持或基本可用的硬件
+上游 Linux 通用说明仍保留在仓库根目录的 `README` 和 `Documentation/` 中；本仓库新增的 lmi 文档只描述这台设备的编译、启动和硬件适配。
 
-| 硬件 | 当前状态 | 备注 |
-| --- | --- | --- |
-| UFS 存储 | 已支持 | 已验证分区扫描和 Linux rootfs 启动。 |
-| 屏幕 | 已支持 | Samsung AMS667UU01，已验证 fbcon、DRM/KMS、背光和 1080x2400 显示模式。 |
-| 触摸屏 | 已支持 | FocalTech FT3518，多点触控基础事件可用。 |
-| 实体按键 | 已支持 | 电源键、音量上、音量下可作为 input 事件使用；initramfs 菜单可用音量键选择、电源键确认。 |
-| GPU | 已支持 | Adreno 650 / GMU / freedreno 已验证基础 GLES、GBM、KMS 路径。 |
-| Wi-Fi | 已支持 | QCA6391 PCIe / ath11k，可联网和 SSH。 |
-| 蓝牙 | 已支持 | QCA6391 UART HCI，固件加载和基础 BR/EDR、LE 能力可用。 |
-| USB | 部分支持 | USB ACM 调试、Type-C 基础枚举和标准 PD sink 可用；OTG/角色切换仍需继续验证。 |
-| 电池 | 部分支持 | PM8150B fuel gauge 可暴露容量、电压、电流、温度等基础信息。 |
-| 充电 | 部分支持 | PM8150B charger 与标准 Type-C/PD 路径可用；已验证普通 PD 供电，私有快充未接入。 |
-| 音频：主扬声器 | 已支持 | NXP TFA9874 路径已验证可播放。 |
-| 音频：听筒 | 已支持 | WCD9380 earpiece 路径已验证可播放。 |
-| 音频：3.5mm 耳机 | 部分支持 | HPHL/HPHR 播放、插入检测和阻抗读取已验证；耳麦麦克风未验证。 |
-| 音频：机身麦克风 | 部分支持 | 已验证底部 mic1 与顶部 mic2 录音；第三个机身麦克风位置和路由仍待确认。 |
-| 启动菜单 | 已支持 | initramfs 内实现，支持单系统也显示菜单、自动识别 rootfs、维护入口和下一次启动选择。 |
+## 仓库内容
 
-## 暂未支持或仍在适配中的硬件
+| 路径 | 用途 |
+| --- | --- |
+| `arch/arm64/boot/dts/qcom/` | SM8250 与 lmi 设备树。 |
+| `drivers/` | lmi bring-up 中涉及的主线驱动改动。 |
+| `lmi/configs/` | lmi 内核配置片段，包含 debug/release 配置。 |
+| `lmi/scripts/build-kernel.sh` | lmi 内核构建入口。 |
+| `lmi/HARDWARE_SUPPORT.md` | 当前硬件支持状态矩阵。 |
+| `lmi/ADAPTATION_NOTES.md` | 深度适配记录、非致命日志说明和历史诊断。 |
+| `lmi/docs/` | 面向使用者和构建者的教程。 |
 
-| 硬件 | 当前状态 | 备注 |
-| --- | --- | --- |
-| 调制解调器 / 蜂窝网络 | 部分支持 | SDX55M 已推进到 PCIe/MHI/Sahara 诊断阶段，但还没有进入 Mission/AMSS；SIM、蜂窝数据、语音、IMS/VoLTE、ModemManager 均未可用。 |
-| 摄像头 | 暂未支持 | 后置四摄和前置升降摄像头均未接入主线可用链路；详见下方摄像头支持情况。 |
-| 前置升降结构 | 暂未支持 | 升降电机、限位/霍尔状态和安全策略尚未适配。 |
-| 闪光灯 LED | 待适配 | PM8150L SPMI flash LED 尚未接入 LED class 测试。 |
-| NFC | 待适配 | NQ-NCI I2C 路径尚未接入和验证。 |
-| 传感器 | 待适配 | 需要 SDSP remoteproc、签名固件和传感器用户态栈；当前未启用。 |
-| 触觉反馈 | 待适配 | AW8697 haptics 尚未接入和验证。 |
-| USB-C analog/accessory mux | 待适配 | FSA4480 暂未完成验证。 |
-| BQ2597x 充电泵 | 暂不支持 | Xiaomi 33W 私有快充依赖私有策略和测试条件，当前服务器使用目标优先普通 PD 稳定供电。 |
+## 本地工具输入
 
-## 摄像头支持情况
+主流程文档集中放在本仓库，但完整启动链路会引用同一工作区中的相邻工具仓库：
 
-当前摄像头整体标记为暂未支持。
+| 本地仓库 | 用途 |
+| --- | --- |
+| `sm8250-xiaomi-lmi-initramfs` | 早期启动、rootfs 自动发现、启动菜单、维护入口和 USB ACM 交接。 |
+| `sm8250-xiaomi-lmi-boot` | Android boot image 打包、copydown bootshim、manifest 生成和 fastboot/fastbootd 辅助脚本。 |
+| `sm8250-xiaomi-lmi-rootfs` | Ubuntu/Fedora rootfs 构建和 ext4 镜像辅助脚本。 |
 
-lmi 机型硬件上包含四个后置摄像头和一个前置升降摄像头，但本仓库当前还没有完成以下主线 Linux 所需链路：
+这些仓库是本地构建输入和工具来源；面向用户的主教程以本仓库 `lmi/docs/` 为准。
 
-- Qualcomm CAMSS / CCI / CSIPHY / CSID / VFE 的设备树接入与实机验证。
-- 各摄像头 sensor、EEPROM、VCM/actuator、供电、时钟和 reset GPIO 描述。
-- 前置升降摄像头的电机控制、位置检测和防夹/超时保护。
-- libcamera / V4L2 pipeline 验证。
-- 相机闪光灯与拍照同步控制。
+## 快速编译
 
-因此目前桌面系统中不应期待出现可用的内置摄像头设备。后续适配应先从只读识别、供电时序和单 sensor bring-up 开始，再推进多摄、自动对焦、闪光灯和前置升降结构。
-
-## 构建
-
-项目内的 lmi 构建入口在：
+假设工作区路径为 `/home/ccc007/Android/Kernel/lmi`：
 
 ```sh
-KERNEL_PROFILE=release ./lmi/scripts/build-kernel.sh
+KERNEL_PROFILE=release /home/ccc007/Android/Kernel/lmi/linux-sm8250-xiaomi-lmi/lmi/scripts/build-kernel.sh
 ```
 
-release 内核会嵌入当前 lmi initramfs，因此修改启动菜单或早期启动逻辑后，需要重新构建内核镜像并重新打包 boot image。
+主要输出：
 
-## 开源边界
+```text
+/home/ccc007/Android/Kernel/lmi/linux-sm8250-xiaomi-lmi/out/m1-release/arch/arm64/boot/Image.gz
+/home/ccc007/Android/Kernel/lmi/linux-sm8250-xiaomi-lmi/out/m1-release/arch/arm64/boot/dts/qcom/sm8250-xiaomi-lmi.dtb
+```
 
-本仓库只保存内核源码、DTS、配置片段、适配脚本和文档，不包含 boot image、rootfs 镜像、原厂 MIUI 镜像、设备分区备份、抓取日志或本地构建缓存。
+完整编译、initramfs 更新、boot 打包和 manifest 检查见 [`lmi/docs/BUILD_AND_PACKAGING.md`](lmi/docs/BUILD_AND_PACKAGING.md)。
 
-本仓库仍是进行中的主线适配工作，不是完整量产系统。硬件状态以实机验证为准；仅在 downstream Android 中存在或只在代码中出现的硬件，不默认视为已支持。
+## 使用边界
+
+本仓库只保存内核源码、DTS、配置片段、适配脚本和文档，不保存以下内容：
+
+- 生成的 boot image。
+- rootfs 镜像或 rootfs tar 包。
+- 原厂 MIUI 镜像。
+- 从原厂 boot/vendor/firmware 中提取的 stock DTB 或 firmware blob。
+- 设备分区备份、抓取日志、本地 Wi-Fi/SSH 配置、密钥或密码。
+- 本地构建缓存和临时输出。
+
+boot 打包流程会引用本地捕获的 stock DTB / stock kernel DTB。包含这类输入的生成 boot image 不默认具备公开再分发条件；如果要发布二进制，必须先单独核对 manifest 和许可边界。

@@ -1,6 +1,27 @@
 # lmi 主线适配备注
 
-本文件记录已经能稳定工作的模块里仍会出现的非致命提示。后续新增驱动时，如果功能验证通过但日志仍有可解释的 warning，也按同样格式追加到这里，避免把已知提示和真正回退混在一起。
+> 100% AI 编写：本文档由 AI 生成和整理。
+
+本文件保存 Redmi K30 Pro / POCO F2 Pro（`lmi`）主线 Linux 适配中的深度 bring-up 记录、已解释 warning 和历史诊断过程。面向使用者的简明结论见 [HARDWARE_SUPPORT.md](HARDWARE_SUPPORT.md)，编译和刷写教程见 [docs/](docs/)。
+
+## 当前基线
+
+- 设备：Redmi K30 Pro / POCO F2 Pro，代号 `lmi`，Qualcomm SM8250 / Snapdragon 865。
+- 启动：Android boot image -> copydown bootshim -> Linux Image.gz + runtime DTB -> 内嵌 initramfs -> UFS rootfs。
+- 当前验证系统：Ubuntu 26.04 Server arm64 rootfs，推荐 `/dev/sda34` / `LABEL=ubuntu-rootfs`。
+- 发布配置目标：普通发行版 rootfs 尽量保持纯净，硬件适配放在内核、DTS、initramfs 和必要支持层中。
+
+## 阅读导航
+
+| 主题 | 章节 |
+| --- | --- |
+| rootfs / UFS / 启动挂载 | [UFS / userdata](#ufs--userdata) |
+| 显示 / GPU / 输入 | [Display / Samsung AMS667UU01](#display--samsung-ams667uu01)、[GPU / Adreno A650 / Freedreno](#gpu--adreno-a650--freedreno)、[Touchscreen / FocalTech FT3518](#touchscreen--focaltech-ft3518)、[Input / hardware keys](#input--hardware-keys) |
+| 供电 / USB | [Power / PM8150B charger / fuel-gauge](#power--pm8150b-charger--fuel-gauge)、[USB / Type-C / ACM 调试](#usb--type-c--acm-调试) |
+| 无线 / 音频 | [Wireless / QCA6391 Wi‑Fi + Bluetooth](#wireless--qca6391-wi-fi--bluetooth)、[Audio / QDSP6 / TFA9874](#audio--qdsp6--tfa9874) |
+| 调制解调器 | [Modem / SDX55M / X55 5G](#modem--sdx55m--x55-5g) |
+
+本文件的长记录用于解释为什么某些 warning 暂时可接受，以及未来继续适配时应从哪里恢复上下文。
 
 ## 判定规则
 
@@ -10,7 +31,7 @@
 
 ## UFS / userdata
 
-当前状态：UFS 已作为主线 Ubuntu 控制台阶段的稳定基线使用。`ufshcd-qcom` 能绑定，UFS PHY 正常，`sda1` 到 `sda34` 能枚举；当前 `/dev/sda34` 已被替换为 Ubuntu rootfs，label 为 `ubuntu-rootfs`，initramfs 能挂载后 `switch_root` 进入 Ubuntu 24.04。
+当前状态：UFS 已作为主线 Ubuntu 控制台阶段的稳定基线使用。`ufshcd-qcom` 能绑定，UFS PHY 正常，`sda1` 到 `sda34` 能枚举；当前 `/dev/sda34` 已被替换为 Ubuntu rootfs，label 为 `ubuntu-rootfs`，initramfs 能挂载后 `switch_root` 进入 Ubuntu 26.04 Server。
 
 ### `freq-table-hz property not specified`
 
@@ -170,13 +191,13 @@
 
 ## Wireless / QCA6391 Wi‑Fi + Bluetooth
 
-当前状态：QCA6391 Wi‑Fi 按 QCA6390 PCIe 设备建模，`ath11k_pci` 能枚举 `17cb:1101`，接口为 `wlp1s0`，当前使用 `/persist/wlan_mac.bin` 中的真实 WLAN MAC `98:f6:21:c4:66:24`。Bluetooth 走 UART6 `qcom,qca6390-bt`，固件加载后通过 mgmt public-address 设置为 `98:F6:21:C4:66:25`，`btmgmt info` 显示 `missing options:` 为空。M8 验证中 `CONFIG_BT_LE=y`、`CONFIG_BT_RFCOMM_TTY=y`、`CONFIG_BT_HIDP=y` 已生效，`btmgmt` current settings 包含 `le`。
+当前状态：QCA6391 Wi‑Fi 按 QCA6390 PCIe 设备建模，`ath11k_pci` 能枚举 `17cb:1101`，接口为 `wlp1s0`，当前使用设备持久化 MAC 来源中的真实 WLAN MAC。Bluetooth 走 UART6 `qcom,qca6390-bt`，固件加载后通过 mgmt public-address 设置为从 WLAN MAC 派生的稳定地址，`btmgmt info` 显示 `missing options:` 为空。M8 验证中 `CONFIG_BT_LE=y`、`CONFIG_BT_RFCOMM_TTY=y`、`CONFIG_BT_HIDP=y` 已生效，`btmgmt` current settings 包含 `le`。
 
 ### 无线服务不阻塞启动
 
 含义：rootfs 中的 firmware import、wireless reprobe 和 Wi‑Fi connect 服务不再作为 `Type=oneshot` 阻塞 `multi-user.target`；Wi‑Fi 连接服务由 systemd 前台托管 `wpa_supplicant`，避免脚本退出时杀掉后台 supplicant。
 
-当前影响：已验证可用；M8 镜像 userspace 到达 `multi-user.target` 约 2.5 秒，Wi‑Fi 随后保持 `wlp1s0` 连接并获取 `192.168.0.41/24`。
+当前影响：已验证可用；M8 镜像 userspace 到达 `multi-user.target` 约 2.5 秒，Wi‑Fi 随后保持 `wlp1s0` 连接并获取局域网 DHCP 地址。
 
 后续处理：后续若把 Wi‑Fi/BT 转成模块，应继续保持无线连接和 firmware 导入不阻塞启动，并确认模块自动加载不会重新引入 initramfs firmware/MAC 时序问题。
 
@@ -184,7 +205,7 @@
 
 含义：当前 QCA Bluetooth 固件路径不会自行从设备 NVM 暴露真实 public address，因此 initramfs 从真实 WLAN MAC 派生 BT 地址并通过 mgmt `Set Public Address` 写入控制器。
 
-当前影响：功能可用；`hci0` 为 `UP RUNNING`，地址稳定为 `98:F6:21:C4:66:25`，LE/BR-EDR 基础能力已开启。
+当前影响：功能可用；`hci0` 为 `UP RUNNING`，地址稳定为从 WLAN MAC 派生的 public address，LE/BR-EDR 基础能力已开启。
 
 后续处理：如果后续找到原厂 BT address 的独立持久化来源，或主线 QCA 路径获得设备专用 NVM 地址解析，再替换当前 WLAN+1 派生策略。
 
