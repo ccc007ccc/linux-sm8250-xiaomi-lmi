@@ -19,6 +19,7 @@
 | 充电泵 | `ti,bq2597x-standalone` | `i2c15 @ 0x66` / charger pump | 暂不支持 | Android 用作 `pm8150b-charger` 的泵，IRQ 为 GPIO157；主线没有 `ti,bq2597x-standalone` compatible，且 33W Xiaomi 私有快充因缺少官方线和测试环境暂缓。 |
 | 内部存储 | `jedec,ufs-2.0` / `qcom,sm8250-qmp-ufs-phy` | UFS / QMP PHY | 已支持 | 已验证 UFS 枚举、分区扫描、Ubuntu rootfs 从 `/dev/sda34` 启动。 |
 | 触摸屏 | `focaltech,ft3518 @ 0x38` | `i2c13` | 已支持 | 已验证硬件 GENI I2C 路径、`/dev/input/event0`、多点触控基础事件。 |
+| 实体按键 | PM8150 PON pwrkey / RESIN / PM8150 GPIO6 | SPMI PON + PMIC GPIO / input | 已支持 | 已验证 `pm8941_pwrkey`、`pm8941_resin` 和 `gpio-keys` 三个 input 设备；电源键、音量下、音量上分别上报 `KEY_POWER`、`KEY_VOLUMEDOWN`、`KEY_VOLUMEUP`。debug rootfs 中 `lmi-debug-keys.service` 已将音量键映射为背光亮度加减，电源键短按映射为背光开关，并通过 logind ignore + evdev grab 避免触发重启或向 shell 输入。 |
 | GPU | `qcom,adreno-650` | MSM DRM / GMU / Adreno SMMU | 已支持 | 已验证 `/dev/dri/renderD128`、Mesa freedreno `FD650`、GLES/GBM/KMS 测试；需要 `a650_sqe.fw`、`a650_gmu.bin` 和 lmi stock `a650_zap.mdt` + bXX 段。 |
 | SBA-MUX | `fcs,fsa4480 @ 0x42` | `i2c15` | 待适配 | 可能用于 USB-C analog/audio accessory mux；当前 USB gadget/Type-C 基础链路不依赖它。 |
 | 闪光灯 LED | `qcom,spmi-flash-led` | PM8150L SPMI | 待适配 | 未接入 LED class 测试。 |
@@ -34,18 +35,19 @@
 
 | 组件 | 用途 | 连接 / 总线 | 当前状态 | 备注 |
 | --- | --- | --- | --- | --- |
-| `ncp,tfa9874` | EAR speaker | `i2c3 @ 0x34` | 待适配 | 未接入 ASoC codec / amplifier。 |
-| `ncp,tfa9874` | Main speaker | `i2c3 @ 0x34` | 待适配 | 地址/双功放拓扑需要对照 Android downstream。 |
-| `qcom,wcd9380-codec` | Chassis microphones x3 | SoundWire / WCD938x | 待适配 | 需要 SM8250 audio graph、SoundWire、APR/LPASS/WCD codec 路径。 |
-| `qcom,wcd9380-codec` | Analog I/O audio port | SoundWire / WCD938x | 待适配 | 与 USB-C analog path / FSA4480 可能有关。 |
+| `nxp,tfa9874` | Main speaker | `i2c3 @ 0x34` / `PRIMARY_MI2S_RX` | 已支持 | 已接入内置 ASoC amplifier、SM8250 sound card、Q6ASM/Q6AFE/Q6ADM 路由；实机验证 `PRI_MI2S_RX Audio Mixer MultiMedia1` 与 48 kHz S16_LE stereo 可驱动主扬声器。2026-05-24 在 `7.1.0-rc4-lmi-release+` 上用 period 480 / buffer 960 重测 `speaker_tfa9874_440Hz`，`aplay_rc=0`。I2S 模式默认设置 `TDM_CONFIG1.TDMDEL` 后低 PCM 振幅恢复线性；NXP/Goodix 专用 DSP/profile/calibration、安全音量策略与常规播放器参数仍待完善。 |
+| `qcom,wcd9380-codec` | Earpiece / receiver | SoundWire / WCD938x / `RX_CODEC_DMA_RX_0` | 已支持 | 已接入 WCD9380 RX SoundWire、RX macro 和 WCD playback dai-link；实机验证 `RDAC3_MUX=RX1`、`EAR_RDAC`、`RX_EAR Mode Switch`、`CLSH Switch` 与 `HPHL Switch` 路由可驱动真实听筒。2026-05-24 重测 `earpiece_wcd9380_660Hz`，`aplay_rc=0`。当前听筒低端可用参考为 `EAR_AMP≈1250`、`EAR_DVOL≈60..124`，最大 PCM 振幅按 32767 测试。 |
+| `qcom,wcd9380-codec` | Analog I/O audio port / 3.5mm | SoundWire / WCD938x / HPHL/HPHR | 部分支持 | HPHL/HPHR 播放已验证正常；2026-05-24 插入耳机后 `Headphone Jack=on`、`HPH Type=2`、`HPHL/HPHR Impedance≈55/56Ω`，并强制播放 stereo 测试 `headphones_forced_stereo_L760Hz_R1250Hz`，`aplay_rc=0`。`HPHL/HPHR Volume` 范围 0..24（约 -30dB..+6dB），`RX_RX0/1 Digital Volume` 84 为 0dB、124 为 +40dB。`qcom,hphl-jack-type-normally-closed` 在 lmi 上会让已插耳机读成未插，已撤回；当前没有耳麦测试环境，3.5mm 耳麦麦克风未验证，快速切换后的 HPH Type/阻抗采样稳定性仍需继续验证。 |
+| `qcom,wcd9380-codec` | Chassis microphones x3 | SoundWire / WCD938x / `TX_CODEC_DMA_TX_3` | 部分支持 | WCD TX capture 链路已验证，短录音 `rc=0`，可先录 WAV、归一化后经主扬声器安全回放；dmesg 无 DSP/AFE/Bus clash/MAX_RETRY。用户实测确认 `mic1->AMIC1` 为底部充电口旁、挨着扬声器的麦克风，`mic2->AMIC5` 为顶部麦克风；2026-05-24 两轮重测 3 秒录音并经主扬声器归一化回放均通过；第二轮 `mic1_bottom_AMIC1_ADC0` 为 `arecord_rc=0 bytes=288000 peak=1473 rms=325 playback_rc=0 norm_gain=4.75`，`mic2_top_AMIC5_ADC3` 为 `arecord_rc=0 bytes=288000 peak=14891 rms=937 playback_rc=0 norm_gain=0.47`。`mic3->AMIC4` 和 `mic3b->AMIC6` 当前听不到，第三个机身麦克风尚未定位，需继续扫 `AMIC2/AMIC3/AMIC4/AMIC6/AMIC7`。 |
 
 ## 已验证的基础组合
 
 - 控制台启动：UFS rootfs、DSI fbcon、USB ACM、Wi-Fi SSH 可同时工作。
-- 输入显示：FT3518 触摸和 AMS667UU01 DRM/KMS 可同时工作。
+- 输入显示：FT3518 触摸、实体电源/音量键和 AMS667UU01 DRM/KMS/backlight 可同时工作。
 - GPU：Adreno A650 / GMU / freedreno 可用于 GBM/EGL/GLES 渲染。
 - 电源：PM8150B Type-C/TCPM、charger 和 fuel-gauge 普通路线可同时暴露 USB 输入与电池状态。
 - 无线：Wi-Fi 使用真实 WLAN MAC，Bluetooth public address 使用 WLAN MAC + 1 的当前支持策略。
+- 音频：ADSP/PDR/QRTR/APR、SM8250 sound card、TFA9874 主扬声器、WCD9380 听筒、3.5mm HPH 左右分频播放、MBHC 插入/阻抗读取和 WCD9380 TX 两个机身麦克风基础链路已验证；当前仍限短音/短录音 smoke test，且需控制 PCM 振幅避免突然大声。
 
 ## 电池 / 充电当前结论
 
