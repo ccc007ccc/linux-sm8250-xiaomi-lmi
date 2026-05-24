@@ -2683,7 +2683,6 @@ static int wsa_macro_probe(struct platform_device *pdev)
 	int ret, def_count;
 
 	flags = (kernel_ulong_t)device_get_match_data(dev);
-	dev_info(dev, "probe start flags=0x%lx\n", flags);
 
 	wsa = devm_kzalloc(dev, sizeof(*wsa), GFP_KERNEL);
 	if (!wsa)
@@ -2711,21 +2710,11 @@ static int wsa_macro_probe(struct platform_device *pdev)
 	if (IS_ERR(wsa->fsgen))
 		return dev_err_probe(dev, PTR_ERR(wsa->fsgen), "unable to get fsgen clock\n");
 
-	dev_info(dev, "clocks macro=%s dcodec=%s mclk=%s npl=%s fsgen=%s\n",
-		 wsa->macro ? __clk_get_name(wsa->macro) : "none",
-		 wsa->dcodec ? __clk_get_name(wsa->dcodec) : "none",
-		 __clk_get_name(wsa->mclk),
-		 wsa->npl ? __clk_get_name(wsa->npl) : "none",
-		 __clk_get_name(wsa->fsgen));
-
 	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
 		return dev_err_probe(dev, PTR_ERR(base), "unable to map registers\n");
 
 	wsa->codec_version = lpass_macro_get_codec_version();
-	dev_info(dev, "codec version %s (%d)\n",
-		 lpass_macro_get_codec_version_string(wsa->codec_version),
-		 wsa->codec_version);
 	struct reg_default *reg_defaults __free(kfree) = NULL;
 
 	switch (wsa->codec_version) {
@@ -2781,10 +2770,8 @@ static int wsa_macro_probe(struct platform_device *pdev)
 
 	wsa->dev = dev;
 
-	ret = clk_set_rate(wsa->mclk, WSA_MACRO_MCLK_FREQ);
-	dev_info(dev, "set mclk rate ret=%d rate=%lu\n", ret, clk_get_rate(wsa->mclk));
-	ret = clk_set_rate(wsa->npl, WSA_MACRO_MCLK_FREQ);
-	dev_info(dev, "set npl rate ret=%d rate=%lu\n", ret, clk_get_rate(wsa->npl));
+	clk_set_rate(wsa->mclk, WSA_MACRO_MCLK_FREQ);
+	clk_set_rate(wsa->npl, WSA_MACRO_MCLK_FREQ);
 
 	ret = clk_prepare_enable(wsa->macro);
 	if (ret) {
@@ -2846,8 +2833,6 @@ static int wsa_macro_probe(struct platform_device *pdev)
 		dev_err_probe(dev, ret, "unable to register mclk output\n");
 		goto err_clkout;
 	}
-
-	dev_info(dev, "probe complete\n");
 
 	return 0;
 

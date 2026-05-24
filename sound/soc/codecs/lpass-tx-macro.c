@@ -887,19 +887,23 @@ static int tx_macro_tx_mixer_put(struct snd_kcontrol *kcontrol,
 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
 
 	if (enable) {
-		if (tx->active_decimator[dai_id] == dec_id)
+		if (test_and_set_bit(dec_id, &tx->active_ch_mask[dai_id]))
 			return 0;
 
-		set_bit(dec_id, &tx->active_ch_mask[dai_id]);
 		tx->active_ch_cnt[dai_id]++;
 		tx->active_decimator[dai_id] = dec_id;
 	} else {
-		if (tx->active_decimator[dai_id] == -1)
+		if (!test_and_clear_bit(dec_id, &tx->active_ch_mask[dai_id]))
 			return 0;
 
-		tx->active_ch_cnt[dai_id]--;
-		clear_bit(dec_id, &tx->active_ch_mask[dai_id]);
-		tx->active_decimator[dai_id] = -1;
+		if (tx->active_ch_cnt[dai_id])
+			tx->active_ch_cnt[dai_id]--;
+
+		if (tx->active_ch_cnt[dai_id])
+			tx->active_decimator[dai_id] = find_first_bit(&tx->active_ch_mask[dai_id],
+								      TX_MACRO_DEC_MAX);
+		else
+			tx->active_decimator[dai_id] = -1;
 	}
 	snd_soc_dapm_mixer_update_power(widget->dapm, kcontrol, enable, update);
 

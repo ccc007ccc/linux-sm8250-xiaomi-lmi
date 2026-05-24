@@ -160,6 +160,14 @@
 
 后续处理：如果后续把该改动整理给上游，需要继续评估是保留 per-node `qcom,gpi-ee-offset`，还是按 SoC/instance 建模 GPI EE offset。
 
+## Input / hardware keys
+
+当前状态：2026-05-23 key-enabled copydown 镜像已临时 `fastboot boot` 验证，`pm8941_pwrkey`、`pm8941_resin` 和 `gpio-keys` 均能枚举。PM8150 PON pwrkey 上报 `KEY_POWER`，PM8150 RESIN 上报 `KEY_VOLUMEDOWN`，PM8150 GPIO6 上报 `KEY_VOLUMEUP`；音量上 GPIO6 的 pull-up/input 配置来自 Xiaomi downstream 和同族 `sm8250-xiaomi-pipa.dts` 对照。当前 debug rootfs 中额外安装 `/usr/local/sbin/lmi-debug-keys.py` 与 `lmi-debug-keys.service`：logind 被配置为忽略电源键，daemon 对三路 key event 做 evdev grab，音量键调 `/sys/class/backlight/*/brightness`，电源键短按只切换 backlight `bl_power`/brightness，不触发重启、关机或挂起后台进程。
+
+当前影响：已验证基础按键输入可用；rootfs 策略满足调试阶段“音量键调亮度、电源键关/开背光”的需求。若调亮度仍偶发闪屏，优先区分是普通 brightness 写入导致的 panel/DRM 亮度过渡，还是错误地触发了 blank/unblank；当前 daemon 已避免在正常调亮度时反复写 `bl_power=0`。
+
+后续处理：进入完整桌面后，按键策略可移交给桌面电源管理器或保留 rootfs daemon；内核 DTS 只负责上报标准 key code，不在内核里实现锁屏、菜单或亮度策略。若 shell 仍收到音量键字符，先检查 daemon 是否 active、日志中是否显示 `grabbed=1`，不要把 key code 改成非标准值来规避用户态策略问题。
+
 ## Wireless / QCA6391 Wi‑Fi + Bluetooth
 
 当前状态：QCA6391 Wi‑Fi 按 QCA6390 PCIe 设备建模，`ath11k_pci` 能枚举 `17cb:1101`，接口为 `wlp1s0`，当前使用 `/persist/wlan_mac.bin` 中的真实 WLAN MAC `98:f6:21:c4:66:24`。Bluetooth 走 UART6 `qcom,qca6390-bt`，固件加载后通过 mgmt public-address 设置为 `98:F6:21:C4:66:25`，`btmgmt info` 显示 `missing options:` 为空。M8 验证中 `CONFIG_BT_LE=y`、`CONFIG_BT_RFCOMM_TTY=y`、`CONFIG_BT_HIDP=y` 已生效，`btmgmt` current settings 包含 `le`。
@@ -182,11 +190,27 @@
 
 ## Audio / QDSP6 / TFA9874
 
-当前状态：TFA9874 主扬声器首版内置支持已验证。`nxp,tfa9874` 能在 `i2c3 @ 0x34` 绑定，SM8250 sound card 注册为 `Xiaomi lmi`，`MultiMedia1` / `MultiMedia2` / `MultiMedia3` PCM 均出现；通过 `PRI_MI2S_RX Audio Mixer MultiMedia1` 路由和 `hw:0,0` 48 kHz S16_LE stereo、period 480、buffer 960 的 1 kHz 测试音，已验证 Q6ASM、Q6AFE、Q6ADM routing、PCM 和 TFA9874 I2S/TDM 基本链路，并在实机主扬声器听到物理声音。
+当前状态：TFA9874 主扬声器、WCD9380 听筒、3.5mm HPH 播放、MBHC 插入/阻抗读取和 WCD9380 TX 两个机身麦克风首版内置支持已验证。`nxp,tfa9874` 能在 `i2c3 @ 0x34` 绑定，WCD9380 RX/TX SoundWire 设备能绑定到 `qcom,wcd9380-codec`，SM8250 sound card 注册为 `Xiaomi lmi`，`MultiMedia1` / `MultiMedia2` / `MultiMedia3` PCM 均出现；2026-05-24 在 `7.1.0-rc4-lmi-release+` 上用 48 kHz S16_LE、period 480、buffer 960 重测，主扬声器 440Hz、听筒 660Hz、3.5mm 左 760Hz/右 1250Hz 同步测试音均 `aplay_rc=0`，mic1/mic2 短录音均 `arecord_rc=0`。
 
-TFA9874 当前有声配置来自 2026-05-22 实机运行时寄存器对照：清 `AUDIO_CTR.DPSA`、置 `SYS_CTRL1.MANSCONF`，并在 I2S/TDM 格式下清 `TDM_CONFIG1.TDMDEL`。未做这些设置时，`PRI_MI2S_RX` 软件播放可成功返回但物理无声。该主扬声器输出增益偏高，bring-up 测试应优先使用低 PCM 振幅短音，后续再补安全音量策略和 smart amp profile/calibration。
+TFA9874 当前有声配置来自 2026-05-22 实机运行时寄存器对照：清 `AUDIO_CTR.DPSA`、置 `SYS_CTRL1.MANSCONF`，并在 I2S/TDM 格式下设置 `TDM_CONFIG1.TDMDEL`。该 delay 位修复了 `SPK_AMP=1` 仍异常大声的位对齐问题；2026-05-23 clean boot 后直接读到 `reg21=0xc1f1`，确认新驱动默认已经置上 bit14，不再依赖运行时 patch 脚本。bring-up 测试仍应优先使用低 PCM 振幅短音，后续再补安全音量策略和 smart amp profile/calibration。
 
-路线区分结果：`PRI_MI2S_RX -> TFA9874` 是当前唯一已确认有物理声音的路线；`WSA_CODEC_DMA_RX_0` 软件播放可返回成功但实机未听到声音，且不是 3.5mm 路线；`RX_CODEC_DMA_RX_0` / `RX_CODEC_DMA_RX_1` 当前返回 `EINVAL`，需要先接入 WCD9380 RX/TX SoundWire 与 WCD playback/capture dai-link 后再验证听筒、3.5mm 和麦克风。
+路线区分结果：`PRI_MI2S_RX -> TFA9874` 是主扬声器路线；`RX_CODEC_DMA_RX_0 -> WCD9380 RX` 同时覆盖真实听筒和 3.5mm HPH 路线。听筒使用 `RDAC3_MUX=RX1`、`EAR_RDAC`、`RX_EAR Mode Switch`，并且需要打开 `CLSH Switch` 和 `HPHL Switch` 让 WCD RX SoundWire/CLSH 源工作；实测 `EAR_AMP≈1250` 是低端可用参考，`EAR_DVOL≈60..124` 是实用范围。3.5mm 使用 HPHL/HPHR，左右分频测试为左 760Hz、右 1250Hz 同时播放；先调 `HPHL/HPHR Volume` 0..24，再谨慎提高 `RX_RX0/1 Digital Volume`。WSA SoundWire speaker 路线不是 lmi 当前外放基线，已从目标音频拓扑移除。
+
+3.5mm MBHC 状态：HPH 音频播放已正常。2026-05-24 重新用 CARD 控件读取，耳机已插入时 `Headphone Jack=on`、`Mic Jack=off`、`HPH Type=2`、`HPHL/HPHR Impedance≈55/56Ω`，并且 HPHL/HPHR 左右分频播放 `aplay_rc=0`；当前没有耳麦测试环境，所以 3.5mm 耳麦麦克风路径未验证。`qcom,hphl-jack-type-normally-closed` 曾作为拔出后 input switch 可能停在 `0x84` 的极性候选修复，但 2026-05-23 clean boot 中用户确认耳机已插入时仍读到 `switch_bits=0x0`，说明该属性在 lmi 上极性错误，已从 DTS 撤回。单独打开 WCD9380 MBHC `gnd_det_en` 后初始状态正确，但用户多次运行时拔插仍没有边沿；强制 SoundWire/WCD runtime PM 保持 active 后，`switch_bits` 立即能在 `0x84` / `0x0` 间实时切换，定位根因为 SoundWire controller 进入 runtime suspend/clock-stop 后缺少 wake IRQ。当前修复是在 `drivers/soundwire/qcom.c` 中对“没有 controller wake IRQ 且 bus 上存在 wake-capable slave”的情况拒绝 runtime suspend；`audio-wcd9380-swrpm-2026-05-23-verify` 已在 `power/control=auto` 下验证插拔边沿工作，`mbhc sw intr` 从 12 增到 21。
+
+麦克风状态：WCD9380 TX capture 已通过 `TX_CODEC_DMA_TX_3` 打通，短录音验证使用 `TX_AIF1_CAP Mixer DEC0`、`TX SMIC MUX0`、`TX DEC0 MUX=SWR_MIC` 和 `MultiMedia3 Mixer TX_CODEC_DMA_TX_3`；`lpass-tx-macro` 修正后 TX active channel map 为单通道，`q6afe-dai` 按 active channel mask 下发 `num_channels=1`，避免 ADSP 以 `mask=0x1/channels=2` 拒绝 AFE port。用户实测确认 `mic1->AMIC1` 是底部充电口旁、挨着扬声器的麦克风，`mic2->AMIC5` 是顶部麦克风。2026-05-24 3 秒录音并经主扬声器归一化回放重测：第一轮 `mic1_bottom_AMIC1_ADC0` 为 `arecord_rc=0 bytes=288000 peak=5262 rms=446 playback_rc=0 norm_gain=1.33`，`mic2_top_AMIC5_ADC3` 为 `arecord_rc=0 bytes=288000 peak=10243 rms=217 playback_rc=0 norm_gain=0.68`；第二轮 `mic1_bottom_AMIC1_ADC0` 为 `arecord_rc=0 bytes=288000 peak=1473 rms=325 playback_rc=0 norm_gain=4.75`，`mic2_top_AMIC5_ADC3` 为 `arecord_rc=0 bytes=288000 peak=14891 rms=937 playback_rc=0 norm_gain=0.47`。`mic3->AMIC4` 和 `mic3b->AMIC6` 当前听不到，第三个机身麦克风尚未定位；后续用 `/root/lmi_mic_locate_record.sh unknown` 扫 `AMIC2/AMIC3/AMIC4/AMIC6/AMIC7`。
+
+### Audio 手动调用方法和路由逻辑
+
+通用测试参数：播放使用 `aplay -D hw:0,0 -f S16_LE -r 48000 -c 2 -t raw --period-size=480 --buffer-size=960`，录音使用 `arecord -D hw:0,2 -f S16_LE -r 48000 -c 1 -t raw --period-size=480 --buffer-size=960`。`hw:0,0` 是 `MultiMedia1` playback FE；`hw:0,2` 是 `MultiMedia3` capture FE。测试前后应关闭不用的 route mixer、HPH/EAR switch 和 TX ADC switch，避免旧路线残留。
+
+主扬声器逻辑：PCM 从 `MultiMedia1` 进入 `PRI_MI2S_RX`，再走板上 `nxp,tfa9874` I2S/TDM 功放。手动调用只需要打开 `PRI_MI2S_RX Audio Mixer MultiMedia1=1`，然后向 `hw:0,0` 写 stereo raw PCM；lmi 只有一个主扬声器，测试音左右声道通常写同样数据。
+
+听筒逻辑：PCM 从 `MultiMedia1` 进入 `RX_CODEC_DMA_RX_0`，RX macro 的 `RX0` 选择 `AIF1_PB`，WCD9380 的 `RX1/HPHL` 作为 EAR 的源，`RDAC3_MUX=RX1` 后经 `EAR_RDAC` 和 `RX_EAR Mode Switch` 到真实听筒。手动调用需要设置 `RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia1=1`、`RX HPH Mode=CLS_H_ULP`、`RX_RX0 Digital Volume`、`RX_MACRO RX0 MUX=AIF1_PB`、`RX INT0_1 MIX1 INP0=RX0`、`RX INT0 DEM MUX=CLSH_DSM_OUT`、`CLSH Switch=1`、`RDAC3_MUX=RX1`、`EAR_PA Volume=0`、`EAR_RDAC Switch=1`、`RX_EAR Mode Switch=1`、`HPHL Switch=1`。
+
+3.5mm HPH 逻辑：PCM 从 `MultiMedia1` 进入 `RX_CODEC_DMA_RX_0`，RX macro 的 `RX0/RX1` 都选择 `AIF1_PB`，`RX0` 送 HPHL、`RX1` 送 HPHR。手动调用需要设置 `RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia1=1`、`RX HPH Mode=CLS_H_HIFI`、`RX_RX0/1 Digital Volume`、`RX_MACRO RX0/1 MUX=AIF1_PB`、`RX INT0_1 MIX1 INP0=RX0`、`RX INT1_1 MIX1 INP0=RX1`、`RX INT0/1 DEM MUX=CLSH_DSM_OUT`、`CLSH Switch=1`、`HPHL/HPHR Volume`、`HPHL/HPHR_RDAC Switch=1`、`HPHL/HPHR Switch=1`。左右声道区分测试使用同一 stereo raw 流，左声道 760Hz、右声道 1250Hz。
+
+麦克风逻辑：录音从 `MultiMedia3` FE 进入 `TX_CODEC_DMA_TX_3`，再经 `TX_AIF1_CAP Mixer DEC0`、`TX DEC0 MUX=SWR_MIC` 和 `TX SMIC MUX0` 选择具体 WCD9380 ADC。底部麦克风 `mic1` 使用 `ADC1 Volume=12`、`ADC1_MIXER Switch=1`、`ADC1 Switch=1`、`TX SMIC MUX0=ADC0`；顶部麦克风 `mic2` 使用 `ADC4 MUX=INP5`、`ADC4 Volume=12`、`ADC4_MIXER Switch=1`、`ADC4 Switch=1`、`TX SMIC MUX0=ADC3`。两路都需要先打开 `MultiMedia3 Mixer TX_CODEC_DMA_TX_3=1` 和 `TX_AIF1_CAP Mixer DEC0=1`，再从 `hw:0,2` 录制 mono raw PCM。
 
 ### `Direct firmware load for qcom/sm8250/adsp.mbn failed with error -2`
 

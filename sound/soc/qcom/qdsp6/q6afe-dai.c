@@ -3,6 +3,7 @@
 // Copyright (c) 2018, Linaro Limited
 
 #include <dt-bindings/sound/qcom,q6afe.h>
+#include <linux/bitops.h>
 #include <linux/err.h>
 #include <linux/init.h>
 #include <linux/module.h>
@@ -364,6 +365,8 @@ static int q6dma_hw_params(struct snd_pcm_substream *substream,
 	cfg->bit_width = params_width(params);
 	cfg->sample_rate = params_rate(params);
 	cfg->num_channels = params_channels(params);
+	if (cfg->active_channels_mask)
+		cfg->num_channels = hweight16(cfg->active_channels_mask);
 
 	return 0;
 }

@@ -27,7 +27,7 @@
 		ranges;
 
 		stdout-path = "serial0:115200n8";
-		bootargs = "clk_ignore_unused pd_ignore_unused fw_devlink=off pstore.backend=ramoops androidboot.hardware=qcom earlycon=msm_geni_serial,0xa90000 console=tty0 loglevel=4 kpti=off loop.max_part=7 lpm_levels.sleep_disabled=1 reboot=panic_warm swiotlb=2048 cgroup.memory=nokmem,nosocket msm_rtb.filter=0x237 service_locator.enable=1 drm_client_lib.active=fbdev fbcon=font:TER16x32 fbcon=rotate:1";
+		bootargs = "clk_ignore_unused pd_ignore_unused fw_devlink=off pstore.backend=ramoops androidboot.hardware=qcom earlycon=msm_geni_serial,0xa90000 console=tty0 loglevel=4 kpti=off loop.max_part=7 lpm_levels.sleep_disabled=1 reboot=panic_warm swiotlb=2048 cgroup.memory=nokmem,nosocket msm_rtb.filter=0x237 service_locator.enable=1 drm_client_lib.active=fbdev fbcon=font:TER16x32";
 
 		framebuffer0: framebuffer@9c000000 {
 			compatible = "simple-framebuffer";
@@ -37,6 +37,22 @@
 			stride = <4352>;
 			format = "a8r8g8b8";
 			status = "okay";
+		};
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		pinctrl-0 = <&vol_up_n>;
+		pinctrl-names = "default";
+
+		key-volume-up {
+			label = "Volume Up";
+			gpios = <&pm8150_gpios 6 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+			debounce-interval = <15>;
+			linux,can-disable;
+			wakeup-source;
 		};
 	};
 
@@ -79,6 +95,29 @@
 		regulator-max-microvolt = <880000>;
 		regulator-always-on;
 		vin-supply = <&vph_pwr>;
+	};
+
+	wcd938x: audio-codec {
+		compatible = "qcom,wcd9380-codec";
+
+		reset-gpios = <&tlmm 32 GPIO_ACTIVE_LOW>;
+
+		vdd-buck-supply = <&vreg_s4a_1p8>;
+		vdd-rxtx-supply = <&vreg_s4a_1p8>;
+		vdd-io-supply = <&vreg_s4a_1p8>;
+		vdd-mic-bias-supply = <&vreg_bob>;
+
+		qcom,micbias1-microvolt = <2750000>;
+		qcom,micbias2-microvolt = <2750000>;
+		qcom,micbias3-microvolt = <2750000>;
+		qcom,micbias4-microvolt = <2750000>;
+		qcom,mbhc-buttons-vthreshold-microvolt = <75000 150000 237000 500000 500000 500000 500000 500000>;
+		qcom,mbhc-headset-vthreshold-microvolt = <1700000>;
+		qcom,mbhc-headphone-vthreshold-microvolt = <50000>;
+		qcom,rx-device = <&wcd_rx>;
+		qcom,tx-device = <&wcd_tx>;
+
+		#sound-dai-cells = <1>;
 	};
 
 	sdx55m-esoc-diag {
@@ -562,10 +601,29 @@
 	status = "okay";
 };
 
+&pm8150_gpios {
+	vol_up_n: vol-up-n-state {
+		pins = "gpio6";
+		function = "normal";
+		power-source = <1>;
+		input-enable;
+		bias-pull-up;
+	};
+};
+
 &pon {
 	mode-bootloader = <0x2>;
 	mode-fastboot = <0x2>;
 	mode-recovery = <0x1>;
+};
+
+&pon_pwrkey {
+	status = "okay";
+};
+
+&pon_resin {
+	linux,code = <KEY_VOLUMEDOWN>;
+	status = "okay";
 };
 
 &spmi_bus {
@@ -590,6 +648,14 @@
 		reg = <PRIMARY_MI2S_RX>;
 		qcom,sd-lines = <0>;
 	};
+
+	dai@113 {
+		reg = <RX_CODEC_DMA_RX_0>;
+	};
+
+	dai@120 {
+		reg = <TX_CODEC_DMA_TX_3>;
+	};
 };
 
 &q6asmdai {
@@ -613,8 +679,26 @@
 	pinctrl-names = "default";
 	model = "Xiaomi lmi";
 	audio-routing =
-		"SpkrLeft IN", "WSA_SPK1 OUT",
-		"SpkrRight IN", "WSA_SPK2 OUT";
+		"IN1_HPHL", "HPHL_OUT",
+		"IN2_HPHR", "HPHR_OUT",
+		"IN3_AUX", "AUX_OUT",
+		"AMIC1", "MIC BIAS1",
+		"AMIC2", "MIC BIAS2",
+		"AMIC3", "MIC BIAS3",
+		"AMIC4", "MIC BIAS3",
+		"AMIC5", "MIC BIAS4",
+		"ADC1", "AMIC1",
+		"ADC2", "AMIC2",
+		"ADC3", "AMIC3",
+		"ADC4", "AMIC4",
+		"TX SWR_ADC0", "ADC1_OUTPUT",
+		"TX SWR_ADC1", "ADC2_OUTPUT",
+		"TX SWR_ADC2", "ADC3_OUTPUT",
+		"TX SWR_ADC3", "ADC4_OUTPUT",
+		"RX_TX DEC0_INP", "TX DEC0 MUX",
+		"RX_TX DEC1_INP", "TX DEC1 MUX",
+		"RX_TX DEC2_INP", "TX DEC2 MUX",
+		"RX_TX DEC3_INP", "TX DEC3 MUX";
 
 	mm1-dai-link {
 		link-name = "MultiMedia1";
@@ -657,12 +741,12 @@
 		};
 	};
 
-	wsa-dai-link {
-		link-name = "WSA Playback";
+	wcd-playback-dai-link {
+		link-name = "WCD Playback";
 		no-pcm;
 
 		cpu {
-			sound-dai = <&q6afedai WSA_CODEC_DMA_RX_0>;
+			sound-dai = <&q6afedai RX_CODEC_DMA_RX_0>;
 		};
 
 		platform {
@@ -670,37 +754,60 @@
 		};
 
 		codec {
-			sound-dai = <&left_spkr>, <&right_spkr>, <&swr0 0>, <&wsamacro 0>;
+			sound-dai = <&wcd938x 0>, <&swr1 0>, <&rxmacro 0>;
+		};
+	};
+
+	wcd-capture-dai-link {
+		link-name = "WCD Capture";
+		no-pcm;
+
+		cpu {
+			sound-dai = <&q6afedai TX_CODEC_DMA_TX_3>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai = <&wcd938x 1>, <&swr2 0>, <&txmacro 0>;
 		};
 	};
 };
 
-&swr0 {
+&vamacro {
+	vdd-micb-supply = <&vreg_bob>;
+	qcom,dmic-sample-rate = <4800000>;
+	status = "okay";
+};
+
+&rxmacro {
+	status = "okay";
+};
+
+&txmacro {
+	status = "okay";
+};
+
+&swr1 {
 	status = "okay";
 
-	left_spkr: speaker@0,3 {
-		compatible = "sdw10217211000";
-		reg = <0 3>;
-		powerdown-gpios = <&tlmm 26 GPIO_ACTIVE_LOW>;
-		#thermal-sensor-cells = <0>;
-		qcom,port-mapping = <1 2 3 7>;
-		sound-name-prefix = "SpkrLeft";
-		#sound-dai-cells = <0>;
-	};
-
-	right_spkr: speaker@0,4 {
-		compatible = "sdw10217211000";
+	wcd_rx: wcd9380-rx@0,4 {
+		compatible = "sdw20217010d00";
 		reg = <0 4>;
-		powerdown-gpios = <&tlmm 127 GPIO_ACTIVE_LOW>;
-		#thermal-sensor-cells = <0>;
-		qcom,port-mapping = <4 5 6 8>;
-		sound-name-prefix = "SpkrRight";
-		#sound-dai-cells = <0>;
+		qcom,rx-port-mapping = <1 2 3 4 5>;
 	};
 };
 
-&wsamacro {
+&swr2 {
 	status = "okay";
+
+	wcd_tx: wcd9380-tx@0,3 {
+		compatible = "sdw20217010d00";
+		reg = <0 3>;
+		qcom,tx-port-mapping = <2 3 4 5>;
+	};
 };
 
 &uart6 {

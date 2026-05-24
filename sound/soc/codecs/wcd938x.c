@@ -174,6 +174,9 @@ struct wcd938x_priv {
 	int hphr_pdm_wd_int;
 	int hphl_pdm_wd_int;
 	int aux_pdm_wd_int;
+	unsigned int hphr_pdm_wd_users;
+	unsigned int hphl_pdm_wd_users;
+	unsigned int aux_pdm_wd_users;
 	bool comp1_enable;
 	bool comp2_enable;
 	bool ldoh;
@@ -183,6 +186,21 @@ struct wcd938x_priv {
 static const char * const wcd938x_supplies[] = {
 	"vdd-rxtx", "vdd-io", "vdd-buck", "vdd-mic-bias",
 };
+
+static void wcd938x_pdm_wd_irq_get(int irq, unsigned int *users)
+{
+	if ((*users)++ == 0)
+		enable_irq(irq);
+}
+
+static void wcd938x_pdm_wd_irq_put(int irq, unsigned int *users)
+{
+	if (!*users)
+		return;
+
+	if (--(*users) == 0)
+		disable_irq_nosync(irq);
+}
 
 static const SNDRV_CTL_TLVD_DECLARE_DB_MINMAX(ear_pa_gain, 600, -1800);
 static const DECLARE_TLV_DB_SCALE(line_gain, -3000, 150, 0);
@@ -741,10 +759,12 @@ static int wcd938x_codec_enable_hphr_pa(struct snd_soc_dapm_widget *w,
 			snd_soc_component_write_field(component, WCD938X_ANA_RX_SUPPLIES,
 					WCD938X_REGULATOR_MODE_MASK,
 					WCD938X_REGULATOR_MODE_CLASS_AB);
-		enable_irq(wcd938x->hphr_pdm_wd_int);
+		wcd938x_pdm_wd_irq_get(wcd938x->hphr_pdm_wd_int,
+					     &wcd938x->hphr_pdm_wd_users);
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
-		disable_irq_nosync(wcd938x->hphr_pdm_wd_int);
+		wcd938x_pdm_wd_irq_put(wcd938x->hphr_pdm_wd_int,
+					     &wcd938x->hphr_pdm_wd_users);
 		/*
 		 * 7ms sleep is required if compander is enabled as per
 		 * HW requirement. If compander is disabled, then
@@ -847,10 +867,12 @@ static int wcd938x_codec_enable_hphl_pa(struct snd_soc_dapm_widget *w,
 			snd_soc_component_write_field(component, WCD938X_ANA_RX_SUPPLIES,
 					WCD938X_REGULATOR_MODE_MASK,
 					WCD938X_REGULATOR_MODE_CLASS_AB);
-		enable_irq(wcd938x->hphl_pdm_wd_int);
+		wcd938x_pdm_wd_irq_get(wcd938x->hphl_pdm_wd_int,
+					     &wcd938x->hphl_pdm_wd_users);
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
-		disable_irq_nosync(wcd938x->hphl_pdm_wd_int);
+		wcd938x_pdm_wd_irq_put(wcd938x->hphl_pdm_wd_int,
+					     &wcd938x->hphl_pdm_wd_users);
 		/*
 		 * 7ms sleep is required if compander is enabled as per
 		 * HW requirement. If compander is disabled, then
@@ -915,10 +937,12 @@ static int wcd938x_codec_enable_aux_pa(struct snd_soc_dapm_widget *w,
 			snd_soc_component_write_field(component, WCD938X_ANA_RX_SUPPLIES,
 					WCD938X_REGULATOR_MODE_MASK,
 					WCD938X_REGULATOR_MODE_CLASS_AB);
-		enable_irq(wcd938x->aux_pdm_wd_int);
+		wcd938x_pdm_wd_irq_get(wcd938x->aux_pdm_wd_int,
+					     &wcd938x->aux_pdm_wd_users);
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
-		disable_irq_nosync(wcd938x->aux_pdm_wd_int);
+		wcd938x_pdm_wd_irq_put(wcd938x->aux_pdm_wd_int,
+					     &wcd938x->aux_pdm_wd_users);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		/* 1 msec delay as per HW requirement */
@@ -976,15 +1000,19 @@ static int wcd938x_codec_enable_ear_pa(struct snd_soc_dapm_widget *w,
 					WCD938X_REGULATOR_MODE_MASK,
 					WCD938X_REGULATOR_MODE_CLASS_AB);
 		if (wcd938x->ear_rx_path & EAR_RX_PATH_AUX)
-			enable_irq(wcd938x->aux_pdm_wd_int);
+			wcd938x_pdm_wd_irq_get(wcd938x->aux_pdm_wd_int,
+					     &wcd938x->aux_pdm_wd_users);
 		else
-			enable_irq(wcd938x->hphl_pdm_wd_int);
+			wcd938x_pdm_wd_irq_get(wcd938x->hphl_pdm_wd_int,
+					     &wcd938x->hphl_pdm_wd_users);
 		break;
 	case SND_SOC_DAPM_PRE_PMD:
 		if (wcd938x->ear_rx_path & EAR_RX_PATH_AUX)
-			disable_irq_nosync(wcd938x->aux_pdm_wd_int);
+			wcd938x_pdm_wd_irq_put(wcd938x->aux_pdm_wd_int,
+					     &wcd938x->aux_pdm_wd_users);
 		else
-			disable_irq_nosync(wcd938x->hphl_pdm_wd_int);
+			wcd938x_pdm_wd_irq_put(wcd938x->hphl_pdm_wd_int,
+					     &wcd938x->hphl_pdm_wd_users);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		if (!wcd938x->comp1_enable)
@@ -3090,6 +3118,9 @@ static int wcd938x_soc_codec_probe(struct snd_soc_component *component)
 	disable_irq_nosync(wcd938x->hphr_pdm_wd_int);
 	disable_irq_nosync(wcd938x->hphl_pdm_wd_int);
 	disable_irq_nosync(wcd938x->aux_pdm_wd_int);
+	wcd938x->hphr_pdm_wd_users = 0;
+	wcd938x->hphl_pdm_wd_users = 0;
+	wcd938x->aux_pdm_wd_users = 0;
 
 	switch (variant) {
 	case CHIPID_WCD9380:
@@ -3252,6 +3283,7 @@ static int wcd938x_populate_dt_data(struct wcd938x_priv *wcd938x, struct device 
 	cfg->linein_th = 5000;
 	cfg->hs_thr = 1700;
 	cfg->hph_thr = 50;
+	cfg->gnd_det_en = true;
 
 	wcd_dt_parse_mbhc_data(dev, cfg);
 

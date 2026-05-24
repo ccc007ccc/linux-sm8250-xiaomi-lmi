@@ -3,7 +3,9 @@
 
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/slab.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/pcm.h>
@@ -20,7 +22,6 @@
 
 struct sm8250_snd_data {
 	bool stream_prepared[AFE_PORT_MAX];
-	struct snd_soc_card *card;
 	struct snd_soc_jack jack;
 	struct snd_soc_jack usb_offload_jack;
 	bool usb_offload_jack_setup;
@@ -179,6 +180,7 @@ static int sm8250_platform_probe(struct platform_device *pdev)
 	card->dev = dev;
 	dev_set_drvdata(dev, card);
 	snd_soc_card_set_drvdata(card, data);
+
 	ret = qcom_snd_parse_of(card);
 	if (ret)
 		return ret;

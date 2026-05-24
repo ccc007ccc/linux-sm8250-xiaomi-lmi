@@ -142,6 +142,8 @@ static int tfa9874_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
 	case SND_SOC_DAIFMT_I2S:
+		delay = TFA9874_TDM_CONFIG1_TDMDEL;
+		break;
 	case SND_SOC_DAIFMT_LEFT_J:
 		delay = 0;
 		break;

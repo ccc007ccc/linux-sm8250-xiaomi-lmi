@@ -21,6 +21,7 @@ struct ams667uu01 {
 	struct mipi_dsi_device *dsi;
 	struct regulator_bulk_data supplies[AMS667UU01_NUM_SUPPLIES];
 	struct gpio_desc *reset_gpio;
+	enum drm_panel_orientation orientation;
 };
 
 static const char * const ams667uu01_supply_names[] = {
@@ -140,8 +141,8 @@ static const struct drm_display_mode ams667uu01_modes[] = {
 		.vsync_start = 2400 + 34,
 		.vsync_end = 2400 + 34 + 20,
 		.vtotal = 2400 + 34 + 20 + 34,
-		.width_mm = 71,
-		.height_mm = 158,
+		.width_mm = 128,
+		.height_mm = 284,
 		.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
 	},
 	{
@@ -154,8 +155,8 @@ static const struct drm_display_mode ams667uu01_modes[] = {
 		.vsync_start = 2400 + 34,
 		.vsync_end = 2400 + 34 + 20,
 		.vtotal = 2400 + 34 + 20 + 34,
-		.width_mm = 71,
-		.height_mm = 158,
+		.width_mm = 128,
+		.height_mm = 284,
 		.type = DRM_MODE_TYPE_DRIVER,
 	},
 };
@@ -181,10 +182,18 @@ static int ams667uu01_get_modes(struct drm_panel *panel,
 	return ARRAY_SIZE(ams667uu01_modes);
 }
 
+static enum drm_panel_orientation ams667uu01_get_orientation(struct drm_panel *panel)
+{
+	struct ams667uu01 *ctx = to_ams667uu01(panel);
+
+	return ctx->orientation;
+}
+
 static const struct drm_panel_funcs ams667uu01_panel_funcs = {
 	.prepare = ams667uu01_prepare,
 	.unprepare = ams667uu01_unprepare,
 	.get_modes = ams667uu01_get_modes,
+	.get_orientation = ams667uu01_get_orientation,
 };
 
 static int ams667uu01_bl_update_status(struct backlight_device *bl)
@@ -265,6 +274,10 @@ static int ams667uu01_probe(struct mipi_dsi_device *dsi)
 
 	ctx->dsi = dsi;
 	mipi_dsi_set_drvdata(dsi, ctx);
+
+	ret = of_drm_get_panel_orientation(dev->of_node, &ctx->orientation);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "Failed to get panel orientation\n");
 
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;

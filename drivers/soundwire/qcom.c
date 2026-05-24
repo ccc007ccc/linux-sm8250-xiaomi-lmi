@@ -1766,10 +1766,25 @@ static int __maybe_unused swrm_runtime_resume(struct device *dev)
 	return 0;
 }
 
+static bool qcom_swrm_has_wake_capable_slave(struct qcom_swrm_ctrl *ctrl)
+{
+	struct sdw_slave *slave;
+
+	list_for_each_entry(slave, &ctrl->bus.slaves, node) {
+		if (slave->prop.wake_capable)
+			return true;
+	}
+
+	return false;
+}
+
 static int __maybe_unused swrm_runtime_suspend(struct device *dev)
 {
 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(dev);
 	int ret;
+
+	if (ctrl->wake_irq <= 0 && qcom_swrm_has_wake_capable_slave(ctrl))
+		return -EBUSY;
 
 	swrm_wait_for_wr_fifo_done(ctrl);
 	if (!ctrl->clock_stop_not_supported) {

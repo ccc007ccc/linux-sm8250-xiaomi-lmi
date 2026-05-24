@@ -2476,49 +2476,37 @@ static int rx_macro_mux_put(struct snd_kcontrol *kcontrol,
 	struct rx_macro *rx = snd_soc_component_get_drvdata(component);
 
 	aif_rst = rx->rx_port_value[widget->shift];
-	if (!rx_port_value) {
-		if (aif_rst == 0)
-			return 0;
-		if (aif_rst > RX_MACRO_AIF4_PB) {
-			dev_err(component->dev, "%s: Invalid AIF reset\n", __func__);
-			return 0;
-		}
-	}
-	rx->rx_port_value[widget->shift] = rx_port_value;
-
-	switch (rx_port_value) {
-	case 0:
-		/*
-		 * active_ch_cnt and active_ch_mask use DAI IDs (RX_MACRO_MAX_DAIS).
-		 * active_ch_cnt == 0 was tested in if() above.
-		 */
-		dai_id = aif_rst - 1;
-		if (rx->active_ch_cnt[dai_id]) {
-			clear_bit(widget->shift, &rx->active_ch_mask[dai_id]);
-			rx->active_ch_cnt[dai_id]--;
-		}
-		break;
-	case 1:
-	case 2:
-	case 3:
-	case 4:
-		/* active_ch_cnt and active_ch_mask use DAI IDs (WSA_MACRO_MAX_DAIS). */
-		dai_id = rx_port_value - 1;
-		set_bit(widget->shift, &rx->active_ch_mask[dai_id]);
-		rx->active_ch_cnt[dai_id]++;
-		break;
-	default:
+	if (rx_port_value > RX_MACRO_AIF4_PB) {
 		dev_err(component->dev,
 			"%s:Invalid AIF_ID for RX_MACRO MUX %d\n",
 			__func__, rx_port_value);
-		goto err;
+		return -EINVAL;
+	}
+	if (aif_rst > RX_MACRO_AIF4_PB) {
+		dev_err(component->dev, "%s: Invalid AIF reset\n", __func__);
+		return -EINVAL;
+	}
+	if (rx_port_value == aif_rst)
+		return 0;
+
+	if (aif_rst) {
+		dai_id = aif_rst - 1;
+		if (test_and_clear_bit(widget->shift, &rx->active_ch_mask[dai_id]) &&
+		    rx->active_ch_cnt[dai_id])
+			rx->active_ch_cnt[dai_id]--;
 	}
 
+	if (rx_port_value) {
+		dai_id = rx_port_value - 1;
+		if (!test_and_set_bit(widget->shift, &rx->active_ch_mask[dai_id]))
+			rx->active_ch_cnt[dai_id]++;
+	}
+
+	rx->rx_port_value[widget->shift] = rx_port_value;
 	snd_soc_dapm_mux_update_power(widget->dapm, kcontrol,
 					rx_port_value, e, update);
+
 	return 0;
-err:
-	return -EINVAL;
 }
 
 static const struct snd_kcontrol_new rx_macro_rx0_mux =

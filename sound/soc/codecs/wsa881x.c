@@ -6,7 +6,6 @@
 #include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
-#include <linux/of.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/pm_runtime.h>
@@ -1155,11 +1154,6 @@ static int wsa881x_probe(struct sdw_slave *pdev,
 	wsa881x->sconfig.frame_rate = 48000;
 	wsa881x->sconfig.direction = SDW_DATA_DIR_RX;
 	wsa881x->sconfig.type = SDW_STREAM_PDM;
-	if (of_property_read_u32_array(dev->of_node, "qcom,port-mapping",
-					       &pdev->m_port_map[1],
-					       WSA881X_MAX_SWR_PORTS))
-		dev_dbg(dev, "Static Port mapping not specified\n");
-
 	pdev->prop.sink_ports = GENMASK(WSA881X_MAX_SWR_PORTS - 1, 0);
 	pdev->prop.sink_dpn_prop = wsa_sink_dpn_prop;
 	pdev->prop.scp_int1_mask = SDW_SCP_INT1_BUS_CLASH | SDW_SCP_INT1_PARITY;
@@ -1175,7 +1169,6 @@ static int wsa881x_probe(struct sdw_slave *pdev,
 	pm_runtime_mark_last_busy(dev);
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
-	pm_runtime_get_noresume(dev);
 
 	return devm_snd_soc_register_component(dev,
 					       &wsa881x_component_drv,

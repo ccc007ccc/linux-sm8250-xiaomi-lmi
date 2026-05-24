@@ -13,6 +13,16 @@
 - [`lmi/HARDWARE_SUPPORT.md`](lmi/HARDWARE_SUPPORT.md)：硬件支持状态表
 - [`lmi/ADAPTATION_NOTES.md`](lmi/ADAPTATION_NOTES.md)：适配过程与诊断记录
 - [`lmi/configs/m1.config`](lmi/configs/m1.config)：通用 lmi 配置片段
+- [`lmi/configs/m1-release.config`](lmi/configs/m1-release.config)：release 启动配置片段
+
+## 相关仓库
+
+| 仓库 | 用途 |
+| --- | --- |
+| `linux-sm8250-xiaomi-lmi` | 主线 Linux 内核、DTS、lmi 配置和硬件适配记录。 |
+| `sm8250-xiaomi-lmi-initramfs` | 早期启动、rootfs 自动发现、系统选择菜单、维护入口和 next-boot 支持。 |
+| `sm8250-xiaomi-lmi-boot` | Android boot image 打包、bootshim、fastboot/fastbootd 测试和 boot manifest 工具。 |
+| `sm8250-xiaomi-lmi-rootfs` | Ubuntu debug rootfs 与 Fedora/KDE rootfs 构建辅助脚本；硬件适配不长期依赖这里。 |
 
 ## 已支持或基本可用的硬件
 
@@ -72,6 +82,8 @@ KERNEL_PROFILE=release ./lmi/scripts/build-kernel.sh
 
 release 内核会嵌入当前 lmi initramfs，因此修改启动菜单或早期启动逻辑后，需要重新构建内核镜像并重新打包 boot image。
 
-## 说明
+## 开源边界
+
+本仓库只保存内核源码、DTS、配置片段、适配脚本和文档，不包含 boot image、rootfs 镜像、原厂 MIUI 镜像、设备分区备份、抓取日志或本地构建缓存。
 
 本仓库仍是进行中的主线适配工作，不是完整量产系统。硬件状态以实机验证为准；仅在 downstream Android 中存在或只在代码中出现的硬件，不默认视为已支持。

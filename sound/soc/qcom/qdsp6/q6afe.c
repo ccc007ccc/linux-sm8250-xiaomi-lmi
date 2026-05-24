@@ -1653,7 +1653,9 @@ void q6afe_cdc_dma_port_prepare(struct q6afe_port *port,
 	dma_cfg->bit_width = cfg->bit_width;
 	dma_cfg->data_format = cfg->data_format;
 	dma_cfg->num_channels = cfg->num_channels;
-	if (!cfg->active_channels_mask)
+	if (cfg->active_channels_mask)
+		dma_cfg->active_channels_mask = cfg->active_channels_mask;
+	else
 		dma_cfg->active_channels_mask = (1 << cfg->num_channels) - 1;
 }
 EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);

@@ -65,7 +65,7 @@ int qcom_snd_sdw_startup(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
-	u32 rx_ch[SDW_MAX_PORTS], tx_ch[SDW_MAX_PORTS];
+	u32 rx_ch[SDW_MAX_PORTS] = {}, tx_ch[SDW_MAX_PORTS] = {};
 	struct sdw_stream_runtime *sruntime;
 	struct snd_soc_dai *codec_dai;
 	u32 rx_ch_cnt = 0, tx_ch_cnt = 0;
@@ -84,9 +84,6 @@ int qcom_snd_sdw_startup(struct snd_pcm_substream *substream)
 		if (ret < 0 && ret != -ENOTSUPP) {
 			dev_err(rtd->dev, "Failed to set sdw stream on %s\n", codec_dai->name);
 			goto err_set_stream;
-		} else if (ret == -ENOTSUPP) {
-			/* Ignore unsupported */
-			continue;
 		}
 
 		ret = snd_soc_dai_get_channel_map(codec_dai, &tx_ch_cnt, tx_ch,
@@ -104,6 +101,12 @@ int qcom_snd_sdw_startup(struct snd_pcm_substream *substream)
 	case RX_CODEC_DMA_RX_0:
 	case TX_CODEC_DMA_TX_3:
 		if (tx_ch_cnt || rx_ch_cnt) {
+			ret = snd_soc_dai_set_channel_map(cpu_dai,
+							  tx_ch_cnt, tx_ch,
+							  rx_ch_cnt, rx_ch);
+			if (ret != 0 && ret != -ENOTSUPP)
+				goto err_set_stream;
+
 			for_each_rtd_codec_dais(rtd, j, codec_dai) {
 				ret = snd_soc_dai_set_channel_map(codec_dai,
 								  tx_ch_cnt, tx_ch,
