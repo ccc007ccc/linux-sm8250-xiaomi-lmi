@@ -123,7 +123,7 @@
 
 ## Power / PM8150B charger / fuel-gauge
 
-当前状态：PM8150B Type-C/TCPM/VBUS、SMB5 charger 和 gen4 fuel-gauge 已按普通充电路线接通。M14 验证 `/sys/class/power_supply` 出现 `pm8150b-charger`、`qcom-battery` 和 TCPM supply，并在标准 PD 电源上协商到 9V/2A；M15 验证 `pm8150b-charger` 在 USB online 时能上报 `voltage_now` 和 `current_now`。
+当前状态：PM8150B Type-C/TCPM/VBUS、SMB5 charger 和 gen4 fuel-gauge 已按普通充电路线接通。M14 验证 `/sys/class/power_supply` 出现 `pm8150b-charger`、`qcom-battery` 和 TCPM supply，并在标准 PD 电源上协商到 9V/2A；M15 验证 `pm8150b-charger` 在 USB online 时能上报 `voltage_now` 和 `current_now`。当前代码路径新增 `charge_behaviour` 与 `input_current_limit`，用于 lmi 长期插电服务器场景的保守限充策略。
 
 ### `deferred probe pending: qcom-smbx-charger: Couldn't get usbin_v IIO channel`
 
@@ -139,7 +139,15 @@
 
 当前影响：已验证修复；M15 改为按 `smb_get_prop_usb_online()` 判断是否读取 IIO，当前普通 5V 输入下 `pm8150b-charger` 上报 `voltage_now=4623520`、`current_now=442470`。
 
-后续处理：后续接 PD 电源时继续确认 TCPM 的 9V/2A 与 charger 侧 IIO 读数同时合理；如果加入限充/停充策略，也不要把输入电压/电流上报重新绑定到电池是否正在充电。
+后续处理：后续接 PD 电源时继续确认 TCPM 的 9V/2A 与 charger 侧 IIO 读数同时合理；限充/停充策略也不要把输入电压/电流上报重新绑定到电池是否正在充电。
+
+### 保守限充 / 电池保护策略
+
+当前代码路径：`pm8150b-charger` 暴露标准 `charge_behaviour`，只支持 `auto` 与 `inhibit-charge`；同时暴露标准 `input_current_limit` 作为配置目标值，`current_max` 作为 AICL 后的实际/有效值。旧的 `status` 写入口不再作为控制面使用，`status` 只保留为只读状态。
+
+rootfs 支持层提供 `lmi-power` 项目：`lmi-powerd.service` 负责限充/温度/输入限流策略，`lmi-power-keysd.service` 负责电源键背光 toggle 和音量键亮度调节，`lmi-power` CLI 用于查看 `status`、策略、target/effective input current 和手动调试。默认在 75% 停充、70% 恢复，充电输入电流目标为 700 mA，停充保持输入电流目标为 1000 mA；温度策略优先于容量策略，55°C 停充、50°C 恢复，10°C 以下停充、15°C 恢复。75% 停充、压力放电到 70% 后恢复、再回到 75% 停充的闭环已实机验证。
+
+限制：这不是硬件旁路供电，也不承诺电池无老化；Xiaomi 33W 私有快充和 BQ2597x 充电泵仍不作为当前目标。后续仍应继续观察 24～48 小时容量/温度保持情况，并在 `lmi-power status` 中同时看 `input_current_limit` target 与 `current_max` effective。
 
 ## USB / Type-C / ACM 调试
 

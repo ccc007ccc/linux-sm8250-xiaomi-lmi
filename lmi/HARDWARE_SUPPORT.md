@@ -25,7 +25,7 @@
 | Wi-Fi | 已支持 | QCA6391 Wi-Fi 已验证 `ath11k_pci`、真实 WLAN MAC、自动连接和 SSH。 | 需要设备匹配 firmware；Android/发行版网络策略仍可能影响自动连接。 |
 | 蓝牙 | 已支持 | QCA6391 UART Bluetooth 已验证固件加载、public address 设置、BR/EDR 与 LE 基础能力。 | 若未来找到独立原厂 BT address 来源，可替换当前支持层设置策略。 |
 | USB / Type-C | 部分支持 | DWC3 gadget、USB ACM 串口、Type-C 基础枚举和标准 PD sink 已验证；标准 PD 曾验证到 9V/2A。 | USB host/OTG、完整角色切换和更多 PD 场景仍需继续验证。 |
-| 电池 / 充电 | 部分支持 | PM8150B Type-C/TCPM、SMB5 charger 和 gen4 fuel-gauge 已能暴露 USB 输入、电池容量、电压、电流、温度和状态。 | Xiaomi 33W 私有快充、BQ2597x 充电泵、限充/停充策略、完整电池曲线和旁路供电控制未接入。 |
+| 电池 / 充电 | 部分支持 | PM8150B Type-C/TCPM、SMB5 charger 和 gen4 fuel-gauge 已能暴露 USB 输入、电池容量、电压、电流、温度和状态；当前代码提供 `charge_behaviour`、`input_current_limit` 目标值、`current_max` 有效值和 `lmi-power` 保守限充服务，75% 停充、70% 恢复、再到 75% 停充已实机验证。 | 仍需更长时间观察容量/温度保持；Xiaomi 33W 私有快充、BQ2597x 充电泵、完整电池曲线和硬件旁路供电控制未接入。 |
 | 主扬声器 | 已支持 | `nxp,tfa9874` 主扬声器路线已验证可播放 48 kHz S16_LE stereo 测试音。 | NXP/Goodix 专用 DSP/profile/calibration 与安全音量策略仍待完善；测试应先用低振幅短音。 |
 | 听筒 | 已支持 | WCD9380 RX / EAR 路线已验证真实听筒播放。 | 音量曲线和普通播放器默认参数仍需继续打磨。 |
 | 3.5mm HPH | 部分支持 | WCD9380 HPHL/HPHR 播放、耳机插入状态和阻抗读取已验证。 | 当前没有耳麦测试环境；3.5mm 耳麦麦克风未验证。 |
@@ -45,15 +45,15 @@
 - 控制台链路：UFS rootfs、DSI fbcon、USB ACM、Wi-Fi SSH 可同时工作。
 - 输入显示：触摸、电源/音量键、DRM/KMS/backlight 可同时工作。
 - 图形链路：Adreno A650 / GMU / freedreno 可用于 GBM/EGL/GLES 渲染。
-- 电源链路：PM8150B Type-C/TCPM、charger 和 fuel-gauge 可同时暴露 USB 输入与电池状态。
+- 电源链路：PM8150B Type-C/TCPM、charger 和 fuel-gauge 可同时暴露 USB 输入、电池状态与标准限充控制接口。
 - 音频链路：ADSP/PDR/QRTR/APR、SM8250 sound card、TFA9874 主扬声器、WCD9380 听筒、3.5mm HPH 播放、MBHC 插入/阻抗读取和两路机身麦克风基础录音已验证。
 - 服务器链路：Ubuntu 26.04 Server rootfs、SSH、Docker bridge/NAT、端口映射、overlayfs、cgroup v2、nftables/iptables 已通过基础验证。
 
 ## 电池 / 充电当前目标
 
-lmi 作为长期运行的小型服务器使用时，优先目标是稳定供电、电池状态可见、温度/安全信息可见。当前普通 Type-C/PD 路径能稳定供电即可作为基线；33W Xiaomi 私有快充、BQ2597x 充电泵和可能的硬件旁路供电控制需要更多私有策略或硬件验证，不作为当前 release 必备功能。
+lmi 作为长期运行的小型服务器使用时，优先目标是稳定供电、电池状态可见、温度/安全信息可见和电池寿命。当前普通 Type-C/PD 路径能稳定供电即可作为基线；33W Xiaomi 私有快充、BQ2597x 充电泵和可能的硬件旁路供电控制需要更多私有策略或硬件验证，不作为当前 release 必备功能。
 
-Linux 没有通用“电源直供/绕过电池”开关；这类能力必须由 PMIC/charger 硬件和对应驱动暴露。当前 PM8150B 普通 charger 路径只确认了输入、电池和充电状态可见。
+当前代码提供标准 `charge_behaviour`、`input_current_limit` 目标值和 `current_max` 有效值；rootfs 支持层的 `lmi-power` 默认使用 70%～75% 容量窗口、低输入电流和温度保护来降低长期满电、高温和大电流压力。75% 停充、压力放电到 70% 后恢复充电、再回到 75% 停充的往返已经实机验证。Linux 没有通用“电源直供/绕过电池”开关；这类能力必须由 PMIC/charger 硬件和对应驱动暴露，因此当前策略不等同于硬件旁路供电，也不能完全消除电池老化。
 
 ## 调制解调器当前结论
 

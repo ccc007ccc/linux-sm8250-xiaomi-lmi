@@ -10,7 +10,6 @@
 - 设备代号：`lmi`。
 - SoC：Qualcomm SM8250 / Snapdragon 865。
 - bootloader：必须已解锁。
-- 推荐刷写入口：recovery fastbootd。
 
 不要把本文步骤用于其他 SM8250 设备，也不要用于未确认分区布局的设备。
 
@@ -116,32 +115,19 @@ ls /mnt/linuxroot/etc/os-release
 ls /mnt/linuxroot/sbin/init
 ```
 
-### 方式二：在 fastbootd 中写入 ext4 镜像
+### 方式二：使用 fastboot 写入 ext4 镜像
 
-只有在 recovery fastbootd 能看到 `linuxroot` 分区名时，才使用这种方式：
+只有在 fastboot 能看到 `linuxroot` 分区名，并且确认它对应预留的 Linux rootfs 分区时，才使用这种方式：
 
 ```sh
-fastboot getvar is-userspace
 fastboot flash linuxroot ubuntu-rootfs.ext4.img
 ```
 
-`is-userspace` 必须返回 `yes`。不同设备或不同分区表不一定存在 `linuxroot` 这个 fastboot 分区名；不确定时不要执行 `fastboot flash linuxroot`。
+不同设备或不同分区表不一定存在 `linuxroot` 这个 fastboot 分区名；不确定时不要执行 `fastboot flash linuxroot`。
 
 ## 刷入 boot image
 
-进入 recovery fastbootd 后先确认：
-
-```sh
-fastboot getvar is-userspace
-```
-
-期望输出包含：
-
-```text
-is-userspace: yes
-```
-
-然后刷入 boot：
+进入 fastboot 后刷入 boot：
 
 ```sh
 fastboot flash boot boot-linux-copydown-lmi.img
@@ -158,7 +144,7 @@ fastboot reboot
 - 电源键：确认启动。
 - 没有按键操作时：短倒计时后启动默认候选。
 
-菜单中会显示检测到的发行版名称、分区标签和设备节点。即使只有一个 rootfs，也会显示菜单，方便进入 recovery、fastbootd 或 bootloader fastboot。
+菜单中会显示检测到的发行版名称、分区标签和设备节点。即使只有一个 rootfs，也会显示菜单，方便选择系统或进入维护入口。
 
 ## 进入系统后
 
@@ -173,17 +159,65 @@ fastboot reboot
 
 具体硬件状态见 [`../HARDWARE_SUPPORT.md`](../HARDWARE_SUPPORT.md)。
 
+## 电池保护和限充
+
+长期插电作为小型服务器使用时，当前 rootfs 支持层默认启用 `lmi-powerd.service` 和 `lmi-power-keysd.service`。电池策略只使用内核暴露的标准接口：
+
+```text
+/sys/class/power_supply/pm8150b-charger/charge_behaviour
+/sys/class/power_supply/pm8150b-charger/input_current_limit
+/sys/class/power_supply/pm8150b-charger/current_max
+```
+
+默认策略：
+
+- 电量达到 75% 时写 `inhibit-charge` 停充。
+- 电量降到 70% 且温度安全时写 `auto` 恢复充电。
+- 恢复充电时把输入电流目标设为 700000 uA。
+- 停充保持时把输入电流目标设为 1000000 uA。
+- 电池温度达到 55°C 停充，降到 50°C 后才允许恢复。
+- 电池温度低于 10°C 停充，回到 15°C 后才允许恢复。
+- `input_current_limit` 表示目标值，`current_max` 表示 AICL 后的实际/有效值；两者不一致时 CLI 会显示 mismatch。
+
+查看服务状态：
+
+```sh
+systemctl status lmi-powerd lmi-power-keysd
+journalctl -u lmi-powerd -n 80 --no-pager
+journalctl -u lmi-power-keysd -n 80 --no-pager
+```
+
+查看当前电池、charger 和策略判断：
+
+```sh
+lmi-power status
+lmi-power policy
+lmi-power validate
+```
+
+手动调试入口：
+
+```sh
+lmi-power charge auto
+lmi-power charge inhibit
+lmi-power limit 700mA
+lmi-power backlight toggle
+```
+
+`lmi-power-keysd` 负责电源键切换背光、黑屏时唤醒背光，以及音量键调节亮度；它替代旧的 `lmi-debug-keys.service`。
+
+这只是保守限充和温度保护策略，不是硬件旁路供电；它能降低长期满电、高温和大电流压力，但不能承诺电池完全无老化或绝对不会鼓包。旧内核如果没有 `charge_behaviour` / `input_current_limit` / `current_max`，该服务会记录错误并退出，不会 fallback 到写 `status`。
+
 ## 回滚
 
 发布版 boot 只刷写 `boot` 分区。回滚时刷回原厂或备份 boot image：
 
 ```sh
-fastboot getvar is-userspace
 fastboot flash boot stock-boot.img
 fastboot reboot
 ```
 
-首次刷入前建议备份当前 boot 分区，并确保自己仍能进入 recovery fastbootd。
+首次刷入前建议备份当前 boot 分区，并确保自己仍能进入 fastboot。
 
 ## 限制和公开发布边界
 

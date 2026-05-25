@@ -8,7 +8,7 @@
 
 1. [`USAGE.md`](USAGE.md)
    - 适合想把 rootfs 放进手机并启动 Linux 的用户。
-   - 覆盖设备前提、rootfs 分区要求、刷 boot、启动菜单和回滚。
+   - 覆盖设备前提、rootfs 分区要求、刷 boot、启动菜单、电池保护和回滚。
 
 2. [`BUILD_AND_PACKAGING.md`](BUILD_AND_PACKAGING.md)
    - 适合想自己编译内核和打包 boot image 的用户。

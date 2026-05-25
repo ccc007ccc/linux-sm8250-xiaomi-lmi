@@ -117,26 +117,12 @@ embedded_linux_image_sha256=...
 
 ## 刷入 boot
 
-刷写前进入 recovery fastbootd，并确认：
-
-```sh
-fastboot getvar is-userspace
-```
-
-期望：
-
-```text
-is-userspace: yes
-```
-
-刷入：
+进入 fastboot 后刷入：
 
 ```sh
 fastboot flash boot /home/ccc007/Android/Kernel/lmi/sm8250-xiaomi-lmi-boot/builds/lmi-release/boot-linux-copydown-lmi.img
 fastboot reboot
 ```
-
-bootloader fastboot 在当前 lmi 分区状态下不作为主要刷写路径。
 
 ## 生成物公开边界
 
@@ -161,7 +147,7 @@ bootloader fastboot 在当前 lmi 分区状态下不作为主要刷写路径。
 3. 构建 release 内核。
 4. 使用 boot 工具打包 copydown boot image。
 5. 检查 manifest。
-6. 在 recovery fastbootd 中刷 boot。
+6. 在 fastboot 中刷 boot。
 7. 启动后通过菜单进入 rootfs。
 8. 用 SSH、USB ACM 串口或本机 console 验证系统。
 ```

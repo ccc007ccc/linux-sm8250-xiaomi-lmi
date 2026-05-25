@@ -16,7 +16,7 @@
 - 系统：Ubuntu 26.04 Server arm64 rootfs。
 - 启动：Android boot image + copydown bootshim + 内嵌 initramfs + UFS rootfs。
 - rootfs：推荐 `/dev/sda34`，标签 `ubuntu-rootfs`。
-- 刷写：推荐 recovery fastbootd，不推荐把 bootloader fastboot 当作主刷写路径。
+- 刷写：使用 fastboot 刷入 boot 分区。
 
 这仍是进行中的主线适配项目，不是完整量产手机 ROM。硬件状态以实机验证为准。
 
@@ -51,7 +51,7 @@
 | 本地仓库 | 用途 |
 | --- | --- |
 | `sm8250-xiaomi-lmi-initramfs` | 早期启动、rootfs 自动发现、启动菜单、维护入口和 USB ACM 交接。 |
-| `sm8250-xiaomi-lmi-boot` | Android boot image 打包、copydown bootshim、manifest 生成和 fastboot/fastbootd 辅助脚本。 |
+| `sm8250-xiaomi-lmi-boot` | Android boot image 打包、copydown bootshim、manifest 生成和 fastboot 辅助脚本。 |
 | `sm8250-xiaomi-lmi-rootfs` | Ubuntu/Fedora rootfs 构建和 ext4 镜像辅助脚本。 |
 
 这些仓库是本地构建输入和工具来源；面向用户的主教程以本仓库 `lmi/docs/` 为准。

@@ -15,6 +15,7 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
@@ -109,7 +110,7 @@ enum smb_generation {
 #define AUTO_SRC_DETECT_BIT				BIT(3)
 #define HVDCP_EN_BIT					BIT(2)
 
-#define USBIN_LOAD_CFG					0x65
+#define USBIN_LOAD_CFG					0x365
 #define ICL_OVERRIDE_AFTER_APSD_BIT			BIT(4)
 
 #define USBIN_ICL_OPTIONS				0x366
@@ -181,6 +182,9 @@ enum smb_generation {
 #define BARK_BITE_WDOG_PET				0x643
 #define BARK_BITE_WDOG_PET_BIT				BIT(0)
 
+#define AICL_CMD					0x644
+#define RESTART_AICL_BIT				BIT(1)
+
 #define WD_CFG						0x651
 #define WATCHDOG_TRIGGER_AFP_EN_BIT			BIT(7)
 #define BARK_WDOG_INT_EN_BIT				BIT(6)
@@ -229,6 +233,9 @@ struct smb_init_register {
  * @gen:		Generation of SMBx hardware block
  * @current_step_size_ua: Step size of current limits in uA
  * @current_limit_max_ua: Maximum charging current in uA
+ * @current_limit_lock: Protects the userspace input current cap
+ * @user_input_current_limit_ua: Userspace input current cap in uA
+ * @user_input_current_limit_set: If userspace configured an input current cap
  * @status_change_work: Worker to handle plug/unplug events
  * @cable_irq:		USB plugin IRQ
  * @wakeup_enabled:	If the cable IRQ will cause a wakeup
@@ -245,6 +252,9 @@ struct smb_chip {
 	enum smb_generation gen;
 	unsigned int current_step_size_ua;
 	unsigned int current_limit_max_ua;
+	struct mutex current_limit_lock;
+	unsigned int user_input_current_limit_ua;
+	bool user_input_current_limit_set;
 
 	struct delayed_work status_change_work;
 	int cable_irq;
@@ -269,9 +279,11 @@ static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_USB_TYPE,
@@ -422,7 +434,20 @@ static inline int smb_get_current_limit(struct smb_chip *chip,
 	int rc = regmap_read(chip->regmap, chip->base + ICL_STATUS(chip), val);
 
 	if (rc >= 0)
-		*val *= chip->current_step_size_ua;
+		*val = (*val & INPUT_CURRENT_LIMIT_MASK) *
+		       chip->current_step_size_ua;
+	return rc;
+}
+
+static inline int smb_get_configured_current_limit(struct smb_chip *chip,
+						    unsigned int *val)
+{
+	int rc = regmap_read(chip->regmap,
+			     chip->base + USBIN_CURRENT_LIMIT_CFG, val);
+
+	if (rc >= 0)
+		*val = (*val & INPUT_CURRENT_LIMIT_MASK) *
+		       chip->current_step_size_ua;
 	return rc;
 }
 
@@ -480,19 +505,100 @@ static inline int smb_get_current_now(struct smb_chip *chip,
 	return rc;
 }
 
+static int smb_run_aicl(struct smb_chip *chip)
+{
+	int usb_online = 0;
+	int rc;
+
+	if (chip->gen != SMB5)
+		return 0;
+
+	rc = smb_get_prop_usb_online(chip, &usb_online);
+	if (rc < 0 || !usb_online)
+		return rc;
+
+	return regmap_write_bits(chip->regmap, chip->base + AICL_CMD,
+				     RESTART_AICL_BIT, RESTART_AICL_BIT);
+}
+
 static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 {
 	unsigned char val_raw;
+	int rc;
 
-	if (val > chip->current_limit_max_ua) {
+	if (val < chip->current_step_size_ua || val > chip->current_limit_max_ua) {
 		dev_err(chip->dev,
-			"Can't set current limit higher than %u uA\n", chip->current_limit_max_ua);
+			"current limit %u uA outside valid range %u-%u uA\n",
+			val, chip->current_step_size_ua, chip->current_limit_max_ua);
 		return -EINVAL;
 	}
+
 	val_raw = val / chip->current_step_size_ua;
 
-	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
-			    val_raw);
+	if (chip->gen == SMB5) {
+		rc = regmap_update_bits(chip->regmap,
+					chip->base + USBIN_LOAD_CFG,
+					ICL_OVERRIDE_AFTER_APSD_BIT,
+					ICL_OVERRIDE_AFTER_APSD_BIT);
+		if (rc < 0)
+			return rc;
+	}
+
+	rc = regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
+			  val_raw);
+	if (rc < 0)
+		return rc;
+
+	rc = smb_run_aicl(chip);
+	if (rc < 0)
+		dev_warn(chip->dev, "Couldn't restart AICL rc=%d\n", rc);
+
+	return 0;
+}
+
+static unsigned int smb_apply_user_current_limit(struct smb_chip *chip,
+						 unsigned int current_ua)
+{
+	mutex_lock(&chip->current_limit_lock);
+	if (chip->user_input_current_limit_set)
+		current_ua = min(current_ua, chip->user_input_current_limit_ua);
+	mutex_unlock(&chip->current_limit_lock);
+
+	return current_ua;
+}
+
+static int smb_set_user_current_limit(struct smb_chip *chip, unsigned int val)
+{
+	int rc;
+
+	if (val < chip->current_step_size_ua || val > chip->current_limit_max_ua) {
+		dev_err(chip->dev,
+			"current limit %u uA outside valid range %u-%u uA\n",
+			val, chip->current_step_size_ua, chip->current_limit_max_ua);
+		return -EINVAL;
+	}
+
+	mutex_lock(&chip->current_limit_lock);
+	if (val == chip->current_limit_max_ua) {
+		chip->user_input_current_limit_set = false;
+	} else {
+		chip->user_input_current_limit_ua = val;
+		chip->user_input_current_limit_set = true;
+	}
+	mutex_unlock(&chip->current_limit_lock);
+
+	if (val == chip->current_limit_max_ua) {
+		schedule_delayed_work(&chip->status_change_work, 0);
+		power_supply_changed(chip->chg_psy);
+		return 0;
+	}
+
+	rc = smb_set_current_limit(chip, val);
+	if (rc < 0)
+		return rc;
+
+	power_supply_changed(chip->chg_psy);
+	return 0;
 }
 
 static void smb_status_change_work(struct work_struct *work)
@@ -505,7 +611,7 @@ static void smb_status_change_work(struct work_struct *work)
 	chip = container_of(work, struct smb_chip, status_change_work.work);
 
 	smb_get_prop_usb_online(chip, &usb_online);
-	if (!usb_online)
+	if (!usb_online || !chip->batt_info)
 		return;
 
 	for (count = 0; count < 3; count++) {
@@ -543,7 +649,12 @@ static void smb_status_change_work(struct work_struct *work)
 		break;
 	}
 
-	smb_set_current_limit(chip, current_ua);
+	current_ua = min(current_ua, chip->current_limit_max_ua);
+	current_ua = smb_apply_user_current_limit(chip, current_ua);
+	rc = smb_set_current_limit(chip, current_ua);
+	if (rc < 0)
+		return;
+
 	power_supply_changed(chip->chg_psy);
 }
 
@@ -652,6 +763,49 @@ static int smb_get_prop_health(struct smb_chip *chip, int *val)
 	return -EINVAL;
 }
 
+static int smb_get_charge_behaviour(struct smb_chip *chip, int *val)
+{
+	unsigned int stat;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + CHARGING_ENABLE_CMD, &stat);
+	if (rc < 0)
+		return rc;
+
+	if (stat & CHARGING_ENABLE_CMD_BIT)
+		*val = POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+	else
+		*val = POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+
+	return 0;
+}
+
+static int smb_set_charge_behaviour(struct smb_chip *chip, int val)
+{
+	unsigned int enable;
+	int rc;
+
+	switch (val) {
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+		enable = CHARGING_ENABLE_CMD_BIT;
+		break;
+	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+		enable = 0;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	rc = regmap_update_bits(chip->regmap,
+					chip->base + CHARGING_ENABLE_CMD,
+					CHARGING_ENABLE_CMD_BIT, enable);
+	if (rc < 0)
+		return rc;
+
+	power_supply_changed(chip->chg_psy);
+	return 0;
+}
+
 static int smb_get_property(struct power_supply *psy,
 			     enum power_supply_property psp,
 			     union power_supply_propval *val)
@@ -668,6 +822,8 @@ static int smb_get_property(struct power_supply *psy,
 		return 0;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_get_current_limit(chip, &val->intval);
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		return smb_get_configured_current_limit(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		return smb_get_current_now(chip, &val->intval);
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
@@ -682,6 +838,8 @@ static int smb_get_property(struct power_supply *psy,
 		return smb_get_prop_usb_online(chip, &val->intval);
 	case POWER_SUPPLY_PROP_STATUS:
 		return smb_get_prop_status(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return smb_get_charge_behaviour(chip, &val->intval);
 	case POWER_SUPPLY_PROP_HEALTH:
 		return smb_get_prop_health(chip, &val->intval);
 	case POWER_SUPPLY_PROP_USB_TYPE:
@@ -699,11 +857,13 @@ static int smb_set_property(struct power_supply *psy,
 	struct smb_chip *chip = power_supply_get_drvdata(psy);
 
 	switch (psp) {
-	case POWER_SUPPLY_PROP_STATUS:
-		return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
-					  USBIN_SUSPEND_BIT, !val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
-		return smb_set_current_limit(chip, val->intval);
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		if (val->intval < 0)
+			return -EINVAL;
+		return smb_set_user_current_limit(chip, val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return smb_set_charge_behaviour(chip, val->intval);
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -714,8 +874,9 @@ static int smb_property_is_writable(struct power_supply *psy,
 				     enum power_supply_property psp)
 {
 	switch (psp) {
-	case POWER_SUPPLY_PROP_STATUS:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 		return 1;
 	default:
 		return 0;
@@ -774,6 +935,8 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
 static const struct power_supply_desc smb_psy_desc = {
 	.name = "SMB2_charger",
 	.type = POWER_SUPPLY_TYPE_USB,
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
@@ -1074,6 +1237,7 @@ static int smb_probe(struct platform_device *pdev)
 	chip->gen = match_data->gen;
 	chip->current_step_size_ua = match_data->current_step_size_ua;
 	chip->current_limit_max_ua = match_data->current_limit_max_ua;
+	mutex_init(&chip->current_limit_lock);
 
 	dev_info(chip->dev, "Generation %s\n", chip->gen == SMB2 ? "SMB2" : "SMB5");
 
@@ -1094,6 +1258,12 @@ static int smb_probe(struct platform_device *pdev)
 	if (!desc->name)
 		return -ENOMEM;
 
+	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
+					  smb_status_change_work);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "Failed to init status change work\n");
+
 	chip->chg_psy =
 		devm_power_supply_register(chip->dev, desc, &supply_config);
 	if (IS_ERR(chip->chg_psy))
@@ -1106,12 +1276,6 @@ static int smb_probe(struct platform_device *pdev)
 				     "Failed to get battery info\n");
 	if (chip->batt_info->constant_charge_current_max_ua == -EINVAL)
 		chip->batt_info->constant_charge_current_max_ua = DCP_CURRENT_UA;
-
-	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
-					  smb_status_change_work);
-	if (rc)
-		return dev_err_probe(chip->dev, rc,
-				     "Failed to init status change work\n");
 
 	rc = (chip->batt_info->voltage_max_design_uv - 3487500) / 7500 + 1;
 	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
