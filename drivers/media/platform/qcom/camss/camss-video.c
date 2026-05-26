@@ -80,6 +80,30 @@ static struct v4l2_subdev *video_remote_subdev(struct camss_video *video,
 	return media_entity_to_v4l2_subdev(remote->entity);
 }
 
+static int video_get_subdev_mbus_code(struct camss_video *video, u32 *mcode)
+{
+	struct v4l2_subdev_format fmt = {
+		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+	};
+	struct v4l2_subdev *subdev;
+	u32 pad;
+	int ret;
+
+	subdev = video_remote_subdev(video, &pad);
+	if (subdev == NULL)
+		return -EPIPE;
+
+	fmt.pad = pad;
+
+	ret = v4l2_subdev_call(subdev, pad, get_fmt, NULL, &fmt);
+	if (ret)
+		return ret;
+
+	*mcode = fmt.format.code;
+
+	return 0;
+}
+
 static int video_get_subdev_format(struct camss_video *video,
 				   struct v4l2_format *format)
 {
@@ -360,6 +384,7 @@ static int video_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 	struct camss_video *video = video_drvdata(file);
 	int i, j, k;
 	u32 mcode = f->mbus_code;
+	int ret;
 
 	if (f->type != video->type)
 		return -EINVAL;
@@ -367,17 +392,20 @@ static int video_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 	if (f->index >= video->nformats)
 		return -EINVAL;
 
+	if (mcode == 0 && video_is_registered(&video->vdev)) {
+		ret = video_get_subdev_mbus_code(video, &mcode);
+		if (ret)
+			mcode = 0;
+	}
+
 	/*
 	 * Find index "i" of "k"th unique pixelformat in formats array.
 	 *
 	 * If f->mbus_code passed to video_enum_fmt() is not zero, a device
 	 * with V4L2_CAP_IO_MC capability restricts enumeration to only the
 	 * pixel formats that can be produced from that media bus code.
-	 * This is implemented by skipping video->formats[] entries with
-	 * code != f->mbus_code (if f->mbus_code is not zero).
-	 * If the f->mbus_code passed to video_enum_fmt() is not supported,
-	 * -EINVAL is returned.
-	 * If f->mbus_code is zero, all the pixel formats are enumerated.
+	 * If f->mbus_code is zero and a linked remote subdev has an active
+	 * format, use that media bus code; otherwise enumerate all formats.
 	 */
 	k = -1;
 	for (i = 0; i < video->nformats; i++) {
@@ -458,9 +486,19 @@ static int __video_try_fmt(struct camss_video *video, struct v4l2_format *f)
 	struct v4l2_plane_pix_format *p;
 	u32 bytesperline[3] = { 0 };
 	u32 sizeimage[3] = { 0 };
+	struct v4l2_format format = *f;
 	u32 width, height;
 	u32 bpl, lines;
+	int ret;
 	int i, j;
+
+	if (video_is_registered(&video->vdev)) {
+		ret = video_get_subdev_format(video, &format);
+		if (!ret) {
+			*f = format;
+			return 0;
+		}
+	}
 
 	pix_mp = &f->fmt.pix_mp;
 

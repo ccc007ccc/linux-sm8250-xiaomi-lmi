@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/i2c/ovti,ov13b10.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: OmniVision OV13B10 CMOS image sensor
+
+maintainers:
+  - Arec Kao <arec.kao@intel.com>
+
+description:
+  The OmniVision OV13B10 is a 13 megapixel CMOS image sensor controlled through
+  an I2C-compatible SCCB bus. Image data is transmitted through a MIPI CSI-2
+  output using two or four data lanes.
+
+allOf:
+  - $ref: /schemas/media/video-interface-devices.yaml#
+
+properties:
+  compatible:
+    const: ovti,ov13b10
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+    description: External input clock
+
+  reset-gpios:
+    description:
+      GPIO connected to the XSHUTDN pin, which is physically active low.
+    maxItems: 1
+
+  avdd-supply:
+    description: Analog power supply
+
+  dovdd-supply:
+    description: I/O power supply
+
+  dvdd-supply:
+    description: Digital core power supply
+
+  orientation: true
+  rotation: true
+
+  port:
+    $ref: /schemas/graph.yaml#/$defs/port-base
+    additionalProperties: false
+
+    properties:
+      endpoint:
+        $ref: /schemas/media/video-interfaces.yaml#
+        unevaluatedProperties: false
+
+        properties:
+          data-lanes:
+            oneOf:
+              - items:
+                  - const: 1
+                  - const: 2
+              - items:
+                  - const: 1
+                  - const: 2
+                  - const: 3
+                  - const: 4
+
+          link-frequencies:
+            contains:
+              const: 560000000
+
+        required:
+          - data-lanes
+          - link-frequencies
+
+    required:
+      - endpoint
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - reset-gpios
+  - avdd-supply
+  - dovdd-supply
+  - dvdd-supply
+  - port
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        camera@36 {
+            compatible = "ovti,ov13b10";
+            reg = <0x36>;
+
+            clocks = <&ov13b10_clk>;
+            reset-gpios = <&gpio1 7 GPIO_ACTIVE_LOW>;
+
+            avdd-supply = <&ov13b10_avdd_2v8>;
+            dovdd-supply = <&ov13b10_dovdd_1v8>;
+            dvdd-supply = <&ov13b10_dvdd_1v2>;
+
+            port {
+                ov13b10_out: endpoint {
+                    remote-endpoint = <&csi2_in>;
+                    data-lanes = <1 2 3 4>;
+                    link-frequencies = /bits/ 64 <560000000>;
+                };
+            };
+        };
+    };
+...

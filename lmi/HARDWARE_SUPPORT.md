@@ -4,7 +4,7 @@
 
 本表记录 Redmi K30 Pro / POCO F2 Pro（`lmi`）在当前主线 Linux 适配中的硬件状态。状态只按已经在本项目镜像或主线代码路径中实机验证过的结果标记；未验证或只存在 Android downstream 参考的项目不视为已支持。
 
-更长的 bring-up 记录、warning 解释和调制解调器诊断过程见 [`ADAPTATION_NOTES.md`](ADAPTATION_NOTES.md)。使用和编译流程见 [`docs/`](docs/)。
+更长的 bring-up 记录、warning 解释和调制解调器诊断过程见 [`ADAPTATION_NOTES.md`](ADAPTATION_NOTES.md)。摄像头适配记录见 [`CAMERA_BRINGUP.md`](CAMERA_BRINGUP.md)。使用和编译流程见 [`docs/`](docs/)。
 
 ## 状态标记
 
@@ -25,7 +25,7 @@
 | Wi-Fi | 已支持 | QCA6391 Wi-Fi 已验证 `ath11k_pci`、真实 WLAN MAC、自动连接和 SSH。 | 需要设备匹配 firmware；Android/发行版网络策略仍可能影响自动连接。 |
 | 蓝牙 | 已支持 | QCA6391 UART Bluetooth 已验证固件加载、public address 设置、BR/EDR 与 LE 基础能力。 | 若未来找到独立原厂 BT address 来源，可替换当前支持层设置策略。 |
 | USB / Type-C | 部分支持 | DWC3 gadget、USB ACM 串口、Type-C 基础枚举和标准 PD sink 已验证；标准 PD 曾验证到 9V/2A。 | USB host/OTG、完整角色切换和更多 PD 场景仍需继续验证。 |
-| 电池 / 充电 | 部分支持 | PM8150B Type-C/TCPM、SMB5 charger 和 gen4 fuel-gauge 已能暴露 USB 输入、电池容量、电压、电流、温度和状态；当前代码提供 `charge_behaviour`、`input_current_limit` 目标值、`current_max` 有效值和 `lmi-power` 保守限充服务，75% 停充、70% 恢复、再到 75% 停充已实机验证。 | 仍需更长时间观察容量/温度保持；Xiaomi 33W 私有快充、BQ2597x 充电泵、完整电池曲线和硬件旁路供电控制未接入。 |
+| 电池 / 充电 | 部分支持 | PM8150B Type-C/TCPM、SMB5 charger 和 gen4 fuel-gauge 已能暴露 USB 输入、电池容量、电压、电流、温度和状态；当前代码提供 `charge_behaviour`、`input_current_limit` 目标值、`current_max` 有效值和 `lmi-power` 保守限充服务，默认 70% 停充、65% 恢复，停充状态和策略输出已实机核对。 | 仍需更长时间观察容量/温度保持；Xiaomi 33W 私有快充、BQ2597x 充电泵、完整电池曲线和硬件旁路供电控制未接入。 |
 | 主扬声器 | 已支持 | `nxp,tfa9874` 主扬声器路线已验证可播放 48 kHz S16_LE stereo 测试音。 | NXP/Goodix 专用 DSP/profile/calibration 与安全音量策略仍待完善；测试应先用低振幅短音。 |
 | 听筒 | 已支持 | WCD9380 RX / EAR 路线已验证真实听筒播放。 | 音量曲线和普通播放器默认参数仍需继续打磨。 |
 | 3.5mm HPH | 部分支持 | WCD9380 HPHL/HPHR 播放、耳机插入状态和阻抗读取已验证。 | 当前没有耳麦测试环境；3.5mm 耳麦麦克风未验证。 |
@@ -36,6 +36,7 @@
 | 传感器 | 待适配 | 需要 SDSP remoteproc、签名 SDSP firmware 和传感器用户态栈。 | 当前未启用，不作为 release 基础能力。 |
 | 触觉反馈 | 待适配 | 硬件为 AW8697 类 haptics。 | 未接入 haptics/input/ff 测试。 |
 | 闪光灯 LED | 待适配 | PM8150L SPMI flash LED 硬件已知。 | 未接入 LED class 测试。 |
+| 摄像头 | 部分支持（bring-up） | 第一阶段只接入后置超广角 OV13B10；CAMSS/CCI power-domain 问题已通过内置 SM8250 CAMCC 修复，OV13B10 已在 `&cci0_i2c1` 地址 `0x10` probe 成功并出现 `/dev/v4l-subdev24`，当前已通过标准 media/V4L2 ioctl 路线跑通 `/dev/video3` raw Bayer `pgAA` stream，驱动暴露的 6 个 4-lane 模式（4208x3120/4160x3120/4160x2340/2104x1560/2080x1170/1364x768）均已实机 raw capture 验证，并可通过标准 frame-size enumeration 选择模式；frame interval、crop selection、orientation/rotation、media route、video querycap、控制项扩展元数据（含 `Unit Cell Size` 1120nm x 1120nm）、video frame-size probing 和按 `mbus_code = 0x300a` 过滤后的 format enumeration 等标准发现信息可查询，并用纯 Python ioctl 网页预览脚本抓到彩色 PNG/HTTP stream。 | 当前只是 raw RDI/Bayer 路径，SM8250 mainline CAMSS 仍无完整 ISP/YUV 输出；未过滤的 `VIDIOC_ENUM_FMT` 中出现的 YUYV/UYVY 等格式是 CAMSS RDI 通用直通格式列表，按当前 OV13B10 RAW10 media-bus code 过滤后只剩 `pgAA`，不代表 ISP 已输出浏览器可直接消费的 YUV；`/dev/video3` 的 frame-size enum 是 CAMSS 通用连续范围，离散模式和帧间隔应以 OV13B10 subdev 为准；AE/AWB/ISP、标准相机栈和浏览器 `getUserMedia` 级发现尚未完成；前摄升降机构和其他后摄暂不启用。 |
 | SBA-MUX / 模拟附件 | 待适配 | FSA4480 可能用于 USB-C analog/audio accessory mux。 | 当前 USB gadget/Type-C 基础链路不依赖它。 |
 | 充电泵 / 私有快充 | 暂不支持 | BQ2597x 充电泵和 Xiaomi 私有快充不是当前阶段目标。 | 服务器使用目标优先稳定普通供电与可见电池状态。 |
 
@@ -53,7 +54,7 @@
 
 lmi 作为长期运行的小型服务器使用时，优先目标是稳定供电、电池状态可见、温度/安全信息可见和电池寿命。当前普通 Type-C/PD 路径能稳定供电即可作为基线；33W Xiaomi 私有快充、BQ2597x 充电泵和可能的硬件旁路供电控制需要更多私有策略或硬件验证，不作为当前 release 必备功能。
 
-当前代码提供标准 `charge_behaviour`、`input_current_limit` 目标值和 `current_max` 有效值；rootfs 支持层的 `lmi-power` 默认使用 70%～75% 容量窗口、低输入电流和温度保护来降低长期满电、高温和大电流压力。75% 停充、压力放电到 70% 后恢复充电、再回到 75% 停充的往返已经实机验证。Linux 没有通用“电源直供/绕过电池”开关；这类能力必须由 PMIC/charger 硬件和对应驱动暴露，因此当前策略不等同于硬件旁路供电，也不能完全消除电池老化。
+当前代码提供标准 `charge_behaviour`、`input_current_limit` 目标值和 `current_max` 有效值；rootfs 支持层的 `lmi-power` 默认使用 65%～70% 容量窗口、低输入电流和温度保护来降低长期满电、高温和大电流压力。当前 70% 停充状态和策略输出已实机核对。Linux 没有通用“电源直供/绕过电池”开关；这类能力必须由 PMIC/charger 硬件和对应驱动暴露，因此当前策略不等同于硬件旁路供电，也不能完全消除电池老化。
 
 ## 调制解调器当前结论
 
