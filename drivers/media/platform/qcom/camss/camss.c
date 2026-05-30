@@ -1924,12 +1924,12 @@ static const struct camss_subdev_resources vfe_res_8250[] = {
 		.reg = { "vfe1" },
 		.interrupt = { "vfe1" },
 		.vfe = {
-			.line_num = 3,
+			.line_num = 4,
 			.has_pd = true,
 			.pd_name = "ife1",
 			.hw_ops = &vfe_ops_480,
 			.formats_rdi = &vfe_formats_rdi_845,
-			.formats_pix = &vfe_formats_pix_845
+			.formats_pix = &vfe_formats_pix_8250
 		}
 	},
 	/* VFE2 (lite) */

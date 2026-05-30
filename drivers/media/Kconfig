@@ -234,6 +234,9 @@ if MEDIA_TEST_SUPPORT
 source "drivers/media/test-drivers/Kconfig"
 endif
 
+# lmi: vendored v4l2loopback for the userspace software-ISP camera node
+source "drivers/media/v4l2loopback/Kconfig"
+
 source "drivers/media/firewire/Kconfig"
 
 # Common driver options

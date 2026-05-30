@@ -283,6 +283,16 @@ const struct camss_formats vfe_formats_pix_845 = {
 	.formats = formats_rdi_845
 };
 
+static const struct camss_format_info formats_pix_8250[] = {
+	{ MEDIA_BUS_FMT_SGRBG10_1X10, 10, V4L2_PIX_FMT_SGRBG10, 1,
+	  PER_PLANE_DATA(0, 1, 1, 1, 1, 16) },
+};
+
+const struct camss_formats vfe_formats_pix_8250 = {
+	.nformats = ARRAY_SIZE(formats_pix_8250),
+	.formats = formats_pix_8250
+};
+
 static u32 vfe_src_pad_code(struct vfe_line *line, u32 sink_code,
 			    unsigned int index, u32 src_req_code)
 {
@@ -441,6 +451,18 @@ u32 vfe_hw_version(struct vfe_device *vfe)
 	return hw_version;
 }
 
+static void vfe_update_wm_addrs(struct vfe_device *vfe,
+					struct vfe_output *output,
+					struct camss_buffer *buf,
+					struct vfe_line *line)
+{
+	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
+	unsigned int i;
+
+	for (i = 0; i < output->wm_num; i++)
+		ops->vfe_wm_update(vfe, output->wm_idx[i], buf->addr[i], line);
+}
+
 /*
  * vfe_buf_done - Process write master done interrupt
  * @vfe: VFE Device
@@ -448,22 +470,32 @@ u32 vfe_hw_version(struct vfe_device *vfe)
  */
 void vfe_buf_done(struct vfe_device *vfe, int wm)
 {
-	struct vfe_line *line = &vfe->line[vfe->wm_output_map[wm]];
 	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
 	struct camss_buffer *ready_buf;
 	struct vfe_output *output;
+	struct vfe_line *line;
 	unsigned long flags;
+	enum vfe_line_id line_id;
 	u32 index;
 	u64 ts = ktime_get_ns();
 
 	spin_lock_irqsave(&vfe->output_lock, flags);
 
-	if (vfe->wm_output_map[wm] == VFE_LINE_NONE) {
+	if (wm < 0 || wm >= ARRAY_SIZE(vfe->wm_output_map)) {
 		dev_err_ratelimited(vfe->camss->dev,
-				    "Received wm done for unmapped index\n");
+				    "Received wm done for invalid index\n");
 		goto out_unlock;
 	}
-	output = &vfe->line[vfe->wm_output_map[wm]].output;
+
+	line_id = vfe->wm_output_map[wm];
+	if (line_id < VFE_LINE_RDI0 || line_id >= vfe->res->line_num) {
+		dev_err_ratelimited(vfe->camss->dev,
+				    "Received wm done for unmapped line\n");
+		goto out_unlock;
+	}
+
+	line = &vfe->line[line_id];
+	output = &line->output;
 
 	ready_buf = output->buf[0];
 	if (!ready_buf) {
@@ -483,9 +515,7 @@ void vfe_buf_done(struct vfe_device *vfe, int wm)
 	output->buf[index] = vfe_buf_get_pending(output);
 
 	if (output->buf[index]) {
-		ops->vfe_wm_update(vfe, output->wm_idx[0],
-				   output->buf[index]->addr[0],
-				   line);
+		vfe_update_wm_addrs(vfe, output, output->buf[index], line);
 		ops->reg_update(vfe, line->id);
 	} else {
 		output->gen2.active_num--;
@@ -542,15 +572,15 @@ int vfe_enable_output_v2(struct vfe_line *line)
 	output->wait_reg_update = 0;
 	reinit_completion(&output->reg_update);
 
-	ops->vfe_wm_start(vfe, output->wm_idx[0], line);
+	for (i = 0; i < output->wm_num; i++)
+		ops->vfe_wm_start(vfe, output->wm_idx[i], line);
 
 	for (i = 0; i < CAMSS_INIT_BUF_COUNT; i++) {
 		output->buf[i] = vfe_buf_get_pending(output);
 		if (!output->buf[i])
 			break;
 		output->gen2.active_num++;
-		ops->vfe_wm_update(vfe, output->wm_idx[0],
-				   output->buf[i]->addr[0], line);
+		vfe_update_wm_addrs(vfe, output, output->buf[i], line);
 		ops->reg_update(vfe, line->id);
 	}
 
@@ -585,8 +615,7 @@ int vfe_queue_buffer_v2(struct camss_video *vid,
 	if (output->state == VFE_OUTPUT_ON &&
 	    output->gen2.active_num < 2) {
 		output->buf[output->gen2.active_num++] = buf;
-		ops->vfe_wm_update(vfe, output->wm_idx[0],
-				   buf->addr[0], line);
+		vfe_update_wm_addrs(vfe, output, buf, line);
 		ops->reg_update(vfe, line->id);
 	} else {
 		vfe_buf_add_pending(output, buf);
@@ -609,6 +638,10 @@ int vfe_enable_v2(struct vfe_line *line)
 	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
 	int ret;
 
+	ret = vfe_get_output_v2(line);
+	if (ret < 0)
+		return ret;
+
 	mutex_lock(&vfe->stream_lock);
 
 	if (vfe->res->hw_ops->enable_irq)
@@ -617,10 +650,6 @@ int vfe_enable_v2(struct vfe_line *line)
 	vfe->stream_count++;
 
 	mutex_unlock(&vfe->stream_lock);
-
-	ret = vfe_get_output_v2(line);
-	if (ret < 0)
-		goto error_get_output;
 
 	ret = vfe_enable_output_v2(line);
 	if (ret < 0)
@@ -633,7 +662,6 @@ int vfe_enable_v2(struct vfe_line *line)
 error_enable_output:
 	vfe_put_output(line);
 
-error_get_output:
 	mutex_lock(&vfe->stream_lock);
 
 	vfe->stream_count--;
@@ -649,11 +677,39 @@ error_get_output:
  *
  * Return 0 on success or a negative error code otherwise
  */
+static bool vfe_is_semiplanar_format(u32 pixelformat)
+{
+	switch (pixelformat) {
+	case V4L2_PIX_FMT_NV12:
+	case V4L2_PIX_FMT_NV21:
+	case V4L2_PIX_FMT_NV16:
+	case V4L2_PIX_FMT_NV61:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void vfe_release_output_wms(struct vfe_device *vfe,
+				   struct vfe_output *output,
+				   unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		vfe_release_wm(vfe, output->wm_idx[i]);
+
+	output->wm_num = 0;
+}
+
 int vfe_get_output_v2(struct vfe_line *line)
 {
 	struct vfe_device *vfe = to_vfe(line);
+	struct v4l2_format *f = &line->video_out.active_fmt;
 	struct vfe_output *output;
 	unsigned long flags;
+	unsigned int i;
+	int wm_idx;
 
 	spin_lock_irqsave(&vfe->output_lock, flags);
 
@@ -663,14 +719,25 @@ int vfe_get_output_v2(struct vfe_line *line)
 		goto error;
 	}
 
-	output->wm_num = 1;
+	if (line->id == VFE_LINE_PIX &&
+	    vfe_is_semiplanar_format(f->fmt.pix_mp.pixelformat))
+		output->wm_num = 2;
+	else
+		output->wm_num = 1;
 
-	/* Correspondence between VFE line number and WM number.
-	 * line 0 -> RDI 0, line 1 -> RDI1, line 2 -> RDI2, line 3 -> PIX/RDI3
-	 * Note this 1:1 mapping will not work for PIX streams.
-	 */
-	output->wm_idx[0] = line->id;
-	vfe->wm_output_map[line->id] = line->id;
+	if (line->id != VFE_LINE_PIX) {
+		output->wm_idx[0] = line->id;
+		vfe->wm_output_map[line->id] = line->id;
+	} else {
+		for (i = 0; i < output->wm_num; i++) {
+			wm_idx = vfe_reserve_wm(vfe, line->id);
+			if (wm_idx < 0) {
+				dev_err(vfe->camss->dev, "Can not reserve wm\n");
+				goto error_get_wm;
+			}
+			output->wm_idx[i] = wm_idx;
+		}
+	}
 
 	output->drop_update_idx = 0;
 
@@ -678,11 +745,28 @@ int vfe_get_output_v2(struct vfe_line *line)
 
 	return 0;
 
+error_get_wm:
+	vfe_release_output_wms(vfe, output, i);
+	output->state = VFE_OUTPUT_OFF;
 error:
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
-	output->state = VFE_OUTPUT_OFF;
 
 	return -EINVAL;
+}
+
+void vfe_reissue_reg_update(struct v4l2_subdev *sd)
+{
+	struct vfe_line *line = v4l2_get_subdevdata(sd);
+	struct vfe_device *vfe = to_vfe(line);
+	const struct vfe_hw_ops *ops = vfe->res->hw_ops;
+	unsigned long flags;
+
+	if (!ops->reg_update || line->output.state != VFE_OUTPUT_ON)
+		return;
+
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	ops->reg_update(vfe, line->id);
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
 }
 
 int vfe_reset(struct vfe_device *vfe)
@@ -711,6 +795,7 @@ static void vfe_init_outputs(struct vfe_device *vfe)
 		struct vfe_output *output = &vfe->line[i].output;
 
 		output->state = VFE_OUTPUT_OFF;
+		output->wm_num = 0;
 		output->buf[0] = NULL;
 		output->buf[1] = NULL;
 		INIT_LIST_HEAD(&output->pending_bufs);
@@ -794,12 +879,10 @@ int vfe_put_output(struct vfe_line *line)
 	struct vfe_device *vfe = to_vfe(line);
 	struct vfe_output *output = &line->output;
 	unsigned long flags;
-	unsigned int i;
 
 	spin_lock_irqsave(&vfe->output_lock, flags);
 
-	for (i = 0; i < output->wm_num; i++)
-		vfe_release_wm(vfe, output->wm_idx[i]);
+	vfe_release_output_wms(vfe, output, output->wm_num);
 
 	output->state = VFE_OUTPUT_OFF;
 
@@ -1114,6 +1197,10 @@ int vfe_get(struct vfe_device *vfe)
 		vfe_init_outputs(vfe);
 
 		vfe->res->hw_ops->hw_version(vfe);
+	} else if (vfe->stream_count == 0) {
+		ret = vfe_set_clock_rates(vfe);
+		if (ret < 0)
+			goto error_pm_domain;
 	} else {
 		ret = vfe_check_clock_rates(vfe);
 		if (ret < 0)
@@ -1346,9 +1433,8 @@ static void vfe_try_format(struct vfe_line *line,
 			if (fmt->code == line->formats[i].code)
 				break;
 
-		/* If not found, use UYVY as default */
 		if (i >= line->nformats)
-			fmt->code = MEDIA_BUS_FMT_UYVY8_1X16;
+			fmt->code = line->formats[0].code;
 
 		fmt->width = clamp_t(u32, fmt->width, 1, 8191);
 		fmt->height = clamp_t(u32, fmt->height, 1, 8191);

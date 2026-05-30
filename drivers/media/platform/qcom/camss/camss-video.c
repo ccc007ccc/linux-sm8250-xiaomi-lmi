@@ -271,6 +271,8 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct media_entity *entity;
 	struct media_pad *pad;
 	struct v4l2_subdev *subdev;
+	struct v4l2_subdev *enabled_subdevs[8];
+	unsigned int enabled_count = 0;
 	int ret;
 
 	ret = video_device_pipeline_alloc_start(vdev);
@@ -298,10 +300,29 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 
 		ret = v4l2_subdev_call(subdev, video, s_stream, 1);
 		if (ret < 0 && ret != -ENOIOCTLCMD)
-			goto error;
+			goto stop_subdevs;
+
+		if (ret != -ENOIOCTLCMD) {
+			if (enabled_count == ARRAY_SIZE(enabled_subdevs)) {
+				ret = -EPIPE;
+				goto stop_subdevs;
+			}
+			enabled_subdevs[enabled_count++] = subdev;
+		}
 	}
 
 	return 0;
+
+stop_subdevs:
+	while (enabled_count) {
+		int stop_ret;
+
+		subdev = enabled_subdevs[--enabled_count];
+		stop_ret = v4l2_subdev_call(subdev, video, s_stream, 0);
+		if (stop_ret && stop_ret != -ENOIOCTLCMD)
+			dev_warn(video->camss->dev,
+				 "Video pipeline rollback failed: %d\n", stop_ret);
+	}
 
 error:
 	video_device_pipeline_stop(vdev);

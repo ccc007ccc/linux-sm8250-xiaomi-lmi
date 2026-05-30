@@ -840,20 +840,18 @@ static void csid_try_format(struct csid_device *csid,
 
 		break;
 
-	case MSM_CSID_PAD_SRC:
+	default:
+		if (pad < MSM_CSID_PAD_FIRST_SRC || pad >= MSM_CSID_PADS_NUM)
+			break;
+
 		if (csid->testgen.nmodes == CSID_PAYLOAD_MODE_DISABLED ||
 		    csid->testgen_mode->cur.val == 0) {
-			/* Test generator is disabled, */
-			/* keep pad formats in sync */
 			u32 code = fmt->code;
 
 			*fmt = *__csid_get_format(csid, sd_state,
 						      MSM_CSID_PAD_SINK, which);
 			fmt->code = csid->res->hw_ops->src_pad_code(csid, fmt->code, 0, code);
 		} else {
-			/* Test generator is enabled, set format on source */
-			/* pad to allow test generator usage */
-
 			for (i = 0; i < csid->res->formats->nformats; i++)
 				if (csid->res->formats->formats[i].code == fmt->code)
 					break;

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0
+config V4L2LOOPBACK
+	bool "V4L2 loopback device (vendored for lmi software-ISP)"
+	depends on VIDEO_DEV
+	help
+	  Vendored copy of the out-of-tree v4l2loopback driver
+	  (https://github.com/umlaeute/v4l2loopback, GPL-2.0), built in-tree
+	  and statically (=y) because the lmi mainline kernel ships no loadable
+	  modules. It creates virtual V4L2 video devices: a userspace producer
+	  writes frames into the device and standard V4L2 consumers can read them
+	  back as a normal camera. PipeWire/browser getUserMedia is a separate
+	  validation target, not something this Kconfig option by itself proves.
+
+	  On lmi this exposes the OV13B10 RAW software-ISP output produced by
+	  lmi/scripts/lmi-camera-web-preview.py (--isp-sink loopback) as a
+	  standard colour camera node, without touching the distro rootfs and
+	  without faking anything on the truthful RAW /dev/video3.
+
+	  If unsure, say N.

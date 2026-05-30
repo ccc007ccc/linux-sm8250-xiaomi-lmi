@@ -923,6 +923,11 @@
 	status = "okay";
 };
 
+&venus {
+	firmware-name = "qcom/sm8250/xiaomi/lmi/venus.mbn";
+	status = "okay";
+};
+
 &usb_1 {
 	qcom,select-utmi-as-pipe-clk;
 	status = "okay";

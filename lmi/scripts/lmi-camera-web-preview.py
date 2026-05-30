@@ -9,6 +9,7 @@ import mmap
 import os
 import select
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -24,6 +25,7 @@ MEDIA_LNK_FL_IMMUTABLE = 2
 MEDIA_LNK_FL_INTERFACE_LINK = 1 << 28
 MEDIA_BUS_FMT_SGRBG10_1X10 = 0x300a
 V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE = 9
+V4L2_BUF_TYPE_VIDEO_OUTPUT = 2
 V4L2_MEMORY_MMAP = 1
 V4L2_FIELD_NONE = 1
 V4L2_SUBDEV_FORMAT_ACTIVE = 1
@@ -382,8 +384,28 @@ class V4L2PixFormatMPlane(ctypes.Structure):
     ]
 
 
+class V4L2PixFormat(ctypes.Structure):
+    _layout_ = "ms"
+    _pack_ = 1
+    _fields_ = [
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("pixelformat", ctypes.c_uint32),
+        ("field", ctypes.c_uint32),
+        ("bytesperline", ctypes.c_uint32),
+        ("sizeimage", ctypes.c_uint32),
+        ("colorspace", ctypes.c_uint32),
+        ("priv", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("enc", ctypes.c_uint32),
+        ("quantization", ctypes.c_uint32),
+        ("xfer_func", ctypes.c_uint32),
+    ]
+
+
 class FormatUnion(ctypes.Union):
     _fields_ = [
+        ("pix", V4L2PixFormat),
         ("pix_mp", V4L2PixFormatMPlane),
         ("raw_data", ctypes.c_uint8 * 200),
     ]
@@ -649,6 +671,37 @@ def clamp(value, minimum, maximum):
 
 def float_clamp(value, minimum, maximum):
     return max(minimum, min(maximum, float(value)))
+
+
+def parse_ccm(value):
+    items = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if len(items) != 9:
+        raise argparse.ArgumentTypeError("CCM must contain 9 comma-separated numbers")
+    return items
+
+
+def luma_summary(values):
+    if not values:
+        return {
+            "samples": 0,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p70": 0.0,
+            "p90": 0.0,
+        }
+    ordered = sorted(values)
+    count = len(ordered)
+
+    def percentile(fraction):
+        return ordered[min(count - 1, max(0, int(round((count - 1) * fraction))))]
+
+    return {
+        "samples": count,
+        "mean": sum(ordered) / count,
+        "p50": percentile(0.50),
+        "p70": percentile(0.70),
+        "p90": percentile(0.90),
+    }
 
 
 class SensorControls:
@@ -1304,6 +1357,7 @@ class PreviewState:
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.frame = None
+        self.raw = None
         self.content_type = "image/png"
         self.status = {"state": "starting", "frames": 0, "error": None, "updated_at": None}
         self.stop = threading.Event()
@@ -1762,6 +1816,17 @@ def sampled_mean(data, max_samples=4096):
     return total / max(1, count)
 
 
+def gray_luma_stats(data, max_samples=8192):
+    if not data:
+        return luma_summary([])
+    step = max(1, len(data) // max_samples)
+    return luma_summary([data[index] for index in range(0, len(data), step)])
+
+
+def metered_luma(stats, metric):
+    return stats.get(metric, stats.get("mean", 0.0))
+
+
 def choose_raw_format(raw_format, raw_len, width, height, stride):
     if raw_format != "auto":
         return raw_format
@@ -1880,6 +1945,122 @@ def rgb_to_png(rgb, width, height, level):
     ) + png_chunk("IDAT", zlib.compress(bytes(rows), max(0, min(9, level)))) + png_chunk("IEND", b"")
 
 
+def rgb_to_nv12(rgb, width, height):
+    out_width = width & ~1
+    out_height = height & ~1
+    if out_width < 2 or out_height < 2:
+        raise RuntimeError(f"preview too small for NV12: {width}x{height}")
+
+    y_plane = bytearray(out_width * out_height)
+    uv_plane = bytearray(out_width * (out_height // 2))
+    for y in range(out_height):
+        src_row = y * width * 3
+        dst_row = y * out_width
+        for x in range(out_width):
+            src = src_row + x * 3
+            r = rgb[src]
+            g = rgb[src + 1]
+            b = rgb[src + 2]
+            y_plane[dst_row + x] = clamp((77 * r + 150 * g + 29 * b) >> 8, 0, 255)
+
+    for y in range(0, out_height, 2):
+        uv_row = (y // 2) * out_width
+        for x in range(0, out_width, 2):
+            r_sum = g_sum = b_sum = 0
+            for dy in (0, 1):
+                src_row = (y + dy) * width * 3
+                for dx in (0, 1):
+                    src = src_row + (x + dx) * 3
+                    r_sum += rgb[src]
+                    g_sum += rgb[src + 1]
+                    b_sum += rgb[src + 2]
+            r = r_sum >> 2
+            g = g_sum >> 2
+            b = b_sum >> 2
+            uv = uv_row + x
+            uv_plane[uv] = clamp(((-43 * r - 85 * g + 128 * b) >> 8) + 128, 0, 255)
+            uv_plane[uv + 1] = clamp(((128 * r - 107 * g - 21 * b) >> 8) + 128, 0, 255)
+
+    return y_plane + uv_plane, out_width, out_height
+
+
+def rgb_to_yuyv(rgb, src_width, src_height, out_width, out_height, stride=0):
+    """Pack source RGB (src_width x src_height) into packed YUYV (YUY2, 4:2:2)
+    at out_width x out_height, nearest-neighbour resampled, honouring the V4L2
+    node's negotiated row stride (bytesperline). Macropixel = Y0 U Y1 V over a
+    horizontal pixel pair, BT.601 limited-range to match rgb_to_nv12()."""
+    out_width &= ~1
+    if out_width < 2 or out_height < 1 or src_width < 1 or src_height < 1:
+        raise RuntimeError(f"invalid YUYV geometry {src_width}x{src_height}->{out_width}x{out_height}")
+    row_bytes = out_width * 2
+    stride = stride or row_bytes
+    out = bytearray(stride * out_height)
+    for ty in range(out_height):
+        sy = (ty * src_height) // out_height
+        src_row = sy * src_width * 3
+        dst = ty * stride
+        x = 0
+        while x < out_width:
+            sx0 = (x * src_width) // out_width
+            sx1 = ((x + 1) * src_width) // out_width
+            s0 = src_row + sx0 * 3
+            s1 = src_row + sx1 * 3
+            r0 = rgb[s0]; g0 = rgb[s0 + 1]; b0 = rgb[s0 + 2]
+            r1 = rgb[s1]; g1 = rgb[s1 + 1]; b1 = rgb[s1 + 2]
+            y0 = (77 * r0 + 150 * g0 + 29 * b0) >> 8
+            y1 = (77 * r1 + 150 * g1 + 29 * b1) >> 8
+            ar = (r0 + r1) >> 1
+            ag = (g0 + g1) >> 1
+            ab = (b0 + b1) >> 1
+            u = (((-43 * ar - 85 * ag + 128 * ab) >> 8) + 128)
+            v = (((128 * ar - 107 * ag - 21 * ab) >> 8) + 128)
+            out[dst] = y0 if y0 < 256 else 255
+            out[dst + 1] = 0 if u < 0 else (255 if u > 255 else u)
+            out[dst + 2] = y1 if y1 < 256 else 255
+            out[dst + 3] = 0 if v < 0 else (255 if v > 255 else v)
+            dst += 4
+            x += 2
+    return bytes(out)
+
+
+def rgb_to_nv12_scaled(rgb, src_width, src_height, out_width, out_height, stride=0):
+    """Pack source RGB into NV12 (4:2:0) at out_width x out_height, nearest
+    resampled, honouring Y/UV row stride. Mirrors rgb_to_nv12() colour math."""
+    out_width &= ~1
+    out_height &= ~1
+    if out_width < 2 or out_height < 2 or src_width < 1 or src_height < 1:
+        raise RuntimeError(f"invalid NV12 geometry {src_width}x{src_height}->{out_width}x{out_height}")
+    stride = stride or out_width
+    y_plane = bytearray(stride * out_height)
+    uv_plane = bytearray(stride * (out_height // 2))
+    sx_for = [((x * src_width) // out_width) * 3 for x in range(out_width)]
+    for ty in range(out_height):
+        sy = (ty * src_height) // out_height
+        src_row = sy * src_width * 3
+        dst_row = ty * stride
+        for x in range(out_width):
+            s = src_row + sx_for[x]
+            r = rgb[s]; g = rgb[s + 1]; b = rgb[s + 2]
+            yv = (77 * r + 150 * g + 29 * b) >> 8
+            y_plane[dst_row + x] = yv if yv < 256 else 255
+    for ty in range(0, out_height, 2):
+        uv_row = (ty // 2) * stride
+        sy = (ty * src_height) // out_height
+        src_row = sy * src_width * 3
+        for x in range(0, out_width, 2):
+            s0 = src_row + sx_for[x]
+            s1 = src_row + sx_for[x + 1]
+            r = (rgb[s0] + rgb[s1]) >> 1
+            g = (rgb[s0 + 1] + rgb[s1 + 1]) >> 1
+            b = (rgb[s0 + 2] + rgb[s1 + 2]) >> 1
+            u = (((-43 * r - 85 * g + 128 * b) >> 8) + 128)
+            v = (((128 * r - 107 * g - 21 * b) >> 8) + 128)
+            uv = uv_row + x
+            uv_plane[uv] = 0 if u < 0 else (255 if u > 255 else u)
+            uv_plane[uv + 1] = 0 if v < 0 else (255 if v > 255 else v)
+    return bytes(y_plane + uv_plane)
+
+
 def gray_to_rgb_preview(gray, width, height, preview_width):
     source_width = width // 2
     source_height = height // 2
@@ -1949,27 +2130,58 @@ def raw_to_rgb_preview(data, width, height, raw_format, stride, shift, preview_w
     return rgb, out_width, out_height, raw_format, luma
 
 
-def rgb_stats(rgb):
+def rgb_stats(rgb, min_luma=0, max_luma=255, clip_margin=0):
+    red = green = blue = 0
+    selected_red = selected_green = selected_blue = 0
+    all_luma = []
+    selected_luma = []
+    selected = 0
     pixels = len(rgb) // 3
-    if pixels == 0:
-        return {"red_mean": 0.0, "green_mean": 0.0, "blue_mean": 0.0, "luma": 0.0}
-    red = 0
-    green = 0
-    blue = 0
-    luma = 0
     for index in range(0, len(rgb), 3):
         r = rgb[index]
         g = rgb[index + 1]
         b = rgb[index + 2]
+        y = (77 * r + 150 * g + 29 * b) >> 8
         red += r
         green += g
         blue += b
-        luma += (77 * r + 150 * g + 29 * b) >> 8
+        all_luma.append(y)
+        clipped = clip_margin and (
+            r <= clip_margin or g <= clip_margin or b <= clip_margin or
+            r >= 255 - clip_margin or g >= 255 - clip_margin or b >= 255 - clip_margin
+        )
+        if min_luma <= y <= max_luma and not clipped:
+            selected_red += r
+            selected_green += g
+            selected_blue += b
+            selected_luma.append(y)
+            selected += 1
+    if pixels == 0:
+        return {
+            "red_mean": 0.0,
+            "green_mean": 0.0,
+            "blue_mean": 0.0,
+            "luma": 0.0,
+            "luma_stats": luma_summary([]),
+            "selected_samples": 0,
+            "selected_luma_stats": luma_summary([]),
+        }
+    if selected == 0:
+        selected = pixels
+        selected_red = red
+        selected_green = green
+        selected_blue = blue
+        selected_luma = all_luma
+    luma_stats = luma_summary(all_luma)
+    selected_luma_stats = luma_summary(selected_luma)
     return {
-        "red_mean": red / pixels,
-        "green_mean": green / pixels,
-        "blue_mean": blue / pixels,
-        "luma": luma / pixels,
+        "red_mean": selected_red / selected,
+        "green_mean": selected_green / selected,
+        "blue_mean": selected_blue / selected,
+        "luma": luma_stats["mean"],
+        "luma_stats": luma_stats,
+        "selected_samples": selected,
+        "selected_luma_stats": selected_luma_stats,
     }
 
 
@@ -1980,23 +2192,60 @@ def apply_rgb_gains(rgb, red_gain, green_gain, blue_gain):
         rgb[index + 2] = clamp(rgb[index + 2] * blue_gain, 0, 255)
 
 
+def apply_color_transform(rgb, ccm, gamma):
+    identity_ccm = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    use_ccm = any(abs(a - b) > 0.0001 for a, b in zip(ccm, identity_ccm))
+    use_gamma = abs(gamma - 1.0) > 0.0001
+    if not use_ccm and not use_gamma:
+        return False
+    gamma_power = 1.0 / max(0.05, gamma)
+    for index in range(0, len(rgb), 3):
+        r = rgb[index]
+        g = rgb[index + 1]
+        b = rgb[index + 2]
+        if use_ccm:
+            nr = ccm[0] * r + ccm[1] * g + ccm[2] * b
+            ng = ccm[3] * r + ccm[4] * g + ccm[5] * b
+            nb = ccm[6] * r + ccm[7] * g + ccm[8] * b
+        else:
+            nr, ng, nb = r, g, b
+        if use_gamma:
+            nr = 255.0 * ((float_clamp(nr, 0, 255) / 255.0) ** gamma_power)
+            ng = 255.0 * ((float_clamp(ng, 0, 255) / 255.0) ** gamma_power)
+            nb = 255.0 * ((float_clamp(nb, 0, 255) / 255.0) ** gamma_power)
+        rgb[index] = clamp(nr, 0, 255)
+        rgb[index + 1] = clamp(ng, 0, 255)
+        rgb[index + 2] = clamp(nb, 0, 255)
+    return True
+
+
 def balance_rgb_preview(rgb, args):
-    stats = rgb_stats(rgb)
+    awb_stats = rgb_stats(rgb, args.awb_min_luma, args.awb_max_luma, args.awb_clip_margin)
     red_gain = args.red_gain
     green_gain = args.green_gain
     blue_gain = args.blue_gain
     if args.auto_white_balance:
-        green = max(stats["green_mean"], 1.0)
-        red_gain *= float_clamp(green / max(stats["red_mean"], 1.0), args.awb_min_gain, args.awb_max_gain)
-        blue_gain *= float_clamp(green / max(stats["blue_mean"], 1.0), args.awb_min_gain, args.awb_max_gain)
+        green = max(awb_stats["green_mean"], 1.0)
+        red_gain *= float_clamp(green / max(awb_stats["red_mean"], 1.0), args.awb_min_gain, args.awb_max_gain)
+        blue_gain *= float_clamp(green / max(awb_stats["blue_mean"], 1.0), args.awb_min_gain, args.awb_max_gain)
     if any(abs(gain - 1.0) > 0.001 for gain in (red_gain, green_gain, blue_gain)):
         apply_rgb_gains(rgb, red_gain, green_gain, blue_gain)
-        stats = rgb_stats(rgb)
-    return rgb, stats["luma"], {
+    color_transform_applied = apply_color_transform(rgb, args.ccm, args.gamma)
+    stats = rgb_stats(rgb)
+    luma_stats = stats["luma_stats"]
+    return rgb, metered_luma(luma_stats, args.ae_metering), {
         "red": round(red_gain, 3),
         "green": round(green_gain, 3),
         "blue": round(blue_gain, 3),
         "auto_white_balance": args.auto_white_balance,
+        "awb_selected_samples": awb_stats["selected_samples"],
+        "awb_luma_stats": {key: round(value, 2) if isinstance(value, float) else value for key, value in awb_stats["selected_luma_stats"].items()},
+        "ae_metering": args.ae_metering,
+        "ae_luma": round(metered_luma(luma_stats, args.ae_metering), 2),
+        "luma_stats": {key: round(value, 2) if isinstance(value, float) else value for key, value in luma_stats.items()},
+        "ccm": [round(value, 4) for value in args.ccm],
+        "gamma": args.gamma,
+        "color_transform_applied": color_transform_applied,
     }
 
 
@@ -2015,6 +2264,7 @@ def discover_camera(args):
     video_formats_all = video_formats(args.video)
     video_formats_for_mbus_code = video_formats(args.video, args.mbus_code)
     out = {
+        "schema": "lmi.raw-camera.discovery.v1",
         "route": args.route,
         "media": args.media,
         "nodes": collect_nodes(),
@@ -2039,21 +2289,87 @@ def discover_camera(args):
             "frame_intervals": video_frame_intervals(args.video, args.pixelformat, args.width, args.height),
             "current_format": video_current_format(args.video),
         },
+        "software_outputs": {
+            "preview_image_formats": ["png-color", "bmp-gray"],
+            "raw_dump": True,
+            "metadata_dump": True,
+            "nv12_dump": "software preview-derived NV12 for codec tests only",
+            "http_stream": "multipart/x-mixed-replace using the selected preview image content type",
+            "http_capture_endpoints": ["/snapshot", "/raw", "/metadata"],
+            "http_capabilities_endpoint": "/capabilities",
+            "software_3a": ["AE", "AWB", "preview CCM/gamma"],
+        },
+        "standard_stack_boundary": {
+            "libcamera_pipeline_in_repo": False,
+            "browser_get_user_media_ready": False,
+            "expected_browser_path": "libcamera + PipeWire/portal, or a real processed V4L2/loopback node supplied by a separate userspace stack",
+            "rootfs_changes_required_by_this_helper": False,
+            "do_not_assume_video_node_number": True,
+        },
         "kernel_output_boundary": {
             "capture_api": "V4L2 mplane + media-controller",
             "validated_output": "raw Bayer RDI",
             "validated_fourcc": args.pixelformat,
             "browser_ready_yuv_or_rgb": False,
-            "format_list_note": "VIDIOC_ENUM_FMT reports the generic CAMSS RDI pass-through table; YUYV/UYVY entries there do not mean this route performs ISP conversion from the OV13B10 raw Bayer stream.",
+            "kernel_isp_yuv_or_rgb": False,
+            "format_list_note": "The active OV13B10 route is RAW10; any processed browser path must be produced by a real ISP/userspace stack, not by pretending this node is YUV/RGB.",
             "reason": "The validated SM8250 CAMSS path is OV13B10 -> CSIPHY1 -> CSID1 -> VFE1 RDI0 -> video node, and this mainline driver path does not expose an ISP/YUV/RGB output node.",
         },
     }
     print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def http_capabilities(args, status):
+    return {
+        "schema": "lmi.raw-camera.http.v1",
+        "route": args.route,
+        "video": status.get("video") or args.video,
+        "sensor": args.sensor,
+        "selected_mode": args.selected_mode,
+        "preview": {
+            "image_format": args.image_format,
+            "content_type": status.get("content_type"),
+            "width": status.get("preview_width"),
+            "height": status.get("preview_height"),
+        },
+        "raw": {
+            "available": bool(status.get("raw_available")),
+            "fourcc": args.pixelformat,
+            "mbus_code": f"0x{args.mbus_code:x}",
+            "raw_format": status.get("raw_format"),
+            "size": status.get("raw_size"),
+        },
+        "software_processing": {
+            "auto_exposure": args.auto_exposure,
+            "ae_mode": args.ae_mode,
+            "ae_metering": args.ae_metering,
+            "auto_white_balance": args.auto_white_balance,
+            "ccm": [round(value, 4) for value in args.ccm],
+            "gamma": args.gamma,
+            "kernel_isp": False,
+        },
+        "endpoints": {
+            "page": "/",
+            "stream": "/stream",
+            "snapshot": "/snapshot",
+            "raw": "/raw",
+            "metadata": "/metadata",
+            "status": "/status",
+            "capabilities": "/capabilities",
+        },
+        "standard_stack_boundary": {
+            "browser_get_user_media_ready": False,
+            "libcamera_pipeline_in_repo": False,
+            "kernel_isp_yuv_or_rgb": False,
+            "expected_browser_path": "libcamera + PipeWire/portal, or a real processed V4L2/loopback node supplied by a separate userspace stack",
+        },
+    }
+
+
 def capture_image(camera, args):
     raw, meta = camera.read_frame()
     color_balance = None
+    luma_stats = None
     if args.image_format == "png-color":
         rgb, preview_width, preview_height, raw_format, _ = raw_to_rgb_preview(
             raw,
@@ -2065,6 +2381,7 @@ def capture_image(camera, args):
             args.preview_width,
         )
         rgb, luma, color_balance = balance_rgb_preview(rgb, args)
+        luma_stats = color_balance["luma_stats"]
         image = rgb_to_png(rgb, preview_width, preview_height, args.png_level)
         content_type = "image/png"
     else:
@@ -2076,7 +2393,8 @@ def capture_image(camera, args):
             meta["stride"],
             args.shift,
         )
-        luma = sampled_mean(gray)
+        luma_stats = gray_luma_stats(gray)
+        luma = metered_luma(luma_stats, args.ae_metering)
         image, preview_width, preview_height = gray_to_bmp(gray, meta["width"], meta["height"], args.preview_width)
         content_type = "image/bmp"
     controls = camera.update_auto_exposure(luma)
@@ -2085,16 +2403,24 @@ def capture_image(camera, args):
         "raw_size": len(raw),
         "preview_width": preview_width,
         "preview_height": preview_height,
-        "luma_mean": round(luma, 2),
+        "ae_luma": round(luma, 2),
+        "luma_stats": luma_stats,
         "controls": controls,
         "auto_exposure": args.auto_exposure,
         "ae_mode": args.ae_mode,
+        "ae_metering": args.ae_metering,
         "target_luma": args.target_luma,
         "ae_max_step": args.ae_max_step,
         "image_format": args.image_format,
+        "software_processing": {
+            "demosaic": "2x2 GRBG preview sampling" if args.image_format == "png-color" else "none",
+            "white_balance": "preview RGB gains" if color_balance else "none",
+            "color": "software CCM/gamma on preview RGB" if color_balance else "none",
+            "kernel_isp": False,
+        },
         "color_balance": color_balance,
     })
-    return image, content_type, meta
+    return image, content_type, meta, raw
 
 
 def capture_loop(args, state):
@@ -2105,13 +2431,14 @@ def capture_loop(args, state):
             while not state.stop.is_set():
                 started = time.monotonic()
                 try:
-                    image, content_type, meta = capture_image(camera, args)
+                    image, content_type, meta, raw = capture_image(camera, args)
                     finished = time.monotonic()
                     if last_frame_time is not None and finished > last_frame_time:
                         meta["preview_fps"] = round(1.0 / (finished - last_frame_time), 2)
                     last_frame_time = finished
                     with state.condition:
                         state.frame = image
+                        state.raw = raw
                         state.content_type = content_type
                         state.status.update({
                             "state": "streaming",
@@ -2119,6 +2446,8 @@ def capture_loop(args, state):
                             "error": None,
                             "updated_at": now(),
                             "video": args.video,
+                            "content_type": content_type,
+                            "raw_available": raw is not None,
                             **meta,
                         })
                         state.condition.notify_all()
@@ -2144,13 +2473,20 @@ def make_handler(state, args):
         def log_message(self, fmt, *values):
             sys.stderr.write("[%s] http: %s\n" % (time.strftime("%H:%M:%S"), fmt % values))
 
-        def send_bytes(self, status, content_type, body):
+        def send_bytes(self, status, content_type, body, headers=None):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
+            if headers:
+                for name, value in headers.items():
+                    self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def current_capture(self):
+            with state.lock:
+                return state.frame, state.raw, state.content_type, dict(state.status)
 
         def send_stream(self):
             self.send_response(200)
@@ -2197,16 +2533,38 @@ def make_handler(state, args):
             if path == "/stream":
                 self.send_stream()
                 return
-            if path == "/frame.bmp":
-                with state.lock:
-                    frame = state.frame
-                    content_type = state.content_type
-                    status = dict(state.status)
+            if path in ("/frame.bmp", "/frame", "/snapshot", "/snapshot.png"):
+                frame, _, content_type, status = self.current_capture()
                 if frame is None:
                     body = (status.get("error") or "no frame captured yet").encode("utf-8")
                     self.send_bytes(503, "text/plain; charset=utf-8", body)
                     return
-                self.send_bytes(200, content_type, frame)
+                extension = "png" if content_type == "image/png" else "bmp"
+                self.send_bytes(200, content_type, frame, {
+                    "Content-Disposition": f"inline; filename=\"lmi-camera-frame.{extension}\"",
+                })
+                return
+            if path in ("/raw", "/frame.raw"):
+                _, raw, _, status = self.current_capture()
+                if raw is None:
+                    body = (status.get("error") or "no raw frame captured yet").encode("utf-8")
+                    self.send_bytes(503, "text/plain; charset=utf-8", body)
+                    return
+                self.send_bytes(200, "application/octet-stream", raw, {
+                    "Content-Disposition": "attachment; filename=\"lmi-camera-frame.raw\"",
+                })
+                return
+            if path in ("/metadata", "/snapshot.json"):
+                _, _, _, status = self.current_capture()
+                body = json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+                self.send_bytes(200, "application/json; charset=utf-8", body, {
+                    "Content-Disposition": "attachment; filename=\"lmi-camera-frame.json\"",
+                })
+                return
+            if path == "/capabilities":
+                _, _, _, status = self.current_capture()
+                body = json.dumps(http_capabilities(args, status), ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+                self.send_bytes(200, "application/json; charset=utf-8", body)
                 return
             if path == "/status":
                 with state.lock:
@@ -2238,6 +2596,12 @@ pre {{ white-space: pre-wrap; background: #181c20; padding: 12px; border-radius:
 <main>
 <h1>{title}</h1>
 <p>video node: <code>{video}</code></p>
+<p>
+  <a href="/snapshot">preview snapshot</a> ·
+  <a href="/raw">raw frame</a> ·
+  <a href="/metadata">metadata JSON</a> ·
+  <a href="/capabilities">capabilities JSON</a>
+</p>
 <img id="frame" src="/stream" alt="camera stream">
 <pre id="status">starting</pre>
 </main>
@@ -2274,6 +2638,31 @@ def serve(args):
         worker.join(timeout=2)
 
 
+def raw_frame_to_nv12(raw, meta, args):
+    rgb, width, height, raw_format, _ = raw_to_rgb_preview(
+        raw,
+        meta["width"],
+        meta["height"],
+        args.raw_format,
+        meta["stride"],
+        args.shift,
+        args.preview_width,
+    )
+    rgb, _, color_balance = balance_rgb_preview(rgb, args)
+    nv12, width, height = rgb_to_nv12(rgb, width, height)
+    return nv12, {
+        "path": "raw_bayer_rdi_to_software_preview_rgb_to_nv12",
+        "width": width,
+        "height": height,
+        "fourcc": "NV12",
+        "size": len(nv12),
+        "raw_format": raw_format,
+        "kernel_isp": False,
+        "hardware_encoder_input_only": True,
+        "color_balance": color_balance,
+    }
+
+
 def capture_once_to_file(args):
     if not args.output:
         raise SystemExit("--once requires --output")
@@ -2284,11 +2673,669 @@ def capture_once_to_file(args):
                 capture_image(camera, args)
                 if args.ae_warmup_interval > 0:
                     time.sleep(args.ae_warmup_interval)
-        image, content_type, meta = capture_image(camera, args)
+        image, content_type, meta, raw = capture_image(camera, args)
     with open(args.output, "wb") as file:
         file.write(image)
     meta["content_type"] = content_type
+    meta["output"] = args.output
+    if args.raw_output:
+        with open(args.raw_output, "wb") as file:
+            file.write(raw)
+        meta["raw_output"] = args.raw_output
+    if args.nv12_output:
+        nv12, nv12_meta = raw_frame_to_nv12(raw, meta, args)
+        with open(args.nv12_output, "wb") as file:
+            file.write(nv12)
+        nv12_meta["output"] = args.nv12_output
+        meta["nv12_output"] = nv12_meta
+    if args.metadata_output:
+        with open(args.metadata_output, "w", encoding="utf-8") as file:
+            json.dump(meta, file, ensure_ascii=False, indent=2, sort_keys=True)
+            file.write("\n")
     print("wrote %s: %s" % (args.output, json.dumps(meta, ensure_ascii=False, sort_keys=True)))
+
+
+def now_status_write(path, payload):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+    except OSError:
+        pass
+
+
+class DumpSink:
+    """--isp-sink none: write produced frames to a file. Phase 0 validation of
+    the software-ISP pipeline (demosaic + 3A + pack) with no kernel rebuild."""
+    kind = "dump"
+
+    def __init__(self, args):
+        self.path = args.isp_dump
+        self.max_frames = max(1, args.isp_frames)
+        self.format = args.isp_format
+        self.out_width = args.isp_width & ~1
+        self.out_height = (args.isp_height & ~1) if args.isp_format == "nv12" else args.isp_height
+        if self.format == "yuyv":
+            self.stride = self.out_width * 2
+            self.sizeimage = self.stride * self.out_height
+        else:
+            self.stride = self.out_width
+            self.sizeimage = self.stride * self.out_height * 3 // 2
+        self.node = self.path
+        self._fh = None
+        self._written = 0
+
+    def negotiate(self):
+        if self.path:
+            self._fh = open(self.path, "wb")
+
+    def write_frame(self, frame):
+        if self._fh is not None and self._written < self.max_frames:
+            self._fh.write(frame)
+            self._written += 1
+
+    def done(self):
+        return self.path is not None and self._written >= self.max_frames
+
+    def close(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def describe(self):
+        return {"sink": self.kind, "path": self.path, "frames": self.max_frames}
+
+
+class LoopbackSink:
+    """--isp-sink loopback: open a v4l2loopback OUTPUT node, negotiate a single
+    -plane YUYV/NV12 format, then feed each frame with a plain write()."""
+    kind = "loopback"
+
+    def __init__(self, args):
+        self.node = args.isp_node
+        self.format = args.isp_format
+        self.req_width = args.isp_width & ~1
+        self.req_height = (args.isp_height & ~1) if args.isp_format == "nv12" else args.isp_height
+        self.fd = None
+        self.out_width = self.req_width
+        self.out_height = self.req_height
+        self.stride = 0
+        self.sizeimage = 0
+
+    def negotiate(self):
+        self.fd = os.open(self.node, os.O_RDWR)
+        fmt = V4L2Format()
+        fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT
+        fmt.fmt.pix.width = self.req_width
+        fmt.fmt.pix.height = self.req_height
+        fmt.fmt.pix.pixelformat = fourcc("YUYV" if self.format == "yuyv" else "NV12")
+        fmt.fmt.pix.field = V4L2_FIELD_NONE
+        if self.format == "yuyv":
+            fmt.fmt.pix.bytesperline = self.req_width * 2
+            fmt.fmt.pix.sizeimage = self.req_width * 2 * self.req_height
+        else:
+            fmt.fmt.pix.bytesperline = self.req_width
+            fmt.fmt.pix.sizeimage = self.req_width * self.req_height * 3 // 2
+        ioctl(self.fd, VIDIOC_S_FMT, fmt, "VIDIOC_S_FMT(output)")
+        self.out_width = fmt.fmt.pix.width
+        self.out_height = fmt.fmt.pix.height
+        default_stride = self.out_width * 2 if self.format == "yuyv" else self.out_width
+        self.stride = fmt.fmt.pix.bytesperline or default_stride
+        if self.format == "yuyv":
+            self.sizeimage = fmt.fmt.pix.sizeimage or (self.stride * self.out_height)
+        else:
+            self.sizeimage = fmt.fmt.pix.sizeimage or (self.stride * self.out_height * 3 // 2)
+
+    def write_frame(self, frame):
+        os.write(self.fd, frame)
+
+    def done(self):
+        return False
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    def describe(self):
+        return {"sink": self.kind, "node": self.node}
+
+
+class UvcSink:
+    """--isp-sink uvc: build a USB UVC gadget on the live system, run the C
+    feeder (lmi-uvc-gadget) which speaks the UVC PROBE/COMMIT protocol on the
+    gadget OUTPUT node, and non-blocking whole-frame-write YUYV frames into a
+    FIFO the feeder drains. The phone then appears as a standard UVC webcam to a
+    USB host (e.g. a Windows PC) for host UVC consumers; browser getUserMedia is
+    a host-stack validation target, not something this helper itself proves."""
+    kind = "uvc"
+
+    def __init__(self, args):
+        self.format = "yuyv"  # UVC sink only advertises uncompressed YUYV
+        self.out_width = args.isp_width & ~1
+        self.out_height = args.isp_height & ~1
+        self.fps = max(1, args.isp_fps_cap or 15)
+        self.stride = self.out_width * 2
+        self.sizeimage = self.stride * self.out_height
+        self.gadget_name = args.isp_uvc_gadget_name
+        self.feeder_bin = args.isp_uvc_feeder_bin
+        self.fifo = args.isp_uvc_fifo
+        self.udc = args.isp_uvc_udc
+        self.keep = args.isp_uvc_keep
+        self.maxpkt = args.isp_uvc_maxpkt
+        self.configfs = "/sys/kernel/config/usb_gadget"
+        self.gadget = "%s/%s" % (self.configfs, self.gadget_name)
+        self.func = self.gadget + "/functions/uvc.0"
+        self.interval = 10000000 // self.fps
+        self.node = None
+        self.feeder = None
+        self.fifo_fd = None
+        self._built = False
+        self.pipe_cap = 65536
+        self.udc_name = None
+        self.external_writer = False  # when True (C engine), lmi-isp writes the FIFO, not us
+        self.prev_gadget = None  # gadget that held the UDC before us, to restore on close
+
+    def _gadget_on_udc(self, udc):
+        """Return the usb_gadget configfs path currently bound to `udc`, or None."""
+        try:
+            names = os.listdir(self.configfs)
+        except OSError:
+            return None
+        for nm in names:
+            p = "%s/%s" % (self.configfs, nm)
+            if p == self.gadget:
+                continue
+            try:
+                with open(p + "/UDC") as fh:
+                    if fh.read().strip() == udc:
+                        return p
+            except OSError:
+                pass
+        return None
+
+    def _w(self, rel, val):
+        with open(self.gadget + rel, "w") as fh:
+            fh.write(str(val))
+
+    def _build_gadget(self):
+        if os.path.isdir(self.gadget):
+            self._teardown_gadget()
+        g = self.gadget
+        f = self.func
+        os.makedirs(g)
+        self._built = True
+        self._w("/idVendor", "0x1d6b")
+        self._w("/idProduct", "0x0102")
+        self._w("/bcdUSB", "0x0200")
+        self._w("/bcdDevice", "0x0010")
+        self._w("/bDeviceClass", "0xEF")
+        self._w("/bDeviceSubClass", "0x02")
+        self._w("/bDeviceProtocol", "0x01")
+        os.makedirs(g + "/strings/0x409")
+        self._w("/strings/0x409/manufacturer", "lmi")
+        self._w("/strings/0x409/product", "lmi OV13B10 camera")
+        self._w("/strings/0x409/serialnumber", "lmi0001")
+        os.makedirs(g + "/configs/c.1/strings/0x409")
+        self._w("/configs/c.1/strings/0x409/configuration", "uvc")
+        self._w("/configs/c.1/MaxPower", "500")
+        os.makedirs(f)
+        try:
+            with open(f + "/streaming_maxpacket", "w") as fh:
+                fh.write(str(self.maxpkt))
+        except OSError:
+            pass
+        wdir = "%s/streaming/uncompressed/yuyv/%dp" % (f, self.out_height)
+        os.makedirs(wdir)
+        with open(wdir + "/wWidth", "w") as fh:
+            fh.write(str(self.out_width))
+        with open(wdir + "/wHeight", "w") as fh:
+            fh.write(str(self.out_height))
+        with open(wdir + "/dwMaxVideoFrameBufferSize", "w") as fh:
+            fh.write(str(self.sizeimage))
+        with open(wdir + "/dwFrameInterval", "w") as fh:
+            fh.write(str(self.interval))
+        # optional color matching (BT.601 full-ish); best-effort
+        try:
+            cm = f + "/streaming/color_matching/yuyv"
+            os.makedirs(cm)
+            for attr, val in (("bColorPrimaries", 1), ("bTransferCharacteristics", 1), ("bMatrixCoefficients", 4)):
+                with open(cm + "/" + attr, "w") as fh:
+                    fh.write(str(val))
+            os.symlink(cm, f + "/streaming/uncompressed/yuyv/yuyv")
+        except OSError:
+            pass
+        os.makedirs(f + "/streaming/header/h")
+        os.symlink(f + "/streaming/uncompressed/yuyv", f + "/streaming/header/h/yuyv")
+        for spd in ("fs", "hs", "ss"):
+            os.symlink(f + "/streaming/header/h", f + "/streaming/class/%s/h" % spd)
+        os.makedirs(f + "/control/header/h")
+        for spd in ("fs", "ss"):
+            os.symlink(f + "/control/header/h", f + "/control/class/%s/h" % spd)
+        os.symlink(f, g + "/configs/c.1/uvc.0")
+
+    def _teardown_gadget(self):
+        g = self.gadget
+        f = self.func
+        def rm(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        def rmd(path):
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+        try:
+            with open(g + "/UDC", "w") as fh:
+                fh.write("\n")
+        except OSError:
+            pass
+        rm(g + "/configs/c.1/uvc.0")
+        for spd in ("fs", "ss"):
+            rm(f + "/control/class/%s/h" % spd)
+        for spd in ("fs", "hs", "ss"):
+            rm(f + "/streaming/class/%s/h" % spd)
+        rm(f + "/streaming/header/h/yuyv")
+        rm(f + "/streaming/uncompressed/yuyv/yuyv")
+        rmd(f + "/control/header/h")
+        rmd(f + "/streaming/header/h")
+        rmd(f + "/streaming/color_matching/yuyv")
+        for d in glob.glob(f + "/streaming/uncompressed/yuyv/*p"):
+            rmd(d)
+        rmd(f + "/streaming/uncompressed/yuyv")
+        rmd(f)
+        rmd(g + "/configs/c.1/strings/0x409")
+        rmd(g + "/configs/c.1")
+        rmd(g + "/strings/0x409")
+        rmd(g)
+        self._built = False
+
+    def _detect_udc(self):
+        if self.udc:
+            return self.udc
+        udcs = sorted(os.listdir("/sys/class/udc"))
+        if not udcs:
+            raise RuntimeError("no UDC available in /sys/class/udc")
+        return udcs[0]
+
+    def negotiate(self):
+        if not os.path.isdir(self.configfs):
+            raise RuntimeError("configfs not mounted at %s" % self.configfs)
+        try:
+            os.mkfifo(self.fifo, 0o600)
+        except FileExistsError:
+            pass
+        before = set(glob.glob("/dev/video*"))
+        self._build_gadget()
+        udc = self._detect_udc()
+        self.udc_name = udc
+        # A UDC holds only one gadget; if the rootfs gadget (e.g. usb0 RNDIS/serial)
+        # is bound, unbind it first and remember it so we can restore on close.
+        self.prev_gadget = self._gadget_on_udc(udc)
+        if self.prev_gadget:
+            try:
+                with open(self.prev_gadget + "/UDC", "w") as fh:
+                    fh.write("\n")
+                print("[isp] uvc: temporarily unbound %s from %s (will restore on exit)"
+                      % (os.path.basename(self.prev_gadget), udc), flush=True)
+                time.sleep(0.3)
+            except OSError as exc:
+                raise RuntimeError("could not free UDC %s held by %s: %s"
+                                   % (udc, self.prev_gadget, exc))
+        self._w("/UDC", udc)
+        time.sleep(0.5)
+        after = set(glob.glob("/dev/video*"))
+        new_nodes = sorted(after - before)
+        if not new_nodes:
+            # fall back to matching the f_uvc video device by driver name
+            for v in sorted(after):
+                base = os.path.basename(v)
+                try:
+                    with open("/sys/class/video4linux/%s/name" % base) as fh:
+                        nm = fh.read().strip().lower()
+                except OSError:
+                    nm = ""
+                if "uvc" in nm:
+                    new_nodes = [v]
+                    break
+        if not new_nodes:
+            raise RuntimeError("UVC gadget video node did not appear after UDC bind")
+        self.node = new_nodes[0]
+        # start the feeder (it creates/opens the FIFO O_RDWR and subscribes to events)
+        cmd = [
+            self.feeder_bin, "--device", self.node, "--fifo", self.fifo,
+            "--width", str(self.out_width), "--height", str(self.out_height),
+            "--fps", str(self.fps), "--maxpkt", str(self.maxpkt), "--intf", "1",
+        ]
+        self.feeder = subprocess.Popen(cmd)
+        if self.external_writer:
+            # the C ISP (lmi-isp --fifo) is the sole writer; we only manage the
+            # gadget + feeder lifecycle here.
+            print("[isp] uvc gadget %s bound to UDC %s, node=%s, feeder pid=%s (external writer)"
+                  % (self.gadget_name, udc, self.node, self.feeder.pid), flush=True)
+            return
+        # open FIFO for writing; feeder holds the read end (O_RDWR) so this won't hang long
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                self.fifo_fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise RuntimeError("feeder did not open the FIFO read end in time")
+                time.sleep(0.1)
+        # Enlarge the pipe to hold a few frames and keep the fd non-blocking; the
+        # writer below only ever writes a WHOLE frame when there is room, and drops
+        # otherwise. This keeps frame framing exact AND keeps the ISP loop
+        # interruptible even if the feeder stalls (a blocking write previously
+        # hung the daemon uninterruptibly on a host-disconnect race).
+        import fcntl as _fcntl
+        f_setpipe = getattr(_fcntl, "F_SETPIPE_SZ", 1031)
+        try:
+            self.pipe_cap = _fcntl.fcntl(self.fifo_fd, f_setpipe, self.sizeimage * 3)
+        except OSError:
+            self.pipe_cap = 65536
+        print("[isp] uvc gadget %s bound to UDC %s, node=%s, feeder pid=%s"
+              % (self.gadget_name, udc, self.node, self.feeder.pid), flush=True)
+
+    def write_frame(self, frame):
+        if self.fifo_fd is None:
+            return
+        # whole-frame-or-drop on a non-blocking pipe: only start a frame when the
+        # pipe has room for all of it (keeps framing aligned), never block.
+        import fcntl as _fcntl
+        import array
+        import termios
+        try:
+            cnt = array.array('i', [0])
+            _fcntl.ioctl(self.fifo_fd, termios.FIONREAD, cnt, True)
+            inpipe = cnt[0]
+        except OSError:
+            inpipe = 0
+        if self.pipe_cap - inpipe < len(frame):
+            return  # feeder not draining fast enough; drop this frame
+        view = memoryview(frame)
+        off = 0
+        while off < len(view):
+            try:
+                off += os.write(self.fifo_fd, view[off:])
+            except BlockingIOError:
+                return
+            except BrokenPipeError:
+                return
+
+    def done(self):
+        return False
+
+    def close(self):
+        if self.fifo_fd is not None:
+            try:
+                os.close(self.fifo_fd)
+            except OSError:
+                pass
+            self.fifo_fd = None
+        if self.feeder is not None:
+            try:
+                self.feeder.terminate()
+                self.feeder.wait(timeout=3)
+            except Exception:
+                try:
+                    self.feeder.kill()
+                except Exception:
+                    pass
+            self.feeder = None
+        if self._built and not self.keep:
+            self._teardown_gadget()
+        # restore whatever rootfs gadget (usb0 etc.) previously held the UDC
+        if self.prev_gadget and self.udc_name and not self.keep:
+            try:
+                with open(self.prev_gadget + "/UDC", "w") as fh:
+                    fh.write(self.udc_name)
+                print("[isp] uvc: restored %s on %s"
+                      % (os.path.basename(self.prev_gadget), self.udc_name), flush=True)
+            except OSError:
+                pass
+        try:
+            if not self.keep:
+                os.unlink(self.fifo)
+        except OSError:
+            pass
+
+    def describe(self):
+        return {"sink": self.kind, "node": self.node, "gadget": self.gadget_name, "fifo": self.fifo}
+
+
+def validate_isp_args(args):
+    if args.isp_sink == "uvc" and args.isp_format != "yuyv":
+        raise SystemExit("--isp-sink uvc only supports --isp-format yuyv")
+
+
+def make_isp_sink(args):
+    if args.isp_sink == "loopback":
+        if not args.isp_node:
+            raise SystemExit("--isp-sink loopback requires --isp-node /dev/videoN")
+        return LoopbackSink(args)
+    if args.isp_sink == "uvc":
+        return UvcSink(args)
+    return DumpSink(args)
+
+
+_ISP_GAMMA_TABLES = {}
+
+
+def isp_gamma_table(gamma):
+    """Cached 256-entry per-channel tone curve (display gamma encode). Applied
+    with bytes.translate() so it costs almost nothing per frame, unlike the
+    per-pixel pow() in apply_color_transform()."""
+    key = round(gamma, 3)
+    table = _ISP_GAMMA_TABLES.get(key)
+    if table is None:
+        if abs(gamma - 1.0) < 1e-3:
+            table = bytes(range(256))
+        else:
+            inv = 1.0 / gamma
+            table = bytes(min(255, max(0, int(round(255.0 * ((i / 255.0) ** inv))))) for i in range(256))
+        _ISP_GAMMA_TABLES[key] = table
+    return table
+
+
+def isp_process_frame(camera, args, sink):
+    raw, meta = camera.read_frame()
+    rgb, src_width, src_height, raw_format, luma = raw_to_rgb_preview(
+        raw,
+        meta["width"],
+        meta["height"],
+        args.raw_format,
+        meta["stride"],
+        args.shift,
+        args.isp_src_width,
+    )
+    red_gain = args.red_gain
+    green_gain = args.green_gain
+    blue_gain = args.blue_gain
+    if args.auto_white_balance:
+        awb = rgb_stats(rgb, args.awb_min_luma, args.awb_max_luma, args.awb_clip_margin)
+        green = max(awb["green_mean"], 1.0)
+        red_gain *= float_clamp(green / max(awb["red_mean"], 1.0), args.awb_min_gain, args.awb_max_gain)
+        blue_gain *= float_clamp(green / max(awb["blue_mean"], 1.0), args.awb_min_gain, args.awb_max_gain)
+    if any(abs(gain - 1.0) > 0.001 for gain in (red_gain, green_gain, blue_gain)):
+        apply_rgb_gains(rgb, red_gain, green_gain, blue_gain)
+    # optional CCM (per-pixel, slow) only if non-identity; gamma is done via the
+    # fast translate LUT below to give the image proper tonal latitude cheaply.
+    identity_ccm = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    if any(abs(a - b) > 1e-4 for a, b in zip(args.ccm, identity_ccm)):
+        apply_color_transform(rgb, args.ccm, 1.0)
+    gamma = getattr(args, "isp_gamma", 2.2)
+    if abs(gamma - 1.0) > 1e-3:
+        rgb[:] = bytes(rgb).translate(isp_gamma_table(gamma))
+    if getattr(sink, "format", args.isp_format) == "yuyv":
+        frame = rgb_to_yuyv(rgb, src_width, src_height, sink.out_width, sink.out_height, sink.stride)
+    else:
+        frame = rgb_to_nv12_scaled(rgb, src_width, src_height, sink.out_width, sink.out_height, sink.stride)
+    if sink.sizeimage and len(frame) != sink.sizeimage:
+        if len(frame) < sink.sizeimage:
+            frame = frame + bytes(sink.sizeimage - len(frame))
+        else:
+            frame = frame[:sink.sizeimage]
+    controls = camera.update_auto_exposure(luma)
+    info = {
+        "raw_format": raw_format,
+        "src_width": src_width,
+        "src_height": src_height,
+        "ae_luma": round(luma, 2),
+        "gains": {"red": round(red_gain, 3), "green": round(green_gain, 3), "blue": round(blue_gain, 3)},
+        "controls": controls,
+    }
+    return frame, meta, info
+
+
+def run_isp_c(args):
+    """C-engine ISP path: Python set up the route/sensor-mode (and the UVC gadget
+    when needed); the fast lmi-isp binary does capture + full ISP + output. This
+    is the default engine — far higher fps/resolution than the pure-Python loop."""
+    validate_isp_args(args)
+    gadget = None
+    if args.isp_sink == "uvc":
+        gadget = UvcSink(args)
+        gadget.external_writer = True
+        try:
+            gadget.negotiate()
+        except Exception:
+            gadget.close()
+            raise
+        out = ["--fifo", args.isp_uvc_fifo]
+    elif args.isp_sink == "loopback":
+        if not args.isp_node:
+            raise SystemExit("--isp-sink loopback requires --isp-node /dev/videoN")
+        out = ["--loopback", args.isp_node]
+    elif args.isp_dump:
+        out = ["--dump", args.isp_dump, "--frames", str(max(1, args.isp_frames))]
+    else:
+        raise SystemExit("--isp-engine c requires --isp-sink loopback/uvc or --isp-dump")
+
+    ctrl = args.control_subdev or args.sensor_subdev or ""
+    cmd = [
+        args.isp_engine_bin,
+        "--raw", args.video,
+        "--out-width", str(args.isp_width),
+        "--out-height", str(args.isp_height),
+        "--gamma", str(getattr(args, "isp_gamma", 2.2)),
+        "--fps-cap", str(args.isp_fps_cap),
+    ] + out
+    if ctrl:
+        cmd += ["--ctrl", ctrl]
+    if args.isp_format == "nv12":
+        cmd.append("--nv12")
+    if args.auto_exposure:
+        cmd += ["--auto-exposure", "--target", str(int(args.target_luma))]
+    print("[isp] engine=c: %s" % " ".join(cmd), flush=True)
+    proc = subprocess.Popen(cmd)
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        try:
+            import signal as _sig
+            proc.send_signal(_sig.SIGINT)
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    finally:
+        if gadget is not None:
+            gadget.close()
+
+
+def run_isp(args):
+    validate_isp_args(args)
+    configure(args)
+    if getattr(args, "isp_engine", "c") == "c":
+        run_isp_c(args)
+        return
+    sink = make_isp_sink(args)
+    try:
+        sink.negotiate()
+    except Exception:
+        sink.close()
+        raise
+    print(
+        "[isp] sink=%s node=%s fmt=%s %dx%d stride=%d size=%d demosaic_src_w=%d"
+        % (
+            sink.kind,
+            getattr(sink, "node", None),
+            sink.format,
+            sink.out_width,
+            sink.out_height,
+            sink.stride,
+            sink.sizeimage,
+            args.isp_src_width,
+        ),
+        flush=True,
+    )
+    frames = 0
+    t_start = time.monotonic()
+    last_report = t_start
+    try:
+        with IoctlCamera(args) as camera:
+            if args.auto_exposure:
+                for _ in range(max(0, args.ae_warmup_frames)):
+                    isp_process_frame(camera, args, sink)
+                    if args.ae_warmup_interval > 0:
+                        time.sleep(args.ae_warmup_interval)
+            while True:
+                started = time.monotonic()
+                frame, meta, info = isp_process_frame(camera, args, sink)
+                sink.write_frame(frame)
+                frames += 1
+                if sink.done():
+                    break
+                now_t = time.monotonic()
+                if now_t - last_report >= 2.0:
+                    fps = frames / max(1e-6, now_t - t_start)
+                    sys.stderr.write(
+                        "[isp] frames=%d fps=%.2f ae_luma=%s gains=%s\n"
+                        % (frames, fps, info["ae_luma"], info["gains"])
+                    )
+                    last_report = now_t
+                    if args.isp_status:
+                        now_status_write(args.isp_status, {
+                            "schema": "lmi.software-isp.status.v1",
+                            "sink": sink.describe(),
+                            "format": sink.format,
+                            "width": sink.out_width,
+                            "height": sink.out_height,
+                            "stride": sink.stride,
+                            "sizeimage": sink.sizeimage,
+                            "frames": frames,
+                            "fps": round(fps, 2),
+                            "kernel_isp": False,
+                            "demosaic": "software 2x2 GRBG + nearest resample",
+                            "raw_format": info["raw_format"],
+                            "ae_luma": info["ae_luma"],
+                            "gains": info["gains"],
+                            "controls": info["controls"],
+                            "updated_at": now(),
+                        })
+                if args.isp_fps_cap > 0:
+                    delay = (1.0 / args.isp_fps_cap) - (time.monotonic() - started)
+                    if delay > 0:
+                        time.sleep(delay)
+    except KeyboardInterrupt:
+        print("[isp] stopping", flush=True)
+    finally:
+        sink.close()
+    elapsed = time.monotonic() - t_start
+    print(
+        "[isp] done frames=%d elapsed=%.2fs avg_fps=%.2f"
+        % (frames, elapsed, frames / max(1e-6, elapsed)),
+        flush=True,
+    )
 
 
 def parse_args():
@@ -2326,6 +3373,11 @@ def parse_args():
     parser.add_argument("--blue-gain", type=float, default=1.0)
     parser.add_argument("--awb-min-gain", type=float, default=0.5)
     parser.add_argument("--awb-max-gain", type=float, default=2.0)
+    parser.add_argument("--awb-min-luma", type=int, default=16, help="lowest luma sample used for preview AWB")
+    parser.add_argument("--awb-max-luma", type=int, default=240, help="highest luma sample used for preview AWB")
+    parser.add_argument("--awb-clip-margin", type=int, default=3, help="exclude near-clipped RGB samples from preview AWB")
+    parser.add_argument("--ccm", type=parse_ccm, default=parse_ccm("1,0,0,0,1,0,0,0,1"), help="3x3 preview CCM as 9 comma-separated numbers")
+    parser.add_argument("--gamma", type=float, default=1.0, help="preview gamma value applied after CCM")
     parser.set_defaults(auto_white_balance=True)
     parser.add_argument("--capture-timeout", type=float, default=5.0)
     parser.add_argument("--buffers", type=int, default=3)
@@ -2339,6 +3391,7 @@ def parse_args():
     parser.add_argument("--ae-mode", choices=("video", "balanced", "low-light"), default="video")
     parser.add_argument("--max-auto-vblank", type=int, help="highest VBLANK value auto exposure may set; overrides --ae-mode")
     parser.add_argument("--target-luma", type=float, default=110.0)
+    parser.add_argument("--ae-metering", choices=("mean", "p50", "p70", "p90"), default="p50", help="preview luma statistic used by software AE")
     parser.add_argument("--ae-deadband", type=float, default=8.0)
     parser.add_argument("--ae-interval", type=int, default=3, help="captured frames between AE updates")
     parser.add_argument("--ae-max-step", type=float, default=1.12, help="largest per-update AE multiplier")
@@ -2356,6 +3409,28 @@ def parse_args():
     parser.add_argument("--metadata-set-interval", action="store_true", help="also round-trip S_FRAME_INTERVAL using the current interval")
     parser.add_argument("--once", action="store_true", help="capture one preview image and exit")
     parser.add_argument("--output", help="preview image output path for --once")
+    parser.add_argument("--raw-output", help="optional raw frame output path for --once")
+    parser.add_argument("--nv12-output", help="optional software NV12 frame output path for --once, for codec tests only")
+    parser.add_argument("--metadata-output", help="optional JSON metadata output path for --once")
+    parser.add_argument("--isp-sink", choices=("none", "loopback", "uvc"), default="none", help="run the software-ISP daemon, feeding color frames to a standard V4L2 node (loopback/uvc) instead of serving the HTTP preview")
+    parser.add_argument("--isp-node", help="target V4L2 node for --isp-sink loopback (the v4l2loopback OUTPUT node, e.g. /dev/video20)")
+    parser.add_argument("--isp-format", choices=("yuyv", "nv12"), default="yuyv", help="ISP node pixel format")
+    parser.add_argument("--isp-width", type=int, default=640, help="advertised ISP node width")
+    parser.add_argument("--isp-height", type=int, default=480, help="advertised ISP node height")
+    parser.add_argument("--isp-src-width", type=int, default=480, help="software demosaic working width (perf knob; resampled to --isp-width)")
+    parser.add_argument("--isp-gamma", type=float, default=2.2, help="ISP display gamma tone curve (1.0 = linear/off); improves shadow/highlight latitude")
+    parser.add_argument("--isp-engine", choices=("c", "python"), default="c", help="frame engine: c = fast lmi-isp binary (default, higher fps/res), python = pure-stdlib loop")
+    parser.add_argument("--isp-engine-bin", default="/tmp/lmi-isp", help="path to the cross-compiled lmi-isp binary for --isp-engine c")
+    parser.add_argument("--isp-fps-cap", type=int, default=15, help="pace ISP output to at most this many fps (0 = uncapped)")
+    parser.add_argument("--isp-dump", help="for --isp-sink none: write produced ISP frames to this raw file")
+    parser.add_argument("--isp-frames", type=int, default=10, help="for --isp-sink none --isp-dump: stop after N frames")
+    parser.add_argument("--isp-status", help="optional JSON status output path updated periodically by the ISP daemon")
+    parser.add_argument("--isp-uvc-gadget-name", default="lmi_uvc", help="configfs usb_gadget name for --isp-sink uvc")
+    parser.add_argument("--isp-uvc-feeder-bin", default="/tmp/lmi-uvc-gadget", help="path to the cross-compiled UVC feeder binary")
+    parser.add_argument("--isp-uvc-fifo", default="/tmp/lmi-uvc.fifo", help="FIFO used to hand YUYV frames to the UVC feeder")
+    parser.add_argument("--isp-uvc-udc", default="", help="UDC name to bind (default: first /sys/class/udc entry)")
+    parser.add_argument("--isp-uvc-maxpkt", type=int, default=1024, help="UVC streaming endpoint max packet size")
+    parser.add_argument("--isp-uvc-keep", action="store_true", help="do not tear down the UVC gadget/FIFO on exit (debug)")
     return parser.parse_args()
 
 
@@ -2381,6 +3456,9 @@ def main():
         return
     if args.once:
         capture_once_to_file(args)
+        return
+    if args.isp_sink != "none" or args.isp_dump:
+        run_isp(args)
         return
     serve(args)
 

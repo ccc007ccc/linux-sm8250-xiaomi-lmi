@@ -205,6 +205,7 @@ void vfe_isr_reset_ack(struct vfe_device *vfe);
 int vfe_put_output(struct vfe_line *line);
 int vfe_release_wm(struct vfe_device *vfe, u8 wm);
 int vfe_reserve_wm(struct vfe_device *vfe, enum vfe_line_id line_id);
+void vfe_reissue_reg_update(struct v4l2_subdev *sd);
 
 /*
  * vfe_reset - Trigger reset on VFE module and wait to complete
@@ -240,6 +241,7 @@ extern const struct camss_formats vfe_formats_rdi_8x96;
 extern const struct camss_formats vfe_formats_pix_8x96;
 extern const struct camss_formats vfe_formats_rdi_845;
 extern const struct camss_formats vfe_formats_pix_845;
+extern const struct camss_formats vfe_formats_pix_8250;
 
 extern const struct vfe_hw_ops vfe_ops_4_1;
 extern const struct vfe_hw_ops vfe_ops_4_7;

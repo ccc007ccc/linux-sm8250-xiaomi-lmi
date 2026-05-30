@@ -14,6 +14,7 @@
 
 #include "camss-csid.h"
 #include "camss-csid-gen2.h"
+#include "camss-vfe.h"
 #include "camss.h"
 
 /* The CSID 2 IP-block is different from the others,
@@ -120,6 +121,86 @@
 #define CSID_RDI_RPP_LINE_DROP_PERIOD(rdi)		((csid_is_lite(csid) ? 0x230 : 0x330)\
 							+ 0x100 * (rdi))
 
+#define CSID_PXL_PATH_IPP	0
+#define CSID_PXL_PATH_PPP	1
+#define CSID_PXL_SRC_STREAM	3
+#define CSID_PXL_VC		0
+#define CSID_PXL_BASE(path)	((path) == CSID_PXL_PATH_IPP ? 0x200 : 0x700)
+
+#define CSID_PXL_IRQ_STATUS(path)		(CSID_PXL_BASE(path) == 0x200 ? 0x30 : 0xa0)
+#define CSID_PXL_IRQ_MASK(path)			(CSID_PXL_IRQ_STATUS(path) + 0x04)
+#define CSID_PXL_IRQ_CLEAR(path)			(CSID_PXL_IRQ_STATUS(path) + 0x08)
+#define CSID_PXL_IRQ_SET(path)			(CSID_PXL_IRQ_STATUS(path) + 0x0c)
+
+#define CSID_PXL_CFG0(path)			(CSID_PXL_BASE(path) + 0x00)
+#define		PXL_CFG0_BYTE_CNTR_EN		0
+#define		PXL_CFG0_FORMAT_MEASURE_EN	1
+#define		PXL_CFG0_TIMESTAMP_EN		2
+#define		PXL_CFG0_DROP_H_EN		3
+#define		PXL_CFG0_DROP_V_EN		4
+#define		PXL_CFG0_CROP_H_EN		5
+#define		PXL_CFG0_CROP_V_EN		6
+#define		PXL_CFG0_PIX_STORE_EN		7
+#define		PXL_CFG0_CGC_MODE		8
+#define		PXL_CFG0_PLAIN_FORMAT		10
+#define		PXL_CFG0_DECODE_FORMAT		12
+#define		PXL_CFG0_DATA_TYPE		16
+#define		PXL_CFG0_VIRTUAL_CHANNEL		22
+#define		PXL_CFG0_DT_ID			27
+#define		PXL_CFG0_EARLY_EOF_EN		29
+#define		PXL_CFG0_PACKING_FORMAT		30
+#define		PXL_CFG0_ENABLE			31
+#define CSID_PXL_CFG1(path)			(CSID_PXL_BASE(path) + 0x04)
+#define		PXL_CFG1_TIMESTAMP_STB_SEL	0
+#define CSID_PXL_CTRL(path)			(CSID_PXL_BASE(path) + 0x08)
+#define		PXL_CTRL_HALT_CMD		0
+#define		PXL_CTRL_HALT_MODE		2
+#define CSID_PXL_FRM_DROP_PATTERN(path)		(CSID_PXL_BASE(path) + 0x0c)
+#define CSID_PXL_FRM_DROP_PERIOD(path)		(CSID_PXL_BASE(path) + 0x10)
+#define CSID_PXL_IRQ_SUBSAMPLE_PATTERN(path)	(CSID_PXL_BASE(path) + 0x14)
+#define CSID_PXL_IRQ_SUBSAMPLE_PERIOD(path)	(CSID_PXL_BASE(path) + 0x18)
+#define CSID_PXL_HCROP(path)			(CSID_PXL_BASE(path) + 0x1c)
+#define CSID_PXL_VCROP(path)			(CSID_PXL_BASE(path) + 0x20)
+#define CSID_PXL_PIX_DROP_PATTERN(path)		(CSID_PXL_BASE(path) + 0x24)
+#define CSID_PXL_PIX_DROP_PERIOD(path)		(CSID_PXL_BASE(path) + 0x28)
+#define CSID_PXL_LINE_DROP_PATTERN(path)	(CSID_PXL_BASE(path) + 0x2c)
+#define CSID_PXL_LINE_DROP_PERIOD(path)		(CSID_PXL_BASE(path) + 0x30)
+#define CSID_PXL_RST_STROBES(path)		(CSID_PXL_BASE(path) + 0x40)
+#define CSID_PXL_STATUS(path)			(CSID_PXL_BASE(path) + 0x54)
+#define CSID_PXL_MISR_VAL(path)			(CSID_PXL_BASE(path) + 0x58)
+#define CSID_PXL_FORMAT_MEASURE_CFG0(path)	(CSID_PXL_BASE(path) + 0x70)
+#define		PXL_FORMAT_MEASURE_CFG0_EN	0x3
+#define CSID_PXL_FORMAT_MEASURE_CFG1(path)	(CSID_PXL_BASE(path) + 0x74)
+#define CSID_PXL_FORMAT_MEASURE0(path)		(CSID_PXL_BASE(path) + 0x78)
+#define CSID_PXL_FORMAT_MEASURE1(path)		(CSID_PXL_BASE(path) + 0x7c)
+#define CSID_PXL_FORMAT_MEASURE2(path)		(CSID_PXL_BASE(path) + 0x80)
+#define CSID_PXL_TIMESTAMP_CURR0_SOF(path)	(CSID_PXL_BASE(path) + 0x90)
+#define CSID_PXL_TIMESTAMP_CURR1_SOF(path)	(CSID_PXL_BASE(path) + 0x94)
+#define CSID_PXL_TIMESTAMP_PREV0_SOF(path)	(CSID_PXL_BASE(path) + 0x98)
+#define CSID_PXL_TIMESTAMP_PREV1_SOF(path)	(CSID_PXL_BASE(path) + 0x9c)
+#define CSID_PXL_TIMESTAMP_CURR0_EOF(path)	(CSID_PXL_BASE(path) + 0xa0)
+#define CSID_PXL_TIMESTAMP_CURR1_EOF(path)	(CSID_PXL_BASE(path) + 0xa4)
+#define CSID_PXL_TIMESTAMP_PREV0_EOF(path)	(CSID_PXL_BASE(path) + 0xa8)
+#define CSID_PXL_TIMESTAMP_PREV1_EOF(path)	(CSID_PXL_BASE(path) + 0xac)
+#define CSID_PXL_IRQ_RST_DONE			BIT(1)
+#define CSID_PXL_IRQ_FIFO_OVERFLOW		BIT(2)
+#define CSID_PXL_IRQ_INPUT_EOF			BIT(9)
+#define CSID_PXL_IRQ_INPUT_SOF			BIT(12)
+#define CSID_PXL_IRQ_PIX_COUNT			BIT(13)
+#define CSID_PXL_IRQ_LINE_COUNT			BIT(14)
+#define CSID_PXL_IRQ_ERROR			(CSID_PXL_IRQ_FIFO_OVERFLOW | \
+						 CSID_PXL_IRQ_PIX_COUNT | \
+						 CSID_PXL_IRQ_LINE_COUNT)
+#define CSID_PXL_IRQ_MASK_CONFIGURED		(CSID_PXL_IRQ_RST_DONE | \
+						 CSID_PXL_IRQ_INPUT_EOF | \
+						 CSID_PXL_IRQ_INPUT_SOF | \
+						 CSID_PXL_IRQ_ERROR)
+#define CSID_PXL_IRQ_MASK_ALL			0x7fff
+#define CSID_PXL_ERR_RECOVERY_CFG0(path)	(CSID_PXL_BASE(path) + 0xd0)
+#define CSID_PXL_ERR_RECOVERY_CFG1(path)	(CSID_PXL_BASE(path) + 0xd4)
+#define CSID_PXL_ERR_RECOVERY_CFG2(path)	(CSID_PXL_BASE(path) + 0xd8)
+#define CSID_PXL_MULTI_VCDT_CFG0(path)		(CSID_PXL_BASE(path) + 0xdc)
+
 #define CSID_TPG_CTRL		0x600
 #define		TPG_CTRL_TEST_EN		0
 #define		TPG_CTRL_FS_PKT_EN		1
@@ -192,6 +273,20 @@ static void __csid_configure_rx(struct csid_device *csid,
 	writel_relaxed(val, csid->base + CSID_CSI2_RX_CFG1);
 }
 
+static bool csid_use_pxl_stream(struct csid_device *csid, u8 src)
+{
+	return !csid_is_lite(csid) && src == CSID_PXL_SRC_STREAM;
+}
+
+static void csid_reissue_vfe_reg_update(struct csid_device *csid, u8 src)
+{
+	struct media_pad *remote;
+
+	remote = media_pad_remote_pad_first(&csid->pads[MSM_CSID_PAD_FIRST_SRC + src]);
+	if (remote && is_media_entity_v4l2_subdev(remote->entity))
+		vfe_reissue_reg_update(media_entity_to_v4l2_subdev(remote->entity));
+}
+
 static void __csid_ctrl_rdi(struct csid_device *csid, int enable, u8 rdi)
 {
 	int val;
@@ -201,6 +296,17 @@ static void __csid_ctrl_rdi(struct csid_device *csid, int enable, u8 rdi)
 	else
 		val = HALT_CMD_HALT_AT_FRAME_BOUNDARY << RDI_CTRL_HALT_CMD;
 	writel_relaxed(val, csid->base + CSID_RDI_CTRL(rdi));
+}
+
+static void __csid_ctrl_pxl(struct csid_device *csid, int enable, u8 path)
+{
+	int val;
+
+	if (enable)
+		val = HALT_CMD_RESUME_AT_FRAME_BOUNDARY << PXL_CTRL_HALT_CMD;
+	else
+		val = HALT_CMD_HALT_AT_FRAME_BOUNDARY << PXL_CTRL_HALT_CMD;
+	writel_relaxed(val, csid->base + CSID_PXL_CTRL(path));
 }
 
 static void __csid_configure_testgen(struct csid_device *csid, u8 enable, u8 vc)
@@ -260,26 +366,12 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 
 	const struct csid_format_info *format = csid_get_fmt_entry(csid->res->formats->formats,
 								   csid->res->formats->nformats,
 								   input_format->code);
-	u32 val;
-
-	/*
-	 * DT_ID is a two bit bitfield that is concatenated with
-	 * the four least significant bits of the five bit VC
-	 * bitfield to generate an internal CID value.
-	 *
-	 * CSID_RDI_CFG0(vc)
-	 * DT_ID : 28:27
-	 * VC    : 26:22
-	 * DT    : 21:16
-	 *
-	 * CID   : VC 3:0 << 2 | DT_ID 1:0
-	 */
 	u8 dt_id = vc & 0x03;
+	u32 val;
 
 	val = 1 << RDI_CFG0_BYTE_CNTR_EN;
 	val |= 1 << RDI_CFG0_FORMAT_MEASURE_EN;
 	val |= 1 << RDI_CFG0_TIMESTAMP_EN;
-	/* note: for non-RDI path, this should be format->decode_format */
 	val |= DECODE_FORMAT_PAYLOAD_ONLY << RDI_CFG0_DECODE_FORMAT;
 	val |= format->data_type << RDI_CFG0_DATA_TYPE;
 	val |= vc << RDI_CFG0_VIRTUAL_CHANNEL;
@@ -318,23 +410,155 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 
 	writel_relaxed(val, csid->base + CSID_RDI_CTRL(vc));
 
 	val = readl_relaxed(csid->base + CSID_RDI_CFG0(vc));
-	val |=  enable << RDI_CFG0_ENABLE;
+	val |= enable << RDI_CFG0_ENABLE;
 	writel_relaxed(val, csid->base + CSID_RDI_CFG0(vc));
+}
+
+static void __csid_configure_pxl_stream(struct csid_device *csid, u8 enable,
+					 u8 src, u8 path)
+{
+	struct v4l2_mbus_framefmt *input_format =
+		&csid->fmt[MSM_CSID_PAD_FIRST_SRC + src];
+	const struct csid_format_info *format = csid_get_fmt_entry(csid->res->formats->formats,
+								   csid->res->formats->nformats,
+								   input_format->code);
+	u32 last_pixel = input_format->width ? input_format->width - 1 : 0;
+	u32 last_line = input_format->height ? input_format->height - 1 : 0;
+	u8 dt_id = CSID_PXL_VC & 0x03;
+	u32 val;
+
+	writel_relaxed(0, csid->base + CSID_PXL_IRQ_MASK(path));
+
+	val = 1 << PXL_CFG0_BYTE_CNTR_EN;
+	val |= 1 << PXL_CFG0_FORMAT_MEASURE_EN;
+	val |= 1 << PXL_CFG0_TIMESTAMP_EN;
+	val |= 1 << PXL_CFG0_PIX_STORE_EN;
+	val |= format->decode_format << PXL_CFG0_DECODE_FORMAT;
+	val |= format->data_type << PXL_CFG0_DATA_TYPE;
+	val |= CSID_PXL_VC << PXL_CFG0_VIRTUAL_CHANNEL;
+	val |= dt_id << PXL_CFG0_DT_ID;
+	writel_relaxed(val, csid->base + CSID_PXL_CFG0(path));
+
+	val = 2 << PXL_CFG1_TIMESTAMP_STB_SEL;
+	writel_relaxed(val, csid->base + CSID_PXL_CFG1(path));
+
+	val = 1;
+	writel_relaxed(val, csid->base + CSID_PXL_FRM_DROP_PERIOD(path));
+
+	val = 0;
+	writel_relaxed(val, csid->base + CSID_PXL_FRM_DROP_PATTERN(path));
+
+	val = 1;
+	writel_relaxed(val, csid->base + CSID_PXL_IRQ_SUBSAMPLE_PERIOD(path));
+
+	val = 0;
+	writel_relaxed(val, csid->base + CSID_PXL_IRQ_SUBSAMPLE_PATTERN(path));
+
+	val = 1;
+	writel_relaxed(val, csid->base + CSID_PXL_PIX_DROP_PERIOD(path));
+
+	val = 0;
+	writel_relaxed(val, csid->base + CSID_PXL_PIX_DROP_PATTERN(path));
+
+	val = 1;
+	writel_relaxed(val, csid->base + CSID_PXL_LINE_DROP_PERIOD(path));
+
+	val = 0;
+	writel_relaxed(val, csid->base + CSID_PXL_LINE_DROP_PATTERN(path));
+
+	val = last_pixel << 16;
+	writel_relaxed(val, csid->base + CSID_PXL_HCROP(path));
+
+	val = last_line << 16;
+	writel_relaxed(val, csid->base + CSID_PXL_VCROP(path));
+
+	val = (input_format->height & 0xffff) << 16;
+	val |= input_format->width & 0xffff;
+	writel_relaxed(val, csid->base + CSID_PXL_FORMAT_MEASURE_CFG1(path));
+	writel_relaxed(enable ? PXL_FORMAT_MEASURE_CFG0_EN : 0,
+		       csid->base + CSID_PXL_FORMAT_MEASURE_CFG0(path));
+
+	val = 0;
+	writel_relaxed(val, csid->base + CSID_PXL_CTRL(path));
+
+	val = readl_relaxed(csid->base + CSID_PXL_CFG0(path));
+	val |= enable << PXL_CFG0_ENABLE;
+	writel_relaxed(val, csid->base + CSID_PXL_CFG0(path));
+
+	writel_relaxed(CSID_PXL_IRQ_MASK_ALL,
+		       csid->base + CSID_PXL_IRQ_CLEAR(path));
+	writel_relaxed(1 << IRQ_CMD_CLEAR, csid->base + CSID_IRQ_CMD);
+
+	if (enable)
+		writel_relaxed(CSID_PXL_IRQ_MASK_CONFIGURED,
+			       csid->base + CSID_PXL_IRQ_MASK(path));
+
+	dev_dbg(csid->camss->dev,
+		"CSID%u PXL path %u %s: src=%u en_vc=%#x %ux%u code=%#x dt=%#x decode=%#x cfg0=%#x mask=%#x status=%#x measure=%#x/%#x/%#x/%#x/%#x\n",
+		csid->id, path, enable ? "enable" : "disable", src,
+		csid->phy.en_vc, input_format->width, input_format->height,
+		input_format->code, format->data_type, format->decode_format,
+		readl_relaxed(csid->base + CSID_PXL_CFG0(path)),
+		readl_relaxed(csid->base + CSID_PXL_IRQ_MASK(path)),
+		readl_relaxed(csid->base + CSID_PXL_STATUS(path)),
+		readl_relaxed(csid->base + CSID_PXL_FORMAT_MEASURE_CFG0(path)),
+		readl_relaxed(csid->base + CSID_PXL_FORMAT_MEASURE_CFG1(path)),
+		readl_relaxed(csid->base + CSID_PXL_FORMAT_MEASURE0(path)),
+		readl_relaxed(csid->base + CSID_PXL_FORMAT_MEASURE1(path)),
+		readl_relaxed(csid->base + CSID_PXL_FORMAT_MEASURE2(path)));
+}
+
+static void csid_pxl_irq_clear(struct csid_device *csid, u8 src, u8 path)
+{
+	u32 status = readl_relaxed(csid->base + CSID_PXL_IRQ_STATUS(path));
+	u32 error = status & CSID_PXL_IRQ_ERROR;
+
+	writel_relaxed(status, csid->base + CSID_PXL_IRQ_CLEAR(path));
+
+	if ((status & CSID_PXL_IRQ_INPUT_SOF) && !csid->pxl_sof_vfe_reg_update) {
+		csid->pxl_sof_vfe_reg_update = true;
+		csid_reissue_vfe_reg_update(csid, src);
+		dev_dbg(csid->camss->dev,
+			"CSID%u PXL first SOF: reissued VFE reg_update\n",
+			csid->id);
+	}
+
+	if (status)
+		dev_dbg(csid->camss->dev,
+			"CSID%u PXL path %u irq status: %#x error: %#x path-status: %#x measure: %#x/%#x/%#x/%#x/%#x\n",
+			csid->id, path, status, error,
+			readl_relaxed(csid->base + CSID_PXL_STATUS(path)),
+			readl_relaxed(csid->base +
+				      CSID_PXL_FORMAT_MEASURE_CFG0(path)),
+			readl_relaxed(csid->base +
+				      CSID_PXL_FORMAT_MEASURE_CFG1(path)),
+			readl_relaxed(csid->base + CSID_PXL_FORMAT_MEASURE0(path)),
+			readl_relaxed(csid->base + CSID_PXL_FORMAT_MEASURE1(path)),
+			readl_relaxed(csid->base + CSID_PXL_FORMAT_MEASURE2(path)));
 }
 
 static void csid_configure_stream(struct csid_device *csid, u8 enable)
 {
 	struct csid_testgen_config *tg = &csid->testgen;
 	u8 i;
-	/* Loop through all enabled VCs and configure stream for each */
+
+	/* Source stream 3 is reserved for the future full-VFE PIX/IPP path. */
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++)
 		if (csid->phy.en_vc & BIT(i)) {
 			if (tg->enabled)
 				__csid_configure_testgen(csid, enable, i);
 
-			__csid_configure_rdi_stream(csid, enable, i);
-			__csid_configure_rx(csid, &csid->phy, i);
-			__csid_ctrl_rdi(csid, enable, i);
+			if (csid_use_pxl_stream(csid, i)) {
+				__csid_configure_pxl_stream(csid, enable, i,
+							    CSID_PXL_PATH_IPP);
+				__csid_configure_rx(csid, &csid->phy, CSID_PXL_VC);
+				csid->pxl_sof_vfe_reg_update = false;
+				__csid_ctrl_pxl(csid, enable, CSID_PXL_PATH_IPP);
+			} else {
+				__csid_configure_rdi_stream(csid, enable, i);
+				__csid_configure_rx(csid, &csid->phy, i);
+				__csid_ctrl_rdi(csid, enable, i);
+			}
 		}
 }
 
@@ -363,15 +587,27 @@ static irqreturn_t csid_isr(int irq, void *dev)
 	val = readl_relaxed(csid->base + CSID_TOP_IRQ_STATUS);
 	writel_relaxed(val, csid->base + CSID_TOP_IRQ_CLEAR);
 	reset_done = val & BIT(TOP_IRQ_STATUS_RESET_DONE);
+	if ((csid->phy.en_vc & BIT(CSID_PXL_SRC_STREAM)) && val)
+		dev_dbg(csid->camss->dev,
+			"CSID%u PXL top irq status: %#x en_vc: %#x\n",
+			csid->id, val, csid->phy.en_vc);
 
 	val = readl_relaxed(csid->base + CSID_CSI2_RX_IRQ_STATUS);
 	writel_relaxed(val, csid->base + CSID_CSI2_RX_IRQ_CLEAR);
+	if ((csid->phy.en_vc & BIT(CSID_PXL_SRC_STREAM)) && val)
+		dev_dbg(csid->camss->dev,
+			"CSID%u PXL rx irq status: %#x en_vc: %#x\n",
+			csid->id, val, csid->phy.en_vc);
 
-	/* Read and clear IRQ status for each enabled RDI channel */
+	/* Read and clear IRQ status for each enabled output path. */
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS; i++)
 		if (csid->phy.en_vc & BIT(i)) {
-			val = readl_relaxed(csid->base + CSID_CSI2_RDIN_IRQ_STATUS(i));
-			writel_relaxed(val, csid->base + CSID_CSI2_RDIN_IRQ_CLEAR(i));
+			if (csid_use_pxl_stream(csid, i)) {
+				csid_pxl_irq_clear(csid, i, CSID_PXL_PATH_IPP);
+			} else {
+				val = readl_relaxed(csid->base + CSID_CSI2_RDIN_IRQ_STATUS(i));
+				writel_relaxed(val, csid->base + CSID_CSI2_RDIN_IRQ_CLEAR(i));
+			}
 		}
 
 	val = 1 << IRQ_CMD_CLEAR;
