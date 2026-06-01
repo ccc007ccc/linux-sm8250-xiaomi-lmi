@@ -26,7 +26,7 @@
 
 ## 构建 initramfs
 
-release 内核会嵌入当前 lmi initramfs。修改 initramfs 菜单、rootfs 发现逻辑、USB ACM 交接或早期 firmware staging 后，需要先构建 initramfs。
+release 内核会嵌入当前 lmi initramfs。修改 initramfs 菜单、rootfs 发现逻辑、USB ACM 交接、早期 firmware staging 或开机 UVC 按需启动支持层后，需要先构建 initramfs。默认构建会在相邻 `linux-sm8250-xiaomi-lmi` 仓库存在时内嵌 camera helper/静态二进制；如需完全关闭开机 UVC 支持层，可设置 `LMI_CAMERA_UVC=0`。
 
 ```sh
 /home/ccc007/Android/Kernel/lmi/sm8250-xiaomi-lmi-initramfs/scripts/build-initramfs.sh
@@ -39,7 +39,7 @@ release 内核会嵌入当前 lmi initramfs。修改 initramfs 菜单、rootfs �
 /home/ccc007/Android/Kernel/lmi/sm8250-xiaomi-lmi-initramfs/out/initramfs-sm8250-xiaomi-lmi.manifest
 ```
 
-内核配置片段 `lmi/configs/m1.config` 通过 `CONFIG_INITRAMFS_SOURCE` 引用该 cpio.gz，因此 initramfs 改动不会在不重编内核的情况下自动进入 boot image。
+内核配置片段 `lmi/configs/m1.config` 通过 `CONFIG_INITRAMFS_SOURCE` 引用该 cpio.gz，因此 initramfs 改动不会在不重编内核的情况下自动进入 boot image。比如开机 UVC quality / max-frame / helper 二进制变更后，必须先构建 initramfs，再构建 release 内核并重新打包 boot image；只替换 `out/initramfs-sm8250-xiaomi-lmi.cpio.gz` 或 boot ramdisk 不会更新已嵌入 `Image.gz` 的运行时支持层。
 
 ## 编译 release 内核
 

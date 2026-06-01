@@ -8,6 +8,7 @@ import math
 import mmap
 import os
 import select
+import signal
 import struct
 import subprocess
 import sys
@@ -2807,25 +2808,46 @@ class LoopbackSink:
 class UvcSink:
     """--isp-sink uvc: build a USB UVC gadget on the live system, run the C
     feeder (lmi-uvc-gadget) which speaks the UVC PROBE/COMMIT protocol on the
-    gadget OUTPUT node, and non-blocking whole-frame-write YUYV frames into a
-    FIFO the feeder drains. The phone then appears as a standard UVC webcam to a
-    USB host (e.g. a Windows PC) for host UVC consumers; browser getUserMedia is
-    a host-stack validation target, not something this helper itself proves."""
+    gadget OUTPUT node, and non-blocking whole-frame-write frames into a FIFO
+    the feeder drains. The phone then appears as a standard UVC webcam to a USB
+    host (e.g. a Windows PC) for host UVC consumers; browser getUserMedia is a
+    host-stack validation target, not something this helper itself proves."""
     kind = "uvc"
 
     def __init__(self, args):
-        self.format = "yuyv"  # UVC sink only advertises uncompressed YUYV
+        self.format = args.isp_uvc_format
         self.out_width = args.isp_width & ~1
         self.out_height = args.isp_height & ~1
         self.fps = max(1, args.isp_fps_cap or 15)
-        self.stride = self.out_width * 2
-        self.sizeimage = self.stride * self.out_height
+        if self.format == "yuyv":
+            self.stride = self.out_width * 2
+            self.sizeimage = self.stride * self.out_height
+            self.format_group = "uncompressed"
+            self.format_name = "yuyv"
+            self.header_name = "yuyv"
+        elif self.format == "mjpeg":
+            self.stride = 0
+            default_max = max(65536, self.out_width * self.out_height)
+            self.sizeimage = args.isp_uvc_max_frame_bytes or default_max
+            self.format_group = "mjpeg"
+            self.format_name = "mjpg"
+            self.header_name = "mjpg"
+        else:
+            self.stride = 0
+            default_max = max(262144, self.out_width * self.out_height)
+            self.sizeimage = args.isp_uvc_max_frame_bytes or default_max
+            self.format_group = "framebased"
+            self.format_name = "h264"
+            self.header_name = "h264"
         self.gadget_name = args.isp_uvc_gadget_name
         self.feeder_bin = args.isp_uvc_feeder_bin
         self.fifo = args.isp_uvc_fifo
+        self.ready_file = self.fifo + ".ready"
+        self.event_fifo = args.isp_uvc_event_fifo or (self.fifo + ".events")
         self.udc = args.isp_uvc_udc
         self.keep = args.isp_uvc_keep
         self.maxpkt = args.isp_uvc_maxpkt
+        self.buffers = args.isp_uvc_buffers
         self.configfs = "/sys/kernel/config/usb_gadget"
         self.gadget = "%s/%s" % (self.configfs, self.gadget_name)
         self.func = self.gadget + "/functions/uvc.0"
@@ -2833,11 +2855,16 @@ class UvcSink:
         self.node = None
         self.feeder = None
         self.fifo_fd = None
+        self.event_fd = None
+        self.event_buf = ""
         self._built = False
         self.pipe_cap = 65536
         self.udc_name = None
         self.external_writer = False  # when True (C engine), lmi-isp writes the FIFO, not us
+        self.external_proc = None  # optional external FIFO writer subprocess for orderly teardown
         self.prev_gadget = None  # gadget that held the UDC before us, to restore on close
+        self.recoveries = 0
+        self.recovery_retries = args.isp_uvc_recovery_retries
 
     def _gadget_on_udc(self, udc):
         """Return the usb_gadget configfs path currently bound to `udc`, or None."""
@@ -2861,6 +2888,117 @@ class UvcSink:
         with open(self.gadget + rel, "w") as fh:
             fh.write(str(val))
 
+    def _write_file(self, path, val):
+        with open(path, "w") as fh:
+            fh.write(str(val))
+
+    def _try_write_file(self, path, val):
+        try:
+            self._write_file(path, val)
+        except OSError:
+            pass
+
+    def _read_gadget_udc(self, gadget):
+        try:
+            with open(gadget + "/UDC") as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
+
+    def _unbind_gadget(self, gadget):
+        try:
+            with open(gadget + "/UDC", "w") as fh:
+                fh.write("\n")
+        except OSError:
+            pass
+
+    def _wait_udc_free(self, udc, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            busy = False
+            try:
+                names = os.listdir(self.configfs)
+            except OSError:
+                names = []
+            for nm in names:
+                p = "%s/%s" % (self.configfs, nm)
+                try:
+                    with open(p + "/UDC") as fh:
+                        if fh.read().strip() == udc:
+                            busy = True
+                            break
+                except OSError:
+                    pass
+            if not busy:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def _restore_previous_gadget(self):
+        if not self.prev_gadget or not self.udc_name:
+            return
+        try:
+            with open(self.prev_gadget + "/UDC", "w") as fh:
+                fh.write(self.udc_name)
+            restored = ""
+            try:
+                with open(self.prev_gadget + "/UDC") as fh:
+                    restored = fh.read().strip()
+            except OSError:
+                pass
+            if restored != self.udc_name:
+                print("[isp] uvc: warning: restore of %s on %s did not verify (UDC=%r)"
+                      % (os.path.basename(self.prev_gadget), self.udc_name, restored), flush=True)
+            else:
+                print("[isp] uvc: restored %s on %s"
+                      % (os.path.basename(self.prev_gadget), self.udc_name), flush=True)
+        except OSError as exc:
+            print("[isp] uvc: warning: could not restore %s on %s: %s"
+                  % (self.prev_gadget, self.udc_name, exc), flush=True)
+
+    def _frame_dir(self):
+        return "%s/streaming/%s/%s/%dp" % (self.func, self.format_group, self.format_name, self.out_height)
+
+    def _build_frame_descriptor(self):
+        f = self.func
+        wdir = self._frame_dir()
+        os.makedirs(wdir)
+        attrs = {
+            "wWidth": self.out_width,
+            "wHeight": self.out_height,
+            "dwMaxVideoFrameBufferSize": self.sizeimage,
+            "dwFrameInterval": self.interval,
+            "dwDefaultFrameInterval": self.interval,
+        }
+        if self.format != "yuyv":
+            bitrate = max(1, self.sizeimage * 8 * self.fps)
+            attrs["dwMinBitRate"] = max(1, bitrate // 3)
+            attrs["dwMaxBitRate"] = bitrate
+        if self.format == "h264":
+            attrs["dwBytesPerLine"] = 0
+            attrs["bVariableSize"] = 1
+        for attr, val in attrs.items():
+            self._try_write_file(wdir + "/" + attr, val)
+
+        # optional color matching (BT.601 full-ish); best-effort for YUYV/MJPEG
+        if self.format in ("yuyv", "mjpeg"):
+            try:
+                cm = f + "/streaming/color_matching/" + self.header_name
+                os.makedirs(cm)
+                for attr, val in (("bColorPrimaries", 1), ("bTransferCharacteristics", 1), ("bMatrixCoefficients", 4)):
+                    self._write_file(cm + "/" + attr, val)
+                os.symlink(cm, "%s/streaming/%s/%s/%s" % (f, self.format_group, self.format_name, self.header_name))
+            except OSError:
+                pass
+
+        os.makedirs(f + "/streaming/header/h")
+        os.symlink("%s/streaming/%s/%s" % (f, self.format_group, self.format_name),
+                   f + "/streaming/header/h/" + self.header_name)
+        os.makedirs(f + "/streaming/class/fs", exist_ok=True)
+        os.makedirs(f + "/streaming/class/hs", exist_ok=True)
+        os.makedirs(f + "/streaming/class/ss", exist_ok=True)
+
     def _build_gadget(self):
         if os.path.isdir(self.gadget):
             self._teardown_gadget()
@@ -2883,33 +3021,14 @@ class UvcSink:
         self._w("/configs/c.1/strings/0x409/configuration", "uvc")
         self._w("/configs/c.1/MaxPower", "500")
         os.makedirs(f)
+        os.makedirs(f + "/control/class/fs", exist_ok=True)
+        os.makedirs(f + "/control/class/ss", exist_ok=True)
         try:
             with open(f + "/streaming_maxpacket", "w") as fh:
                 fh.write(str(self.maxpkt))
         except OSError:
             pass
-        wdir = "%s/streaming/uncompressed/yuyv/%dp" % (f, self.out_height)
-        os.makedirs(wdir)
-        with open(wdir + "/wWidth", "w") as fh:
-            fh.write(str(self.out_width))
-        with open(wdir + "/wHeight", "w") as fh:
-            fh.write(str(self.out_height))
-        with open(wdir + "/dwMaxVideoFrameBufferSize", "w") as fh:
-            fh.write(str(self.sizeimage))
-        with open(wdir + "/dwFrameInterval", "w") as fh:
-            fh.write(str(self.interval))
-        # optional color matching (BT.601 full-ish); best-effort
-        try:
-            cm = f + "/streaming/color_matching/yuyv"
-            os.makedirs(cm)
-            for attr, val in (("bColorPrimaries", 1), ("bTransferCharacteristics", 1), ("bMatrixCoefficients", 4)):
-                with open(cm + "/" + attr, "w") as fh:
-                    fh.write(str(val))
-            os.symlink(cm, f + "/streaming/uncompressed/yuyv/yuyv")
-        except OSError:
-            pass
-        os.makedirs(f + "/streaming/header/h")
-        os.symlink(f + "/streaming/uncompressed/yuyv", f + "/streaming/header/h/yuyv")
+        self._build_frame_descriptor()
         for spd in ("fs", "hs", "ss"):
             os.symlink(f + "/streaming/header/h", f + "/streaming/class/%s/h" % spd)
         os.makedirs(f + "/control/header/h")
@@ -2930,28 +3049,50 @@ class UvcSink:
                 os.rmdir(path)
             except OSError:
                 pass
-        try:
-            with open(g + "/UDC", "w") as fh:
-                fh.write("\n")
-        except OSError:
-            pass
+        self._unbind_gadget(g)
+        if self.udc_name:
+            self._wait_udc_free(self.udc_name, timeout=3.0)
         rm(g + "/configs/c.1/uvc.0")
         for spd in ("fs", "ss"):
             rm(f + "/control/class/%s/h" % spd)
         for spd in ("fs", "hs", "ss"):
             rm(f + "/streaming/class/%s/h" % spd)
-        rm(f + "/streaming/header/h/yuyv")
-        rm(f + "/streaming/uncompressed/yuyv/yuyv")
+        for name in ("yuyv", "mjpg", "h264"):
+            rm(f + "/streaming/header/h/" + name)
+            rm(f + "/streaming/uncompressed/yuyv/" + name)
+            rm(f + "/streaming/mjpeg/mjpg/" + name)
+            rm(f + "/streaming/framebased/h264/" + name)
+            rmd(f + "/streaming/color_matching/" + name)
         rmd(f + "/control/header/h")
+        for path in sorted(glob.glob(f + "/control/*/*"), key=len, reverse=True):
+            if os.path.islink(path):
+                rm(path)
+            elif os.path.isdir(path):
+                rmd(path)
+        for path in sorted(glob.glob(f + "/control/*"), key=len, reverse=True):
+            if os.path.isdir(path):
+                rmd(path)
         rmd(f + "/streaming/header/h")
-        rmd(f + "/streaming/color_matching/yuyv")
-        for d in glob.glob(f + "/streaming/uncompressed/yuyv/*p"):
-            rmd(d)
-        rmd(f + "/streaming/uncompressed/yuyv")
+        for group, fmt in (("uncompressed", "yuyv"), ("mjpeg", "mjpg"), ("framebased", "h264")):
+            for d in glob.glob(f + "/streaming/%s/%s/*p" % (group, fmt)):
+                rmd(d)
+            rmd(f + "/streaming/%s/%s" % (group, fmt))
+            rmd(f + "/streaming/%s" % group)
+        for path in sorted(glob.glob(f + "/streaming/color_matching/*"), key=len, reverse=True):
+            if os.path.isdir(path):
+                rmd(path)
+        rmd(f + "/streaming/color_matching")
+        for path in sorted(glob.glob(f + "/streaming/*"), key=len, reverse=True):
+            if os.path.isdir(path):
+                rmd(path)
+        rmd(f + "/streaming")
+        rmd(f + "/control")
         rmd(f)
         rmd(g + "/configs/c.1/strings/0x409")
         rmd(g + "/configs/c.1")
+        rmd(g + "/configs")
         rmd(g + "/strings/0x409")
+        rmd(g + "/strings")
         rmd(g)
         self._built = False
 
@@ -2963,36 +3104,13 @@ class UvcSink:
             raise RuntimeError("no UDC available in /sys/class/udc")
         return udcs[0]
 
-    def negotiate(self):
-        if not os.path.isdir(self.configfs):
-            raise RuntimeError("configfs not mounted at %s" % self.configfs)
-        try:
-            os.mkfifo(self.fifo, 0o600)
-        except FileExistsError:
-            pass
-        before = set(glob.glob("/dev/video*"))
-        self._build_gadget()
-        udc = self._detect_udc()
-        self.udc_name = udc
-        # A UDC holds only one gadget; if the rootfs gadget (e.g. usb0 RNDIS/serial)
-        # is bound, unbind it first and remember it so we can restore on close.
-        self.prev_gadget = self._gadget_on_udc(udc)
-        if self.prev_gadget:
-            try:
-                with open(self.prev_gadget + "/UDC", "w") as fh:
-                    fh.write("\n")
-                print("[isp] uvc: temporarily unbound %s from %s (will restore on exit)"
-                      % (os.path.basename(self.prev_gadget), udc), flush=True)
-                time.sleep(0.3)
-            except OSError as exc:
-                raise RuntimeError("could not free UDC %s held by %s: %s"
-                                   % (udc, self.prev_gadget, exc))
-        self._w("/UDC", udc)
-        time.sleep(0.5)
-        after = set(glob.glob("/dev/video*"))
-        new_nodes = sorted(after - before)
-        if not new_nodes:
-            # fall back to matching the f_uvc video device by driver name
+    def _find_uvc_node(self, before, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            after = set(glob.glob("/dev/video*"))
+            new_nodes = sorted(after - before)
+            if new_nodes:
+                return new_nodes[0]
             for v in sorted(after):
                 base = os.path.basename(v)
                 try:
@@ -3000,48 +3118,217 @@ class UvcSink:
                         nm = fh.read().strip().lower()
                 except OSError:
                     nm = ""
-                if "uvc" in nm:
-                    new_nodes = [v]
-                    break
-        if not new_nodes:
-            raise RuntimeError("UVC gadget video node did not appear after UDC bind")
-        self.node = new_nodes[0]
-        # start the feeder (it creates/opens the FIFO O_RDWR and subscribes to events)
+                try:
+                    driver = os.path.basename(os.path.realpath(
+                        "/sys/class/video4linux/%s/device/driver" % base)).lower()
+                except OSError:
+                    driver = ""
+                try:
+                    device = os.path.realpath("/sys/class/video4linux/%s/device" % base).lower()
+                except OSError:
+                    device = ""
+                if "uvc" in nm or "gadget" in nm or "configfs-gadget" in driver or "gadget" in device:
+                    return v
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+
+    def _wait_feeder_ready(self, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.feeder is not None and self.feeder.poll() is not None:
+                raise RuntimeError("UVC feeder exited during startup with code %s" % self.feeder.returncode)
+            if os.path.exists(self.ready_file):
+                return
+            time.sleep(0.05)
+        raise RuntimeError("UVC feeder did not finish device setup in time")
+
+    def open_event_reader(self):
+        if self.event_fd is not None:
+            return
+        self.event_fd = os.open(self.event_fifo, os.O_RDWR | os.O_NONBLOCK)
+        self.event_buf = ""
+
+    def poll_events(self):
+        if self.event_fd is None:
+            return []
+        events = []
+        while True:
+            try:
+                chunk = os.read(self.event_fd, 4096)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.event_buf += chunk.decode("ascii", "ignore")
+            while "\n" in self.event_buf:
+                line, self.event_buf = self.event_buf.split("\n", 1)
+                line = line.strip()
+                if line:
+                    events.append(line)
+        return events
+
+    def start_feeder(self):
+        try:
+            os.unlink(self.ready_file)
+        except FileNotFoundError:
+            pass
         cmd = [
             self.feeder_bin, "--device", self.node, "--fifo", self.fifo,
             "--width", str(self.out_width), "--height", str(self.out_height),
             "--fps", str(self.fps), "--maxpkt", str(self.maxpkt), "--intf", "1",
+            "--buffers", str(self.buffers), "--format", self.format,
+            "--max-frame", str(self.sizeimage), "--ready-file", self.ready_file,
+            "--event-fifo", self.event_fifo,
         ]
         self.feeder = subprocess.Popen(cmd)
-        if self.external_writer:
-            # the C ISP (lmi-isp --fifo) is the sole writer; we only manage the
-            # gadget + feeder lifecycle here.
-            print("[isp] uvc gadget %s bound to UDC %s, node=%s, feeder pid=%s (external writer)"
-                  % (self.gadget_name, udc, self.node, self.feeder.pid), flush=True)
-            return
-        # open FIFO for writing; feeder holds the read end (O_RDWR) so this won't hang long
-        deadline = time.monotonic() + 5.0
-        while True:
+        self._wait_feeder_ready(timeout=3.0)
+
+    def _close_event_reader(self):
+        if self.event_fd is not None:
             try:
-                self.fifo_fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
-                break
+                os.close(self.event_fd)
             except OSError:
-                if time.monotonic() > deadline:
-                    raise RuntimeError("feeder did not open the FIFO read end in time")
-                time.sleep(0.1)
-        # Enlarge the pipe to hold a few frames and keep the fd non-blocking; the
-        # writer below only ever writes a WHOLE frame when there is room, and drops
-        # otherwise. This keeps frame framing exact AND keeps the ISP loop
-        # interruptible even if the feeder stalls (a blocking write previously
-        # hung the daemon uninterruptibly on a host-disconnect race).
-        import fcntl as _fcntl
-        f_setpipe = getattr(_fcntl, "F_SETPIPE_SZ", 1031)
+                pass
+            self.event_fd = None
+        self.event_buf = ""
+
+    def _stop_feeder(self):
+        if self.feeder is None:
+            return
+        old_pid = self.feeder.pid
         try:
-            self.pipe_cap = _fcntl.fcntl(self.fifo_fd, f_setpipe, self.sizeimage * 3)
-        except OSError:
-            self.pipe_cap = 65536
-        print("[isp] uvc gadget %s bound to UDC %s, node=%s, feeder pid=%s"
-              % (self.gadget_name, udc, self.node, self.feeder.pid), flush=True)
+            if self.feeder.poll() is None:
+                self.feeder.terminate()
+                self.feeder.wait(timeout=3)
+            else:
+                self.feeder.wait(timeout=0)
+        except Exception:
+            try:
+                self.feeder.kill()
+                self.feeder.wait(timeout=1)
+            except Exception:
+                pass
+        self.feeder = None
+        print("[isp] uvc: feeder pid=%s stopped" % old_pid, flush=True)
+
+    def rebind_gadget(self, reason):
+        if not self.udc_name or not os.path.isdir(self.gadget):
+            raise RuntimeError("cannot rebind UVC gadget before initial negotiation")
+        print("[isp] uvc: %s -> rebind %s on %s"
+              % (reason, self.gadget_name, self.udc_name), flush=True)
+        self._close_event_reader()
+        # Stop userspace first.  Unbinding the UDC while f_uvc userspace still
+        # holds the video node can wedge configfs/f_uvc on lmi/dwc3.
+        self._stop_feeder()
+        self.node = None
+        self._unbind_gadget(self.gadget)
+        if not self._wait_udc_free(self.udc_name, timeout=3.0):
+            print("[isp] uvc: warning: UDC %s still busy before rebind" % self.udc_name, flush=True)
+        before = set(glob.glob("/dev/video*"))
+        self._w("/UDC", self.udc_name)
+        node = self._find_uvc_node(before, timeout=5.0)
+        if not node:
+            raise RuntimeError("UVC gadget video node did not appear after rebind")
+        self.node = node
+        self.open_event_reader()
+        self.start_feeder()
+        print("[isp] uvc: rebound %s on %s, node=%s, feeder pid=%s"
+              % (self.gadget_name, self.udc_name, self.node, self.feeder.pid), flush=True)
+
+    def recover_feeder(self):
+        if self.feeder is None or self.feeder.poll() is None:
+            return False
+        if self.recoveries >= self.recovery_retries:
+            return False
+        old_code = self.feeder.returncode
+        try:
+            self.feeder.wait(timeout=0)
+        except Exception:
+            pass
+        self.feeder = None
+        self.recoveries += 1
+        print("[isp] uvc feeder exited with code %s; rebinding gadget (%d/%d)"
+              % (old_code, self.recoveries, self.recovery_retries), flush=True)
+        self.rebind_gadget("feeder exit")
+        return True
+
+    def wait_event(self, timeout=0.5):
+        events = self.poll_events()
+        if events or self.event_fd is None:
+            return events
+        readable, _, _ = select.select([self.event_fd], [], [], timeout)
+        if readable:
+            events.extend(self.poll_events())
+        return events
+
+    def negotiate(self):
+        if not os.path.isdir(self.configfs):
+            raise RuntimeError("configfs not mounted at %s" % self.configfs)
+        try:
+            os.mkfifo(self.fifo, 0o600)
+        except FileExistsError:
+            pass
+        try:
+            os.mkfifo(self.event_fifo, 0o600)
+        except FileExistsError:
+            pass
+        try:
+            os.unlink(self.ready_file)
+        except FileNotFoundError:
+            pass
+        before = set(glob.glob("/dev/video*"))
+        try:
+            self._build_gadget()
+            udc = self._detect_udc()
+            self.udc_name = udc
+            # A UDC holds only one gadget; if the rootfs gadget (e.g. usb0 RNDIS/serial)
+            # is bound, unbind it first and remember it so we can restore on close.
+            self.prev_gadget = self._gadget_on_udc(udc)
+            if self.prev_gadget:
+                self._unbind_gadget(self.prev_gadget)
+                if not self._wait_udc_free(udc, timeout=3.0):
+                    raise RuntimeError("UDC %s did not become free after unbinding %s"
+                                       % (udc, self.prev_gadget))
+                print("[isp] uvc: temporarily unbound %s from %s (will restore on exit)"
+                      % (os.path.basename(self.prev_gadget), udc), flush=True)
+            self._w("/UDC", udc)
+            self.node = self._find_uvc_node(before)
+            if not self.node:
+                raise RuntimeError("UVC gadget video node did not appear after UDC bind")
+            self.open_event_reader()
+            self.start_feeder()
+            if self.external_writer:
+                # the C ISP (lmi-isp --fifo) is the sole writer; we only manage the
+                # gadget + feeder lifecycle here.
+                print("[isp] uvc gadget %s bound to UDC %s, node=%s, feeder pid=%s fmt=%s (external writer)"
+                      % (self.gadget_name, udc, self.node, self.feeder.pid, self.format), flush=True)
+                return
+            # open FIFO for writing; feeder holds the read end (O_RDWR) so this won't hang long
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    self.fifo_fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError:
+                    if self.feeder and self.feeder.poll() is not None:
+                        raise RuntimeError("UVC feeder exited before opening FIFO")
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("feeder did not open the FIFO read end in time")
+                    time.sleep(0.1)
+            import fcntl as _fcntl
+            f_setpipe = getattr(_fcntl, "F_SETPIPE_SZ", 1031)
+            try:
+                self.pipe_cap = _fcntl.fcntl(self.fifo_fd, f_setpipe, self.sizeimage * 3)
+            except OSError:
+                self.pipe_cap = 65536
+            print("[isp] uvc gadget %s bound to UDC %s, node=%s, feeder pid=%s fmt=%s"
+                  % (self.gadget_name, udc, self.node, self.feeder.pid, self.format), flush=True)
+        except Exception:
+            self.close()
+            raise
 
     def write_frame(self, frame):
         if self.fifo_fd is None:
@@ -3079,40 +3366,86 @@ class UvcSink:
             except OSError:
                 pass
             self.fifo_fd = None
-        if self.feeder is not None:
+        if self.external_proc is not None and self.external_proc.poll() is None:
             try:
-                self.feeder.terminate()
-                self.feeder.wait(timeout=3)
+                self.external_proc.send_signal(signal.SIGINT)
+                self.external_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.external_proc.terminate()
+                    self.external_proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        self.external_proc.kill()
+                        self.external_proc.wait(timeout=1)
+                    except Exception:
+                        pass
+        self.external_proc = None
+        if self.event_fd is not None:
+            try:
+                os.close(self.event_fd)
+            except OSError:
+                pass
+            self.event_fd = None
+        if self.feeder is not None:
+            # Stop the f_uvc userspace endpoint before UDC unbind.  On lmi/dwc3,
+            # unbinding while the feeder still has the gadget video node open can
+            # block in f_uvc; after the feeder closes, the UDC disconnect completes.
+            try:
+                if self.feeder.poll() is None:
+                    self.feeder.terminate()
+                    self.feeder.wait(timeout=3)
+                else:
+                    self.feeder.wait(timeout=0)
             except Exception:
                 try:
                     self.feeder.kill()
+                    self.feeder.wait(timeout=1)
                 except Exception:
                     pass
             self.feeder = None
         if self._built and not self.keep:
+            self._unbind_gadget(self.gadget)
+            if self.udc_name:
+                self._wait_udc_free(self.udc_name, timeout=3.0)
             self._teardown_gadget()
         # restore whatever rootfs gadget (usb0 etc.) previously held the UDC
         if self.prev_gadget and self.udc_name and not self.keep:
-            try:
-                with open(self.prev_gadget + "/UDC", "w") as fh:
-                    fh.write(self.udc_name)
-                print("[isp] uvc: restored %s on %s"
-                      % (os.path.basename(self.prev_gadget), self.udc_name), flush=True)
-            except OSError:
-                pass
+            self._restore_previous_gadget()
         try:
             if not self.keep:
                 os.unlink(self.fifo)
         except OSError:
             pass
+        try:
+            if not self.keep:
+                os.unlink(self.ready_file)
+        except OSError:
+            pass
+        try:
+            if not self.keep:
+                os.unlink(self.event_fifo)
+        except OSError:
+            pass
 
     def describe(self):
-        return {"sink": self.kind, "node": self.node, "gadget": self.gadget_name, "fifo": self.fifo}
+        return {"sink": self.kind, "node": self.node, "gadget": self.gadget_name, "fifo": self.fifo, "format": self.format}
 
 
 def validate_isp_args(args):
-    if args.isp_sink == "uvc" and args.isp_format != "yuyv":
-        raise SystemExit("--isp-sink uvc only supports --isp-format yuyv")
+    if args.isp_sink != "uvc":
+        return
+    uvc_format = getattr(args, "isp_uvc_format", "yuyv")
+    if uvc_format == "yuyv" and args.isp_format != "yuyv":
+        raise SystemExit("--isp-sink uvc --isp-uvc-format yuyv requires --isp-format yuyv")
+    if uvc_format == "mjpeg" and getattr(args, "isp_engine", "c") != "c":
+        raise SystemExit("--isp-uvc-format mjpeg currently requires --isp-engine c")
+    if getattr(args, "isp_uvc_demand_start", False) and getattr(args, "isp_engine", "c") != "c":
+        raise SystemExit("--isp-uvc-demand-start requires --isp-engine c")
+    if uvc_format == "h264":
+        if not getattr(args, "isp_uvc_h264_experimental", False):
+            raise SystemExit("--isp-uvc-format h264 is experimental; pass --isp-uvc-h264-experimental after validating a Venus encoder")
+        raise SystemExit("--isp-uvc-format h264 transport is scaffolded, but the Venus encoder bridge is not implemented yet; use --isp-uvc-format mjpeg")
 
 
 def make_isp_sink(args):
@@ -3194,30 +3527,7 @@ def isp_process_frame(camera, args, sink):
     return frame, meta, info
 
 
-def run_isp_c(args):
-    """C-engine ISP path: Python set up the route/sensor-mode (and the UVC gadget
-    when needed); the fast lmi-isp binary does capture + full ISP + output. This
-    is the default engine — far higher fps/resolution than the pure-Python loop."""
-    validate_isp_args(args)
-    gadget = None
-    if args.isp_sink == "uvc":
-        gadget = UvcSink(args)
-        gadget.external_writer = True
-        try:
-            gadget.negotiate()
-        except Exception:
-            gadget.close()
-            raise
-        out = ["--fifo", args.isp_uvc_fifo]
-    elif args.isp_sink == "loopback":
-        if not args.isp_node:
-            raise SystemExit("--isp-sink loopback requires --isp-node /dev/videoN")
-        out = ["--loopback", args.isp_node]
-    elif args.isp_dump:
-        out = ["--dump", args.isp_dump, "--frames", str(max(1, args.isp_frames))]
-    else:
-        raise SystemExit("--isp-engine c requires --isp-sink loopback/uvc or --isp-dump")
-
+def build_isp_c_command(args, out, gadget=None):
     ctrl = args.control_subdev or args.sensor_subdev or ""
     cmd = [
         args.isp_engine_bin,
@@ -3225,35 +3535,254 @@ def run_isp_c(args):
         "--out-width", str(args.isp_width),
         "--out-height", str(args.isp_height),
         "--gamma", str(getattr(args, "isp_gamma", 2.2)),
+        "--tone-highlight-knee", str(args.isp_tone_highlight_knee),
+        "--tone-highlight-max", str(args.isp_tone_highlight_max),
         "--fps-cap", str(args.isp_fps_cap),
+        "--max-soft-gain", str(args.isp_max_soft_gain),
     ] + out
     if ctrl:
         cmd += ["--ctrl", ctrl]
-    if args.isp_format == "nv12":
+    if args.isp_sink == "uvc" and args.isp_uvc_format == "mjpeg":
+        cmd += [
+            "--mjpeg",
+            "--mjpeg-quality", str(args.isp_uvc_mjpeg_quality),
+            "--mjpeg-sharpen", str(args.isp_uvc_mjpeg_sharpen),
+            "--mjpeg-smooth", str(args.isp_uvc_mjpeg_smooth),
+            "--mjpeg-area-scale", str(args.isp_uvc_mjpeg_area_scale),
+            "--mjpeg-subsampling", str(args.isp_uvc_mjpeg_subsampling),
+            "--mjpeg-scale-mode", str(args.isp_uvc_mjpeg_scale_mode),
+            "--max-frame-bytes", str(gadget.sizeimage if gadget is not None else args.isp_uvc_max_frame_bytes),
+        ]
+    elif args.isp_format == "nv12":
         cmd.append("--nv12")
     if args.auto_exposure:
         cmd += ["--auto-exposure", "--target", str(int(args.target_luma))]
-    print("[isp] engine=c: %s" % " ".join(cmd), flush=True)
-    proc = subprocess.Popen(cmd)
+        if args.isp_ae_clip_target is not None:
+            cmd += ["--ae-clip-target", str(args.isp_ae_clip_target)]
+            cmd += ["--ae-clip-weight", str(args.isp_ae_clip_weight)]
+        if args.isp_max_digital_gain is not None:
+            cmd += ["--max-digital-gain", str(args.isp_max_digital_gain)]
+    return cmd
+
+
+def stop_isp_process(proc, label="ISP"):
+    if proc is None:
+        return None
+    if proc.poll() is not None:
+        return proc.returncode
     try:
-        proc.wait()
-    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=3)
+    except Exception:
         try:
-            import signal as _sig
-            proc.send_signal(_sig.SIGINT)
-            proc.wait(timeout=5)
+            proc.terminate()
+            proc.wait(timeout=2)
         except Exception:
             try:
                 proc.kill()
+                proc.wait(timeout=1)
             except Exception:
                 pass
+    print("[isp] %s stopped" % label, flush=True)
+    return proc.returncode
+
+
+def run_isp_c_uvc_demand(args):
+    """Keep the USB UVC gadget enumerated, but start the RAW camera + C ISP only
+    while the host is actively streaming.  This is the intended long-running mode
+    for boot-time camera-device presentation without keeping OV13B10/CAMSS active
+    when no host application is using the webcam."""
+    validate_isp_args(args)
+    gadget = UvcSink(args)
+    gadget.external_writer = True
+    proc = None
+    stream_requested = False
+    pending_stop_at = None
+    pending_rebind_reason = None
+    next_start_at = None
+    signal_handlers = {}
+
+    def request_stop(signum, _frame):
+        raise KeyboardInterrupt("signal %d" % signum)
+
+    def start_proc():
+        nonlocal proc
+        if proc is not None and proc.poll() is None:
+            return
+        configure(args)
+        cmd = build_isp_c_command(args, ["--fifo", args.isp_uvc_fifo], gadget)
+        print("[isp] uvc demand: STREAMON -> starting camera/ISP: %s" % " ".join(cmd), flush=True)
+        proc = subprocess.Popen(cmd)
+        gadget.external_proc = proc
+
+    def stop_proc(reason):
+        nonlocal proc
+        if proc is not None:
+            print("[isp] uvc demand: %s -> stopping camera/ISP" % reason, flush=True)
+            stop_isp_process(proc, "camera/ISP")
+            proc = None
+            gadget.external_proc = None
+
+    def schedule_start_retry(reason):
+        nonlocal next_start_at
+        if not stream_requested:
+            next_start_at = None
+            return
+        delay = max(0.1, args.isp_uvc_restart_delay)
+        next_start_at = time.monotonic() + delay
+        print("[isp] uvc demand: %s -> retry camera/ISP start in %.1fs" % (reason, delay), flush=True)
+
+    def try_start_proc(reason):
+        nonlocal next_start_at
+        if not stream_requested:
+            next_start_at = None
+            return
+        if proc is not None and proc.poll() is None:
+            next_start_at = None
+            return
+        try:
+            start_proc()
+            next_start_at = None
+        except Exception as exc:
+            print("[isp] uvc demand: camera/ISP start failed during %s: %s" % (reason, exc), flush=True)
+            stop_proc("start failure")
+            schedule_start_retry("start failure")
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_stop)
+    try:
+        gadget.negotiate()
+        print("[isp] uvc demand: gadget is enumerated; waiting for host STREAMON before starting camera/ISP", flush=True)
+        while True:
+            if gadget.feeder is not None and gadget.feeder.poll() is not None:
+                stop_proc("feeder exit")
+                try:
+                    if gadget.recover_feeder():
+                        stream_requested = False
+                        pending_stop_at = None
+                        pending_rebind_reason = None
+                        next_start_at = None
+                        continue
+                except Exception as exc:
+                    print("[isp] uvc feeder recovery failed: %s" % exc, flush=True)
+                feeder_code = gadget.feeder.returncode if gadget.feeder is not None else "unknown"
+                raise RuntimeError("UVC feeder exited with code %s" % feeder_code)
+
+            for event in gadget.wait_event(timeout=0.5):
+                if event == "STREAMON":
+                    stream_requested = True
+                    pending_stop_at = None
+                    pending_rebind_reason = None
+                    try_start_proc("STREAMON")
+                elif event in ("STREAMOFF", "DISCONNECT"):
+                    if stream_requested or proc is not None:
+                        print("[isp] uvc demand: %s -> will stop camera/ISP after %.1fs grace"
+                              % (event, args.isp_uvc_idle_stop_delay), flush=True)
+                    stream_requested = False
+                    next_start_at = None
+                    pending_stop_at = time.monotonic() + max(0.0, args.isp_uvc_idle_stop_delay)
+                    if event == "DISCONNECT":
+                        pending_rebind_reason = "host DISCONNECT"
+                        gadget.poll_events()
+                elif event == "CONNECT":
+                    print("[isp] uvc demand: host connected", flush=True)
+
+            if proc is not None and proc.poll() is not None:
+                print("[isp] uvc demand: camera/ISP exited with code %s" % proc.returncode, flush=True)
+                proc = None
+                gadget.external_proc = None
+                if stream_requested:
+                    pending_stop_at = None
+                    schedule_start_retry("camera/ISP exit")
+            if next_start_at is not None and time.monotonic() >= next_start_at:
+                try_start_proc("retry")
+            if pending_stop_at is not None and time.monotonic() >= pending_stop_at:
+                stop_proc("idle")
+                pending_stop_at = None
+                if pending_rebind_reason is not None:
+                    try:
+                        gadget.rebind_gadget(pending_rebind_reason)
+                    except Exception as exc:
+                        print("[isp] uvc rebind after %s failed: %s" % (pending_rebind_reason, exc), flush=True)
+                        raise
+                    pending_rebind_reason = None
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_proc("exit")
+        gadget.close()
+        for signum, handler in signal_handlers.items():
+            signal.signal(signum, handler)
+
+
+def run_isp_c(args):
+    """C-engine ISP path: Python set up the route/sensor-mode (and the UVC gadget
+    when needed); the fast lmi-isp binary does capture + full ISP + output. This
+    is the default engine — far higher fps/resolution than the pure-Python loop."""
+    validate_isp_args(args)
+    gadget = None
+    proc = None
+    signal_handlers = {}
+
+    def request_stop(signum, _frame):
+        raise KeyboardInterrupt("signal %d" % signum)
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_stop)
+    try:
+        if args.isp_sink == "uvc":
+            gadget = UvcSink(args)
+            gadget.external_writer = True
+            gadget.negotiate()
+            out = ["--fifo", args.isp_uvc_fifo]
+        elif args.isp_sink == "loopback":
+            if not args.isp_node:
+                raise SystemExit("--isp-sink loopback requires --isp-node /dev/videoN")
+            out = ["--loopback", args.isp_node]
+        elif args.isp_dump:
+            out = ["--dump", args.isp_dump, "--frames", str(max(1, args.isp_frames))]
+        else:
+            raise SystemExit("--isp-engine c requires --isp-sink loopback/uvc or --isp-dump")
+
+        cmd = build_isp_c_command(args, out, gadget)
+        print("[isp] engine=c: %s" % " ".join(cmd), flush=True)
+        proc = subprocess.Popen(cmd)
+        if gadget is not None:
+            gadget.external_proc = proc
+        while True:
+            try:
+                proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if gadget is not None and gadget.feeder is not None and gadget.feeder.poll() is not None:
+                    try:
+                        if gadget.recover_feeder():
+                            continue
+                    except Exception as exc:
+                        print("[isp] uvc feeder recovery failed: %s" % exc, flush=True)
+                    feeder_code = gadget.feeder.returncode if gadget.feeder is not None else "unknown"
+                    print("[isp] uvc feeder exited with code %s; stopping ISP" % feeder_code, flush=True)
+                    stop_isp_process(proc)
+                    break
+    except KeyboardInterrupt:
+        stop_isp_process(proc)
     finally:
         if gadget is not None:
             gadget.close()
+        for signum, handler in signal_handlers.items():
+            signal.signal(signum, handler)
 
 
 def run_isp(args):
     validate_isp_args(args)
+    if (getattr(args, "isp_engine", "c") == "c" and args.isp_sink == "uvc" and
+            getattr(args, "isp_uvc_demand_start", False)):
+        run_isp_c_uvc_demand(args)
+        return
     configure(args)
     if getattr(args, "isp_engine", "c") == "c":
         run_isp_c(args)
@@ -3419,6 +3948,12 @@ def parse_args():
     parser.add_argument("--isp-height", type=int, default=480, help="advertised ISP node height")
     parser.add_argument("--isp-src-width", type=int, default=480, help="software demosaic working width (perf knob; resampled to --isp-width)")
     parser.add_argument("--isp-gamma", type=float, default=2.2, help="ISP display gamma tone curve (1.0 = linear/off); improves shadow/highlight latitude")
+    parser.add_argument("--isp-tone-highlight-knee", type=int, default=0, help="optional C ISP post-gamma highlight shoulder knee (0 = off)")
+    parser.add_argument("--isp-tone-highlight-max", type=int, default=255, help="optional C ISP post-gamma highlight shoulder ceiling")
+    parser.add_argument("--isp-max-soft-gain", type=float, default=4.0, help="maximum software lift in the C ISP auto-tone path; lower reduces dark-scene noise")
+    parser.add_argument("--isp-max-digital-gain", type=int, help="optional C ISP digital gain ceiling for software AE; lower reduces sensor noise")
+    parser.add_argument("--isp-ae-clip-target", type=int, help="optional C ISP raw-highlight percentile cap for software AE; lower preserves bright lights")
+    parser.add_argument("--isp-ae-clip-weight", type=int, default=50, help="C ISP AE highlight-cap penalty weight in percent")
     parser.add_argument("--isp-engine", choices=("c", "python"), default="c", help="frame engine: c = fast lmi-isp binary (default, higher fps/res), python = pure-stdlib loop")
     parser.add_argument("--isp-engine-bin", default="/tmp/lmi-isp", help="path to the cross-compiled lmi-isp binary for --isp-engine c")
     parser.add_argument("--isp-fps-cap", type=int, default=15, help="pace ISP output to at most this many fps (0 = uncapped)")
@@ -3427,9 +3962,24 @@ def parse_args():
     parser.add_argument("--isp-status", help="optional JSON status output path updated periodically by the ISP daemon")
     parser.add_argument("--isp-uvc-gadget-name", default="lmi_uvc", help="configfs usb_gadget name for --isp-sink uvc")
     parser.add_argument("--isp-uvc-feeder-bin", default="/tmp/lmi-uvc-gadget", help="path to the cross-compiled UVC feeder binary")
-    parser.add_argument("--isp-uvc-fifo", default="/tmp/lmi-uvc.fifo", help="FIFO used to hand YUYV frames to the UVC feeder")
+    parser.add_argument("--isp-uvc-fifo", default="/tmp/lmi-uvc.fifo", help="FIFO used to hand frames to the UVC feeder")
+    parser.add_argument("--isp-uvc-event-fifo", default="", help="FIFO used by lmi-uvc-gadget to report host STREAMON/OFF events")
+    parser.add_argument("--isp-uvc-demand-start", action="store_true", help="keep UVC enumerated but start OV13B10/CAMSS/lmi-isp only while the host streams")
+    parser.add_argument("--isp-uvc-idle-stop-delay", type=float, default=2.0, help="seconds to keep camera/ISP alive after UVC STREAMOFF before stopping it")
+    parser.add_argument("--isp-uvc-restart-delay", type=float, default=1.0, help="seconds before restarting camera/ISP if it exits while the host still streams")
+    parser.add_argument("--isp-uvc-format", choices=("yuyv", "mjpeg", "h264"), default="yuyv", help="UVC advertised/transport format; MJPEG reduces USB-HS bandwidth")
+    parser.add_argument("--isp-uvc-mjpeg-quality", type=int, default=60, help="software MJPEG quality for --isp-uvc-format mjpeg")
+    parser.add_argument("--isp-uvc-mjpeg-sharpen", type=int, default=0, help="MJPEG RGB unsharp amount in percent (0 = off)")
+    parser.add_argument("--isp-uvc-mjpeg-smooth", type=int, default=0, help="MJPEG RGB post-downscale smoothing amount in percent (0 = off)")
+    parser.add_argument("--isp-uvc-mjpeg-area-scale", type=int, default=100, help="percent of each Bayer source footprint averaged before MJPEG encode (lower = sharper, noisier)")
+    parser.add_argument("--isp-uvc-mjpeg-subsampling", type=int, choices=(420, 444), default=420, help="JPEG chroma subsampling for MJPEG UVC; 444 avoids chroma subsampling grid artifacts")
+    parser.add_argument("--isp-uvc-mjpeg-scale-mode", choices=("bayer-area", "bayer-area-frac", "bayer-center", "demosaic-center", "demosaic-4tap", "demosaic-9tap"), default="bayer-area", help="MJPEG RGB generation path; bayer-area-frac is the current 720p UVC quality path")
+    parser.add_argument("--isp-uvc-max-frame-bytes", type=int, default=0, help="maximum compressed UVC payload size (0 = format default)")
+    parser.add_argument("--isp-uvc-h264-experimental", action="store_true", help="allow the scaffolded H.264 UVC path when a separate encoder helper is available")
     parser.add_argument("--isp-uvc-udc", default="", help="UDC name to bind (default: first /sys/class/udc entry)")
     parser.add_argument("--isp-uvc-maxpkt", type=int, default=1024, help="UVC streaming endpoint max packet size")
+    parser.add_argument("--isp-uvc-buffers", type=int, default=2, help="UVC feeder MMAP buffer count (2-4; lower reduces latency)")
+    parser.add_argument("--isp-uvc-recovery-retries", type=int, default=3, help="restart the UVC feeder this many times after transient USB/g_uvc fd loss")
     parser.add_argument("--isp-uvc-keep", action="store_true", help="do not tear down the UVC gadget/FIFO on exit (debug)")
     return parser.parse_args()
 
