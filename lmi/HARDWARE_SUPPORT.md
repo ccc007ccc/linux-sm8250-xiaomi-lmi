@@ -28,9 +28,9 @@
 | USB / Type-C | 部分支持 | DWC3 gadget、USB ACM 串口、Type-C 基础枚举和标准 PD sink 已验证；标准 PD 曾验证到 9V/2A。 | USB host/OTG、完整角色切换和更多 PD 场景仍需继续验证。 |
 | 电池 / 充电 | 部分支持 | PM8150B Type-C/TCPM、SMB5 charger 和 gen4 fuel-gauge 已能暴露 USB 输入、电池容量、电压、电流、温度和状态；当前代码提供 `charge_behaviour`、`input_current_limit` 目标值、`current_max` 有效值和 `lmi-power` 保守限充服务，默认 70% 停充、65% 恢复，停充状态和策略输出已实机核对。 | 仍需更长时间观察容量/温度保持；Xiaomi 33W 私有快充、BQ2597x 充电泵、完整电池曲线和硬件旁路供电控制未接入。 |
 | 主扬声器 | 已支持 | `nxp,tfa9874` 主扬声器路线已验证可播放 48 kHz S16_LE stereo 测试音。 | NXP/Goodix 专用 DSP/profile/calibration 与安全音量策略仍待完善；测试应先用低振幅短音。 |
-| 听筒 | 已支持 | WCD9380 RX / EAR 路线已验证真实听筒播放。 | 音量曲线和普通播放器默认参数仍需继续打磨。 |
+| 听筒 | 已支持 | WCD9380 RX / EAR 路线已验证真实听筒播放；当前实测需要把 `EAR_PA Volume` 调到最大端才容易听见。 | 音量曲线和普通播放器默认参数仍需继续打磨。 |
 | 3.5mm HPH | 部分支持 | WCD9380 HPHL/HPHR 播放、耳机插入状态和阻抗读取已验证。 | 当前没有耳麦测试环境；3.5mm 耳麦麦克风未验证。 |
-| 机身麦克风 | 部分支持 | WCD9380 TX capture 已验证，底部麦克风和顶部麦克风可短录音并回放确认。 | 第三个机身麦克风尚未定位，常规录音栈和降噪策略未完成。 |
+| 机身麦克风 | 部分支持 | WCD9380 TX capture 已验证，底部麦克风 `AMIC1` 和顶部麦克风 `AMIC5` 可持续录音；6～8 秒 48 kHz S16_LE capture 丢弃首秒后仍持续非零，并已把录音经主扬声器回放确认。 | 第三个机身麦克风尚未定位，常规录音栈和降噪策略未完成。 |
 | Docker / 容器内核能力 | 已支持 | release 配置已验证 overlayfs、cgroup v2、bridge/NAT、端口映射、nftables/iptables 和常见 Docker 运行路径。 | macvlan/ipvlan 可创建，但 Wi-Fi managed client 模式不等同于 Unraid 有线 `br0`，独立 LAN IP 需要单独验证。 |
 | 调制解调器 / 蜂窝 | 部分支持（诊断） | SDX55M PCIe/MHI/SBL/Sahara 诊断已推进到多阶段 image transfer 研究，但仍停在 SBL/Sahara/MHI 阶段，未进入 Mission/AMSS。 | SIM、蜂窝数据、语音、IMS/VoLTE、ModemManager 均不可用；当前 release 不把蜂窝作为可用功能宣传，详细历史见 [`MODEM_BRINGUP.md`](MODEM_BRINGUP.md)。 |
 | NFC | 待适配 | downstream 显示为 NQ NCI I2C 设备。 | 未接入 NCI/I2C 设备节点和用户态验证。 |
@@ -48,7 +48,7 @@
 - 输入显示：触摸、电源/音量键、DRM/KMS/backlight 可同时工作。
 - 图形链路：Adreno A650 / GMU / freedreno 可用于 GBM/EGL/GLES 渲染。
 - 电源链路：PM8150B Type-C/TCPM、charger 和 fuel-gauge 可同时暴露 USB 输入、电池状态与标准限充控制接口。
-- 音频链路：ADSP/PDR/QRTR/APR、SM8250 sound card、TFA9874 主扬声器、WCD9380 听筒、3.5mm HPH 播放、MBHC 插入/阻抗读取和两路机身麦克风基础录音已验证。
+- 音频链路：ADSP/PDR/QRTR/APR、SM8250 sound card、TFA9874 主扬声器、WCD9380 听筒、3.5mm HPH 播放、MBHC 插入/阻抗读取和两路机身麦克风持续录音已验证，录音经主扬声器回放已确认。
 - 服务器链路：Ubuntu 26.04 Server rootfs、SSH、Docker bridge/NAT、端口映射、overlayfs、cgroup v2、nftables/iptables 已通过基础验证。
 
 ## 电池 / 充电当前目标

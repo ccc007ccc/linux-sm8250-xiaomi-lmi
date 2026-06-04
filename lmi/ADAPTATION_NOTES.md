@@ -128,7 +128,9 @@
 - Q6ASM PCM 对 period/buffer 参数敏感；已验证 48 kHz S16_LE、period 480、buffer 960 的低音量测试可用。
 - 主扬声器路线是 `PRI_MI2S_RX -> TFA9874`；听筒/3.5mm 走 `RX_CODEC_DMA_RX_0 -> WCD9380 RX`。
 - TFA9874 需要 downstream 对照出的关键寄存器配置，尤其 TDM delay 位，避免 `SPK_AMP=1` 仍异常大声。
-- 麦克风当前定位：底部麦克风 `mic1 -> AMIC1`，顶部麦克风 `mic2 -> AMIC5`；第三个机身麦克风仍未定位。
+- 麦克风当前定位：底部麦克风 `mic1 -> AMIC1`，顶部麦克风 `mic2 -> AMIC5`；第三个机身麦克风仍未定位。两路机身麦克风已用 48 kHz S16_LE 录音验证 `tail_after_1s` 持续非零，并把录音经主扬声器回放确认。
+- WCD capture link 必须使用 TX SoundWire capture DAI：`<&swr2 1>`。`swr2` 有 1 个 `dout` 口，`SDW Pin0` 是 playback/output；若误写成 `<&swr2 0>`，DAPM/Q6AFE 可能看似启动，但 SoundWire master 不会为 TX capture 分配/enable port，录音只剩 startup transient 或全零 tail。
+- 听筒 `EAR_PA Volume` 控件方向与直觉相反：`0` 是最大 EAR PA 增益，`16` 是最小增益；当前听筒实测需要最大端才容易听见。
 - 实机音频测试必须低振幅、短时长，避免突然大声。
 
 ## Camera / OV13B10 / CAMSS / Venus

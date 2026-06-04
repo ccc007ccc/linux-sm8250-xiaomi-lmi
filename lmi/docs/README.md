@@ -14,10 +14,14 @@
    - 适合想自己编译内核和打包 boot image 的用户。
    - 覆盖 release 内核构建、initramfs 顺序、copydown boot 打包、manifest 检查和 stock blob 边界。
 
-3. [`../HARDWARE_SUPPORT.md`](../HARDWARE_SUPPORT.md)
+3. [`AUDIO_USAGE.md`](AUDIO_USAGE.md)
+   - 适合想手动验证或临时使用扬声器、听筒和两路机身麦克风的用户。
+   - 覆盖 ALSA mixer route、测试音、录音、录音回放和清理命令。
+
+4. [`../HARDWARE_SUPPORT.md`](../HARDWARE_SUPPORT.md)
    - 快速判断当前哪些硬件已支持、部分支持、待适配或暂不支持。
 
-4. [`../ADAPTATION_NOTES.md`](../ADAPTATION_NOTES.md)
+5. [`../ADAPTATION_NOTES.md`](../ADAPTATION_NOTES.md)
    - 保存更长的 bring-up 记录、非致命 warning 解释和历史诊断过程。
 
 ## 不在本目录中的内容
