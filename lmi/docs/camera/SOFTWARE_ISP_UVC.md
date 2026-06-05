@@ -53,16 +53,17 @@ UVC advertised size == OV13B10 selected RAW size == lmi-isp output size
 
 ## UVC 控制项
 
-当前 advertised 的标准 UVC 控制项只覆盖 Windows/DirectShow 更可能识别的基础项目；Processing Unit `bmControls` 按 UVC 位序只打开 Gain 和 Power Line Frequency，不继续 advertised 未实现的亮度/背光等项目：
+当前 advertised 的标准 UVC 控制项覆盖 Windows/DirectShow 更可能识别的基础项目，并额外暴露 UVC 1.5 ROI 供支持的 host/app 尝试测光点；Processing Unit `bmControls` 按 UVC 位序只打开 Gain 和 Power Line Frequency，不继续 advertised 未实现的亮度/背光等项目：
 
 | UVC 单元 | selector | host 语义 | runtime 映射 |
 | --- | ---: | --- | --- |
 | Camera Terminal | `AE_MODE` / `0x02` | 自动曝光模式；兼容 Windows DirectShow 下发的 manual/shutter-priority 值 | `0x01/0x04 -> auto_exposure=0`，`0x02/0x08 -> auto_exposure=1` |
 | Camera Terminal | `EXPOSURE_TIME_ABSOLUTE` / `0x04` | 快门/曝光时间，100us 单位 | `exposure_absolute=N` 后换算到 sensor exposure lines |
 | Processing Unit | `GAIN` / `0x04` | Gain/ISO-like 增益 | `gain=N` 后映射到 analogue gain |
-| Processing Unit | `POWER_LINE_FREQUENCY` / `0x05` | 关闭/50Hz/60Hz/auto 防闪烁 | `flicker=off/50/60/auto` |
+| Processing Unit | `POWER_LINE_FREQUENCY` / `0x05` | 关闭/50Hz/60Hz/auto 防闪烁 | `flicker=off/50/60/auto`；AE 将曝光量量化到 50/60Hz 半周期附近 |
+| Camera Terminal | `REGION_OF_INTEREST` / `0x14` | UVC 1.5 测光/ROI 矩形 | `meter_roi=top,left,bottom,right,auto_controls`；坐标按 UVC 0..65535 归一化且 right/bottom 为 inclusive endpoint，`lmi-isp` 内部再换算到 RAW 像素测光窗口；当前只用 auto exposure bit 决定 AE 是否按 ROI 测光 |
 
-注意：UVC 没有通用标准 ISO 控制项，host 侧“ISO”只能先用 `PU_GAIN` 近似；测光点/ROI 需要 UVC 1.5 `REGION_OF_INTEREST` 或应用私有扩展，Windows Camera 是否暴露不可靠，暂未作为默认控制项宣传。
+注意：UVC 没有通用标准 ISO 控制项，host 侧“ISO”只能先用 `PU_GAIN` 近似；ROI/测光点已按 UVC 1.5 `REGION_OF_INTEREST` advertised，但 Windows Camera 是否会在点击取景器时下发该标准控制不可靠，必须以设备日志中的 `ROI ...` / `meter_roi=...` 为准。
 
 ## 已验证状态
 
@@ -74,6 +75,8 @@ UVC advertised size == OV13B10 selected RAW size == lmi-isp output size
 - frame 6 会切到 OV13B10 mode 5，并配置 `/dev/video3 pgAA 1364x768`。
 - Windows DirectShow 能通过 `IAMCameraControl` / `IAMVideoProcAmp` 看到 Exposure、Gain、Power Line Frequency，并能写入标准 UVC control。
 - DirectShow 手动 Exposure 实测会写入 AE mode `0x04`；runtime 已按 manual 兼容，并在 UVC streaming 中转发到 `lmi-isp` control FIFO。
+- UVC descriptor 现在使用 `bcdUVC=0x0150` 并在 Camera Terminal `bmControls` 第三字节打开 ROI bit；feeder 对 PROBE/COMMIT 使用 48-byte UVC 1.5 control length，避免 descriptor 与 runtime 长度不一致。
+- 实机 DirectShow 写控制项已确认能到达设备：手动 Exposure 下发 `ae_mode=4` 与 `exposure_time_absolute=625`，Gain 下发 `gain=1/0`，Power Line Frequency 下发 `power_line_frequency=1`，`lmi-isp` 随后记录 `flicker=50 hz=50 quantum=956 exposure=3188->2872`。
 
 ## MJPEG 画质和性能边界
 

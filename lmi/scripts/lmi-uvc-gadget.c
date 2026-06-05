@@ -107,6 +107,7 @@ enum control_data_kind {
 	CONTROL_DATA_NONE = 0,
 	CONTROL_DATA_STREAMING,
 	CONTROL_DATA_UVC_CONTROL,
+	CONTROL_DATA_UVC_ROI,
 };
 static enum control_data_kind control_data_kind;
 static uint8_t control_sel;  /* VS PROBE/COMMIT or VC CT/PU selector for following SET_CUR DATA */
@@ -126,6 +127,21 @@ static struct uvc_streaming_control g_commit;
 #define UVC_UNIT_CAMERA_TERMINAL 1
 #define UVC_UNIT_PROCESSING      2
 
+#ifndef UVC_CT_REGION_OF_INTEREST_CONTROL
+#define UVC_CT_REGION_OF_INTEREST_CONTROL 0x14
+#endif
+#define UVC_ROI_AUTO_EXPOSURE 0x0001
+#define UVC_ROI_AUTO_KNOWN_MASK 0x00ff
+#define UVC_ROI_MAX_COORD 65535
+
+struct uvc_roi_state {
+	uint16_t top;
+	uint16_t left;
+	uint16_t bottom;
+	uint16_t right;
+	uint16_t auto_controls;
+};
+
 struct uvc_control_state {
 	uint8_t unit;
 	uint8_t selector;
@@ -144,6 +160,10 @@ static struct uvc_control_state g_uvc_controls[] = {
 	{ UVC_UNIT_PROCESSING, UVC_PU_GAIN_CONTROL, 2, 0, 0, 255, 1, 0, "gain" },
 	{ UVC_UNIT_PROCESSING, UVC_PU_POWER_LINE_FREQUENCY_CONTROL, 1, 0, 0, 3, 1, 0, "power_line_frequency" },
 };
+static struct uvc_roi_state g_roi_cur = { 0, 0, UVC_ROI_MAX_COORD, UVC_ROI_MAX_COORD, UVC_ROI_AUTO_EXPOSURE };
+static const struct uvc_roi_state g_roi_min = { 0, 0, 0, 0, 0 };
+static const struct uvc_roi_state g_roi_max = { 0, 0, UVC_ROI_MAX_COORD, UVC_ROI_MAX_COORD, UVC_ROI_AUTO_EXPOSURE };
+static const struct uvc_roi_state g_roi_def = { 0, 0, UVC_ROI_MAX_COORD, UVC_ROI_MAX_COORD, UVC_ROI_AUTO_EXPOSURE };
 
 struct buffer {
 	void *start;
@@ -616,7 +636,11 @@ static unsigned int streaming_control_len(void)
 {
 	if (g_control_len_override)
 		return g_control_len_override;
-	return g_format == LMI_UVC_H264 ? 48 : 34;
+	/* The production Rust descriptor advertises UVC 1.5 for MJPEG and H.264,
+	 * so the safe fallback is the 48-byte UVC 1.5 PROBE/COMMIT layout.
+	 * Legacy UVC 1.1 debug launches can still force 34 with --control-len.
+	 */
+	return 48;
 }
 
 static void write_streaming_control_response(struct uvc_request_data *resp,
@@ -710,6 +734,43 @@ static int32_t read_le_value(const unsigned char *src, unsigned int len)
 	return (int32_t)v;
 }
 
+static uint16_t read_le16(const unsigned char *src)
+{
+	return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+}
+
+static void write_le16(unsigned char *dst, uint16_t value)
+{
+	dst[0] = (unsigned char)(value & 0xff);
+	dst[1] = (unsigned char)(value >> 8);
+}
+
+static void write_uvc_roi_value(struct uvc_request_data *resp,
+					const struct uvc_roi_state *roi)
+{
+	memset(resp->data, 0, sizeof(resp->data));
+	write_le16(resp->data + 0, roi->top);
+	write_le16(resp->data + 2, roi->left);
+	write_le16(resp->data + 4, roi->bottom);
+	write_le16(resp->data + 6, roi->right);
+	write_le16(resp->data + 8, roi->auto_controls);
+	resp->length = 10;
+}
+
+static int read_uvc_roi_value(const unsigned char *data, struct uvc_roi_state *roi)
+{
+	roi->top = read_le16(data + 0);
+	roi->left = read_le16(data + 2);
+	roi->bottom = read_le16(data + 4);
+	roi->right = read_le16(data + 6);
+	roi->auto_controls = read_le16(data + 8);
+	if (roi->right < roi->left || roi->bottom < roi->top)
+		return -1;
+	if (roi->auto_controls & ~UVC_ROI_AUTO_KNOWN_MASK)
+		roi->auto_controls &= UVC_ROI_AUTO_KNOWN_MASK;
+	return 0;
+}
+
 static void write_uvc_control_value(struct uvc_request_data *resp,
 					const struct uvc_control_state *ctrl,
 					int32_t value)
@@ -723,6 +784,43 @@ static void process_uvc_control(uint8_t req, uint8_t unit, uint8_t cs,
 					struct uvc_request_data *resp)
 {
 	struct uvc_control_state *ctrl = find_uvc_control(unit, cs);
+
+	if (unit == UVC_UNIT_CAMERA_TERMINAL && cs == UVC_CT_REGION_OF_INTEREST_CONTROL) {
+		switch (req) {
+		case UVC_SET_CUR:
+			control_data_kind = CONTROL_DATA_UVC_ROI;
+			control_unit = unit;
+			control_sel = cs;
+			control_data_len = 10;
+			resp->length = 10;
+			break;
+		case UVC_GET_CUR:
+			write_uvc_roi_value(resp, &g_roi_cur);
+			break;
+		case UVC_GET_MIN:
+			write_uvc_roi_value(resp, &g_roi_min);
+			break;
+		case UVC_GET_MAX:
+			write_uvc_roi_value(resp, &g_roi_max);
+			break;
+		case UVC_GET_DEF:
+			write_uvc_roi_value(resp, &g_roi_def);
+			break;
+		case UVC_GET_LEN:
+			resp->data[0] = 10;
+			resp->data[1] = 0;
+			resp->length = 2;
+			break;
+		case UVC_GET_INFO:
+			resp->data[0] = 0x03; /* GET and SET supported */
+			resp->length = 1;
+			break;
+		default:
+			resp->length = -EL2HLT;
+			break;
+		}
+		return;
+	}
 
 	if (!ctrl)
 		return;
@@ -969,6 +1067,37 @@ static void process_data(struct uvc_request_data *data)
 
 	if (control_data_kind == CONTROL_DATA_NONE || control_sel == 0 || data->length <= 0)
 		return;
+
+	if (control_data_kind == CONTROL_DATA_UVC_ROI) {
+		if ((unsigned int)data->length < 10) {
+			ilog("ignored short ROI payload: len=%d expected=10", data->length);
+		} else {
+			struct uvc_roi_state roi;
+			if (read_uvc_roi_value(data->data, &roi) == 0) {
+				char event[160];
+				g_roi_cur = roi;
+				snprintf(event, sizeof(event),
+					 "ROI top=%u left=%u bottom=%u right=%u auto=%u",
+					 g_roi_cur.top, g_roi_cur.left, g_roi_cur.bottom,
+					 g_roi_cur.right, g_roi_cur.auto_controls);
+				emit_event(event);
+				if (g_verbose)
+					ilog("ROI set: top=%u left=%u bottom=%u right=%u auto=0x%04x",
+					     g_roi_cur.top, g_roi_cur.left, g_roi_cur.bottom,
+					     g_roi_cur.right, g_roi_cur.auto_controls);
+			} else {
+				ilog("ignored invalid ROI payload: top=%u left=%u bottom=%u right=%u auto=0x%04x",
+				     read_le16(data->data + 0), read_le16(data->data + 2),
+				     read_le16(data->data + 4), read_le16(data->data + 6),
+				     read_le16(data->data + 8));
+			}
+		}
+		control_data_kind = CONTROL_DATA_NONE;
+		control_sel = 0;
+		control_unit = 0;
+		control_data_len = 0;
+		return;
+	}
 
 	if (control_data_kind == CONTROL_DATA_UVC_CONTROL) {
 		struct uvc_control_state *ctrl = find_uvc_control(control_unit, control_sel);

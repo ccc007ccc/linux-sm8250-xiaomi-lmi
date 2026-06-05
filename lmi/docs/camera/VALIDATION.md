@@ -69,24 +69,40 @@ find /sys/kernel/config/usb_gadget/lmi_uvc/functions/uvc.0/streaming/mjpeg/mjpg 
 ```sh
 cat /sys/kernel/config/usb_gadget/lmi_uvc/functions/uvc.0/control/terminal/camera/default/bmControls
 cat /sys/kernel/config/usb_gadget/lmi_uvc/functions/uvc.0/control/processing/default/bmControls
+cat /sys/kernel/config/usb_gadget/lmi_uvc/functions/uvc.0/control/header/h/bcdUVC
 ```
 
 期望当前值：
 
-- Camera Terminal 第一字节为 `10`：`AE_MODE` + `EXPOSURE_TIME_ABSOLUTE`。
+- Camera Terminal 三字节为 `10`、`0`、`32`：第一字节 `10` 是 `AE_MODE` + `EXPOSURE_TIME_ABSOLUTE`，第三字节 `32` 是 UVC 1.5 `REGION_OF_INTEREST`（index 21）。
 - Processing Unit 第一字节为 `0`、第二字节为 `6`：`GAIN` + `POWER_LINE_FREQUENCY`。
+- Control header `bcdUVC` 为 UVC 1.5（写入 `0x0150`；configfs 读回可能显示十进制 `336`）；Rust runtime 启动 feeder 时应带 `--control-len 48`，helper fallback 也应默认 48-byte UVC 1.5 PROBE/COMMIT，让 descriptor 与 runtime 长度一致。
 
 Host 写控制项时，设备日志应出现：
 
 ```text
+[uvc-gadget ...] start ... control_len=48 ...
 [uvc] control: unit=1 selector=2 ae_mode=... -> auto_exposure=...
 [uvc] control: unit=1 selector=4 exposure_time_absolute=... -> auto_exposure=0,exposure_absolute=...
 [uvc] control: unit=2 selector=4 gain=... -> auto_exposure=0,gain=...
 [uvc] control: unit=2 selector=5 power_line_frequency=... -> flicker=...
-[lmi-isp] control: ...
+[lmi-isp] control: flicker=50 hz=50 quantum=...
+[lmi-isp] control: flicker=60 hz=60 quantum=...
+[lmi-isp] control: exposure_absolute=... exposure=...
+[lmi-isp] control: gain=... analogue_gain=...
 ```
 
-Windows/DirectShow 侧优先确认 Exposure、Gain、Power Line Frequency 是否可见；ISO 不是标准 UVC 控制项，当前按 `GAIN` 做 ISO-like 映射。DirectShow 手动曝光可能写入 UVC AE mode `0x04`（shutter priority），runtime 应按 manual 处理；`0x01/0x04` 均应转为 `auto_exposure=0`，`0x02/0x08` 均应转为 `auto_exposure=1`。ROI/测光点暂不作为通过条件。
+Host 如果支持 UVC 1.5 ROI/测光点，点击取景器或设置 ROI 时还应出现；这里的 top/left/bottom/right 是 UVC 0..65535 归一化坐标，right/bottom 按 UVC inclusive endpoint 处理：
+
+```text
+ROI top=... left=... bottom=... right=... auto=...
+[uvc] ROI: top=... left=... bottom=... right=... auto=0x... -> meter_roi=...
+[lmi-isp] control: meter_roi=... enabled=...
+```
+
+Windows/DirectShow 侧优先确认 Exposure、Gain、Power Line Frequency 是否可见；ISO 不是标准 UVC 控制项，当前按 `GAIN` 做 ISO-like 映射。DirectShow 手动曝光可能写入 UVC AE mode `0x04`（shutter priority），runtime 应按 manual 处理；`0x01/0x04` 均应转为 `auto_exposure=0`，`0x02/0x08` 均应转为 `auto_exposure=1`。
+
+ROI/测光点已实验性 advertised 为 UVC 1.5 `REGION_OF_INTEREST`，但 Windows Camera 可能仍不会在点击取景器时下发该标准控制。若点击后没有任何 `ROI ...` / `meter_roi=...` 日志，应记录为 host/app 映射限制，而不是把 `/dev/video3` 或 VFE480 processed 路径改掉。
 
 ## H.264 / Venus 检查
 

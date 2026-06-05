@@ -52,6 +52,8 @@
 #define MAXPLANES 1
 #define LMI_UVC_RECORD_MAGIC 0x43564d4cU /* "LMVC" little-endian */
 #define LMI_UVC_RECORD_VERSION 1
+#define LMI_UVC_ROI_MAX_COORD 65535
+#define LMI_UVC_ROI_COORD_DEN 65536
 
 /* ---- config ---- */
 static const char *g_raw = "/dev/video3";
@@ -178,6 +180,8 @@ static int g_ae_changed;
 static int g_auto_tone = 1;
 static int g_dgain_limit = -1;
 static int g_flicker_hz;
+static int g_meter_roi_enabled;
+static int g_meter_left, g_meter_top, g_meter_right, g_meter_bottom, g_meter_auto_controls;
 static double g_soft_gain = 1.0;
 static double g_max_soft_gain = 4.0;
 
@@ -397,18 +401,43 @@ static int apply_digital_gain(int value)
 	return 0;
 }
 
+static int flicker_exposure_quantum(void)
+{
+	int fps, frame_units_100us, half_cycle_100us, range;
+	if (g_flicker_hz != 50 && g_flicker_hz != 60)
+		return 0;
+	fps = g_fps_cap > 0 ? g_fps_cap : 30;
+	frame_units_100us = 10000 / fps;
+	if (frame_units_100us < 1)
+		frame_units_100us = 1;
+	/* Mains flicker repeats every half-cycle: 10ms for 50Hz, 8.33ms for 60Hz. */
+	half_cycle_100us = g_flicker_hz == 50 ? 100 : 83;
+	range = g_exp_max - g_exp_min;
+	if (range < 1)
+		return 1;
+	return clamp_i((int)(((int64_t)range * half_cycle_100us + frame_units_100us / 2) /
+				     frame_units_100us), 1, range);
+}
+
+static int flicker_quantize_exposure_dir(int value, int direction)
+{
+	int offset, quantum = flicker_exposure_quantum();
+	if (quantum <= 0)
+		return value;
+	value = clamp_i(value, g_exp_min, g_exp_max);
+	offset = value - g_exp_min;
+	if (direction > 0)
+		value = g_exp_min + ((offset + quantum - 1) / quantum) * quantum;
+	else if (direction < 0)
+		value = g_exp_min + (offset / quantum) * quantum;
+	else
+		value = g_exp_min + ((offset + quantum / 2) / quantum) * quantum;
+	return clamp_i(value, g_exp_min, g_exp_max);
+}
+
 static int flicker_quantize_exposure(int value)
 {
-	int quantum;
-	if (g_flicker_hz != 50 && g_flicker_hz != 60)
-		return value;
-	/* Sensor exposure is line-based here; use a conservative coarse bucket so AE
-	 * does not chase every frame when power-line mode is enabled. */
-	quantum = (g_exp_max - g_exp_min) / (g_flicker_hz == 50 ? 100 : 120);
-	if (quantum < 1)
-		quantum = 1;
-	value = ((value + quantum / 2) / quantum) * quantum;
-	return clamp_i(value, g_exp_min, g_exp_max);
+	return flicker_quantize_exposure_dir(value, 0);
 }
 
 static int exposure_absolute_to_lines(int value_100us)
@@ -430,6 +459,49 @@ static int uvc_gain_to_sensor_gain(int value)
 		return -1;
 	value = clamp_i(value, 0, 255);
 	return g_gain_min + (int)(((int64_t)value * (g_gain_max - g_gain_min)) / 255);
+}
+
+static int meter_roi_active(void)
+{
+	return g_meter_roi_enabled && g_meter_right >= g_meter_left &&
+		g_meter_bottom >= g_meter_top;
+}
+
+static int roi_norm_floor_to_pixel(int value, int pixels)
+{
+	value = clamp_i(value, 0, LMI_UVC_ROI_MAX_COORD);
+	if (pixels <= 1)
+		return 0;
+	return (int)(((int64_t)value * pixels) / LMI_UVC_ROI_COORD_DEN);
+}
+
+static int roi_norm_ceil_to_pixel_exclusive(int value, int pixels)
+{
+	value = clamp_i(value, 0, LMI_UVC_ROI_MAX_COORD);
+	if (pixels <= 1)
+		return pixels;
+	return (int)((((int64_t)value + 1) * pixels + LMI_UVC_ROI_COORD_DEN - 1) /
+		     LMI_UVC_ROI_COORD_DEN);
+}
+
+static void meter_roi_bounds(int *left, int *top, int *right, int *bottom)
+{
+	int l = 0, t = 0, r = g_raw_w, b = g_raw_h;
+
+	if (meter_roi_active()) {
+		l = roi_norm_floor_to_pixel(g_meter_left, g_raw_w);
+		t = roi_norm_floor_to_pixel(g_meter_top, g_raw_h);
+		r = roi_norm_ceil_to_pixel_exclusive(g_meter_right, g_raw_w);
+		b = roi_norm_ceil_to_pixel_exclusive(g_meter_bottom, g_raw_h);
+	}
+	l = clamp_i(l, 0, g_raw_w > 1 ? g_raw_w - 2 : 0) & ~1;
+	t = clamp_i(t, 0, g_raw_h > 1 ? g_raw_h - 2 : 0) & ~1;
+	r = clamp_i(r, l + 2, g_raw_w);
+	b = clamp_i(b, t + 2, g_raw_h);
+	*left = l;
+	*top = t;
+	*right = r;
+	*bottom = b;
 }
 
 static void control_fifo_open(void)
@@ -474,6 +546,7 @@ static void apply_control_line(char *line)
 		return;
 	}
 	if (!strcmp(key, "flicker")) {
+		int quantum, have_controls = 0;
 		if (!strcmp(value, "50"))
 			g_flicker_hz = 50;
 		else if (!strcmp(value, "60"))
@@ -482,7 +555,49 @@ static void apply_control_line(char *line)
 			g_flicker_hz = 50;
 		else
 			g_flicker_hz = 0;
-		ilog("control: flicker=%s hz=%d", value, g_flicker_hz);
+		if (g_flicker_hz)
+			have_controls = controls_init() == 0;
+		quantum = flicker_exposure_quantum();
+		if (have_controls && quantum > 0 && g_exposure >= 0) {
+			int before = g_exposure;
+			int snapped = flicker_quantize_exposure(g_exposure);
+			if (snapped != before && apply_exposure(snapped) == 0) {
+				ilog("control: flicker=%s hz=%d quantum=%d exposure=%d->%d",
+				     value, g_flicker_hz, quantum, before, g_exposure);
+				return;
+			}
+			ilog("control: flicker=%s hz=%d quantum=%d exposure=%d",
+			     value, g_flicker_hz, quantum, g_exposure);
+		} else {
+			ilog("control: flicker=%s hz=%d quantum=%d", value, g_flicker_hz,
+			     quantum);
+		}
+		return;
+	}
+	if (!strcmp(key, "meter_roi")) {
+		int top, left, bottom, right, auto_controls;
+		if (sscanf(value, "%d,%d,%d,%d,%d", &top, &left, &bottom, &right,
+			   &auto_controls) != 5) {
+			ilog("control fifo: ignored malformed meter_roi='%s'", value);
+			return;
+		}
+		top = clamp_i(top, 0, LMI_UVC_ROI_MAX_COORD);
+		left = clamp_i(left, 0, LMI_UVC_ROI_MAX_COORD);
+		bottom = clamp_i(bottom, 0, LMI_UVC_ROI_MAX_COORD);
+		right = clamp_i(right, 0, LMI_UVC_ROI_MAX_COORD);
+		auto_controls &= 0x00ff;
+		g_meter_top = top;
+		g_meter_left = left;
+		g_meter_bottom = bottom;
+		g_meter_right = right;
+		g_meter_auto_controls = auto_controls;
+		if (right < left || bottom < top)
+			g_meter_roi_enabled = 0;
+		else
+			g_meter_roi_enabled = auto_controls & 1;
+		ilog("control: meter_roi=%d,%d,%d,%d auto=0x%x enabled=%d",
+		     g_meter_top, g_meter_left, g_meter_bottom, g_meter_right,
+		     g_meter_auto_controls, g_meter_roi_enabled);
 		return;
 	}
 	if (controls_init() < 0) {
@@ -577,7 +692,7 @@ static void ae_update(int mean)
 			g_exposure += step * 2;
 			if (g_exposure > g_exp_max)
 				g_exposure = g_exp_max;
-			g_exposure = flicker_quantize_exposure(g_exposure);
+			g_exposure = flicker_quantize_exposure_dir(g_exposure, 1);
 			if (set_ctrl(g_ctrlfd, V4L2_CID_EXPOSURE, g_exposure) == 0)
 				g_ae_changed = 1;
 		} else if (g_again >= 0 && g_again < g_gain_max) {
@@ -610,7 +725,7 @@ static void ae_update(int mean)
 			g_exposure -= step;
 			if (g_exposure < g_exp_min)
 				g_exposure = g_exp_min;
-			g_exposure = flicker_quantize_exposure(g_exposure);
+			g_exposure = flicker_quantize_exposure_dir(g_exposure, -1);
 			if (set_ctrl(g_ctrlfd, V4L2_CID_EXPOSURE, g_exposure) == 0)
 				g_ae_changed = 1;
 		}
@@ -696,7 +811,7 @@ static int raw_percentile_luma(int step, int pct)
 {
 	uint32_t hist[1024];
 	uint32_t total = 0, want, acc = 0;
-	int x, y, i;
+	int x, y, i, left, top, right, bottom;
 
 	if (step < 2)
 		step = 2;
@@ -704,9 +819,10 @@ static int raw_percentile_luma(int step, int pct)
 		pct = 1;
 	if (pct > 1000)
 		pct = 1000;
+	meter_roi_bounds(&left, &top, &right, &bottom);
 	memset(hist, 0, sizeof(hist));
-	for (y = 0; y + 1 < g_raw_h; y += step) {
-		for (x = 0; x + 1 < g_raw_w; x += step) {
+	for (y = top; y + 1 < bottom; y += step) {
+		for (x = left; x + 1 < right; x += step) {
 			int gr = bclamp(BRAW(x, y) - g_blacklevel, 0, 1023);
 			int r = bclamp(BRAW(x + 1, y) - g_blacklevel, 0, 1023);
 			int b = bclamp(BRAW(x, y + 1) - g_blacklevel, 0, 1023);
@@ -2863,11 +2979,12 @@ static long pack_output(double rgain, double bgain)
 static int raw_mean_luma(void)
 {
 	uint64_t s = 0, n = 0;
-	int y, x;
+	int y, x, left, top, right, bottom;
 	/* Average both green sites from sparse 2x2 quads; sampling only one parity can
 	 * alias with row/column structure and make AE look stuck under real scenes. */
-	for (y = 0; y + 1 < g_raw_h; y += 8) {
-		for (x = 0; x + 1 < g_raw_w; x += 8) {
+	meter_roi_bounds(&left, &top, &right, &bottom);
+	for (y = top; y + 1 < bottom; y += 8) {
+		for (x = left; x + 1 < right; x += 8) {
 			s += g_bayer[(size_t)y * g_raw_w + x];
 			s += g_bayer[(size_t)(y + 1) * g_raw_w + x + 1];
 			n += 2;

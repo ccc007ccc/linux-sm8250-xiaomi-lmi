@@ -623,6 +623,23 @@ fn handle_event(
                 );
             }
         }
+        UvcEvent::RoiSet(roi) => {
+            let commands = pending_controls.update_roi(roi.clone());
+            println!(
+                "[uvc] ROI: top={} left={} bottom={} right={} auto=0x{:x} -> {}",
+                roi.top,
+                roi.left,
+                roi.bottom,
+                roi.right,
+                roi.auto_controls,
+                commands.join(",")
+            );
+            if pipeline.is_some() {
+                for command in commands {
+                    apply_control_command(config, &command);
+                }
+            }
+        }
         UvcEvent::Connect => println!("[uvc] host connected"),
         UvcEvent::Other(line) => println!("[uvc] event: {line}"),
     }
@@ -777,12 +794,22 @@ struct UvcControlSet {
     value: i32,
 }
 
+#[derive(Debug, Clone)]
+struct UvcRoiSet {
+    top: u32,
+    left: u32,
+    bottom: u32,
+    right: u32,
+    auto_controls: u32,
+}
+
 #[derive(Debug, Default)]
 struct RuntimeControls {
     auto_exposure: Option<bool>,
     exposure_absolute: Option<i32>,
     gain: Option<i32>,
     flicker: Option<&'static str>,
+    roi: Option<UvcRoiSet>,
 }
 
 impl RuntimeControls {
@@ -835,6 +862,12 @@ impl RuntimeControls {
         if let Some(flicker) = self.flicker {
             commands.push(format!("flicker={flicker}"));
         }
+        if let Some(roi) = &self.roi {
+            commands.push(format!(
+                "meter_roi={},{},{},{},{}",
+                roi.top, roi.left, roi.bottom, roi.right, roi.auto_controls
+            ));
+        }
         match self.auto_exposure {
             Some(true) => commands.push("auto_exposure=1".to_string()),
             Some(false) => {
@@ -844,6 +877,15 @@ impl RuntimeControls {
             None => self.push_manual_commands(&mut commands),
         }
         commands
+    }
+
+    fn update_roi(&mut self, roi: UvcRoiSet) -> Vec<String> {
+        let command = format!(
+            "meter_roi={},{},{},{},{}",
+            roi.top, roi.left, roi.bottom, roi.right, roi.auto_controls
+        );
+        self.roi = Some(roi);
+        vec![command]
     }
 
     fn apply_all(&self, config: &NativeUvcRunConfig) {
@@ -875,6 +917,7 @@ enum UvcEvent {
         size: Option<u32>,
     },
     ControlSet(UvcControlSet),
+    RoiSet(UvcRoiSet),
     Other(String),
 }
 
@@ -937,6 +980,37 @@ fn parse_event(line: &str) -> UvcEvent {
                 selector,
                 name,
                 value,
+            });
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("ROI") {
+        let mut top = None;
+        let mut left = None;
+        let mut bottom = None;
+        let mut right = None;
+        let mut auto_controls = None;
+        for item in rest.split_whitespace() {
+            let Some((key, field)) = item.split_once('=') else {
+                continue;
+            };
+            match key {
+                "top" => top = field.parse().ok(),
+                "left" => left = field.parse().ok(),
+                "bottom" => bottom = field.parse().ok(),
+                "right" => right = field.parse().ok(),
+                "auto" => auto_controls = field.parse().ok(),
+                _ => {}
+            }
+        }
+        if let (Some(top), Some(left), Some(bottom), Some(right), Some(auto_controls)) =
+            (top, left, bottom, right, auto_controls)
+        {
+            return UvcEvent::RoiSet(UvcRoiSet {
+                top,
+                left,
+                bottom,
+                right,
+                auto_controls,
             });
         }
     }
@@ -1226,6 +1300,8 @@ impl FeederSupervisor {
             config.event_fifo.display().to_string(),
             "--frame-index".to_string(),
             mode.frame_index.to_string(),
+            "--control-len".to_string(),
+            "48".to_string(),
         ];
         for native in OV13B10_NATIVE_MODES {
             args.push("--frame".to_string());

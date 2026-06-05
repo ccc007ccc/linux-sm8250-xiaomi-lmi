@@ -17,7 +17,7 @@
 - 当前内核仍没有可用的 SM8250 VFE480 processed YUV/RGB 输出；`vfe480_yc_pp_chain_configured()` 必须继续关闭。
 - `lmi-camera` Rust runtime + C `lmi-isp` / `lmi-uvc-gadget` 是用户态 software-ISP/UVC 支持层，不把 `/dev/video3` 伪装成 YUV/RGB/MJPEG。
 - 默认/public UVC profile 是 `native-modes`，只暴露 OV13B10 六个原生 MJPEG frame。
-- UVC 控制项开始 advertised 标准 AE mode、exposure time absolute、gain/ISO-like 和 power-line frequency；ROI/测光点暂不作为默认能力宣传。
+- UVC 控制项 advertised 标准 AE mode、exposure time absolute、gain/ISO-like、power-line frequency，并实验性 advertised UVC 1.5 ROI/测光矩形；Windows Camera 是否会下发 ROI 仍必须看设备日志确认。
 - H.264 UVC 是 Venus-gated 实验链路，低分辨率 frame 6 已验证动态画面，但默认/public 仍是 MJPEG native-six。
 
 ## 文档索引
@@ -89,7 +89,7 @@
 - OV13B10 后置超广角 RAW RDI 可用。
 - `/dev/video3` 能按六个原生模式输出真实 `pgAA` RAW。
 - UVC demand-start + software-ISP 用户态支持层可让 Windows/host 枚举 `UVC Camera`，默认 MJPEG native-six。
-- Windows/DirectShow 可通过标准 UVC 控制项尝试调节自动曝光、快门/曝光时间、Gain/ISO-like 和工频防闪烁；ISO 和 ROI/测光点没有可靠通用 Windows Camera 映射，需后续单独验证。
+- Windows/DirectShow 可通过标准 UVC 控制项尝试调节自动曝光、快门/曝光时间、Gain/ISO-like 和工频防闪烁；ISO 没有通用 UVC 标准控制，只能先按 Gain/ISO-like 映射；ROI/测光点已实验性按 UVC 1.5 advertised，但 Windows Camera 是否在点击取景器时下发控制不可靠，必须以 `ROI ...` / `meter_roi=...` 日志为准。
 - H.264 UVC 已在低分辨率实验链路验证动态画面，但仍依赖 Venus、firmware 和 host 兼容性。
 
 不能说明：
