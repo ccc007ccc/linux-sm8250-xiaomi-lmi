@@ -789,11 +789,11 @@ impl RuntimeControls {
     fn update(&mut self, control: &UvcControlSet) -> Option<Vec<String>> {
         match control.name.as_str() {
             "ae_mode" => match control.value {
-                0x01 => {
+                0x01 | 0x04 => {
                     self.auto_exposure = Some(false);
                     Some(vec!["auto_exposure=0".to_string()])
                 }
-                0x02 => {
+                0x02 | 0x08 => {
                     self.auto_exposure = Some(true);
                     Some(vec!["auto_exposure=1".to_string()])
                 }

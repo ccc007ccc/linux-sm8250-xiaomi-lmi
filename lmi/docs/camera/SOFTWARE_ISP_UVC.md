@@ -57,7 +57,7 @@ UVC advertised size == OV13B10 selected RAW size == lmi-isp output size
 
 | UVC 单元 | selector | host 语义 | runtime 映射 |
 | --- | ---: | --- | --- |
-| Camera Terminal | `AE_MODE` / `0x02` | 自动曝光开关 | `auto_exposure=1/0` |
+| Camera Terminal | `AE_MODE` / `0x02` | 自动曝光模式；兼容 Windows DirectShow 下发的 manual/shutter-priority 值 | `0x01/0x04 -> auto_exposure=0`，`0x02/0x08 -> auto_exposure=1` |
 | Camera Terminal | `EXPOSURE_TIME_ABSOLUTE` / `0x04` | 快门/曝光时间，100us 单位 | `exposure_absolute=N` 后换算到 sensor exposure lines |
 | Processing Unit | `GAIN` / `0x04` | Gain/ISO-like 增益 | `gain=N` 后映射到 analogue gain |
 | Processing Unit | `POWER_LINE_FREQUENCY` / `0x05` | 关闭/50Hz/60Hz/auto 防闪烁 | `flicker=off/50/60/auto` |
@@ -72,6 +72,8 @@ UVC advertised size == OV13B10 selected RAW size == lmi-isp output size
 - Windows DirectShow 能看到六个 MJPEG 原生模式，没有旧 fallback。
 - frame 1 会切到 OV13B10 mode 0，并配置 `/dev/video3 pgAA 4208x3120`。
 - frame 6 会切到 OV13B10 mode 5，并配置 `/dev/video3 pgAA 1364x768`。
+- Windows DirectShow 能通过 `IAMCameraControl` / `IAMVideoProcAmp` 看到 Exposure、Gain、Power Line Frequency，并能写入标准 UVC control。
+- DirectShow 手动 Exposure 实测会写入 AE mode `0x04`；runtime 已按 manual 兼容，并在 UVC streaming 中转发到 `lmi-isp` control FIFO。
 
 ## MJPEG 画质和性能边界
 

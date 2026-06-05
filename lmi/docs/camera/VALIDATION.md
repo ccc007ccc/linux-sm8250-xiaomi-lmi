@@ -86,7 +86,7 @@ Host 写控制项时，设备日志应出现：
 [lmi-isp] control: ...
 ```
 
-Windows/DirectShow 侧优先确认 Exposure、Gain、Power Line Frequency 是否可见；ISO 不是标准 UVC 控制项，当前按 `GAIN` 做 ISO-like 映射。ROI/测光点暂不作为通过条件。
+Windows/DirectShow 侧优先确认 Exposure、Gain、Power Line Frequency 是否可见；ISO 不是标准 UVC 控制项，当前按 `GAIN` 做 ISO-like 映射。DirectShow 手动曝光可能写入 UVC AE mode `0x04`（shutter priority），runtime 应按 manual 处理；`0x01/0x04` 均应转为 `auto_exposure=0`，`0x02/0x08` 均应转为 `auto_exposure=1`。ROI/测光点暂不作为通过条件。
 
 ## H.264 / Venus 检查
 
