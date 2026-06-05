@@ -103,7 +103,15 @@ static int fifofd = -1;
 static int eventfd = -1;
 static int streaming = 0;
 static int g_stream_requested;
-static int control_sel = 0; /* PROBE or COMMIT, for the SET_CUR DATA that follows */
+enum control_data_kind {
+	CONTROL_DATA_NONE = 0,
+	CONTROL_DATA_STREAMING,
+	CONTROL_DATA_UVC_CONTROL,
+};
+static enum control_data_kind control_data_kind;
+static uint8_t control_sel;  /* VS PROBE/COMMIT or VC CT/PU selector for following SET_CUR DATA */
+static uint8_t control_unit;
+static unsigned int control_data_len;
 static unsigned int g_dequeued_frames;
 static unsigned int g_requeued_frames;
 static unsigned int g_received_frames;
@@ -114,6 +122,28 @@ static volatile sig_atomic_t g_run = 1;
 
 static struct uvc_streaming_control g_probe;
 static struct uvc_streaming_control g_commit;
+
+#define UVC_UNIT_CAMERA_TERMINAL 1
+#define UVC_UNIT_PROCESSING      2
+
+struct uvc_control_state {
+	uint8_t unit;
+	uint8_t selector;
+	uint8_t len;
+	int32_t cur;
+	int32_t min;
+	int32_t max;
+	int32_t res;
+	int32_t def;
+	const char *name;
+};
+
+static struct uvc_control_state g_uvc_controls[] = {
+	{ UVC_UNIT_CAMERA_TERMINAL, UVC_CT_AE_MODE_CONTROL, 1, 0x02, 0x01, 0x02, 0x03, 0x02, "ae_mode" },
+	{ UVC_UNIT_CAMERA_TERMINAL, UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL, 4, 333, 1, 10000, 1, 333, "exposure_time_absolute" },
+	{ UVC_UNIT_PROCESSING, UVC_PU_GAIN_CONTROL, 2, 0, 0, 255, 1, 0, "gain" },
+	{ UVC_UNIT_PROCESSING, UVC_PU_POWER_LINE_FREQUENCY_CONTROL, 1, 0, 0, 3, 1, 0, "power_line_frequency" },
+};
 
 struct buffer {
 	void *start;
@@ -646,6 +676,95 @@ static void fill_streaming_control(struct uvc_streaming_control *ctrl)
 	fill_streaming_control_frame(ctrl, g_frame_index);
 }
 
+static struct uvc_control_state *find_uvc_control(uint8_t unit, uint8_t selector)
+{
+	unsigned int i;
+	for (i = 0; i < sizeof(g_uvc_controls) / sizeof(g_uvc_controls[0]); i++) {
+		if (g_uvc_controls[i].unit == unit && g_uvc_controls[i].selector == selector)
+			return &g_uvc_controls[i];
+	}
+	return NULL;
+}
+
+static int control_value_valid(const struct uvc_control_state *ctrl, int32_t value)
+{
+	if (ctrl->selector == UVC_CT_AE_MODE_CONTROL)
+		return value == 0x01 || value == 0x02;
+	return value >= ctrl->min && value <= ctrl->max;
+}
+
+static void write_le_value(unsigned char *dst, unsigned int len, int32_t value)
+{
+	unsigned int i;
+	uint32_t v = (uint32_t)value;
+	for (i = 0; i < len; i++)
+		dst[i] = (unsigned char)((v >> (i * 8)) & 0xff);
+}
+
+static int32_t read_le_value(const unsigned char *src, unsigned int len)
+{
+	unsigned int i;
+	uint32_t v = 0;
+	for (i = 0; i < len && i < 4; i++)
+		v |= (uint32_t)src[i] << (i * 8);
+	return (int32_t)v;
+}
+
+static void write_uvc_control_value(struct uvc_request_data *resp,
+					const struct uvc_control_state *ctrl,
+					int32_t value)
+{
+	memset(resp->data, 0, sizeof(resp->data));
+	write_le_value(resp->data, ctrl->len, value);
+	resp->length = ctrl->len;
+}
+
+static void process_uvc_control(uint8_t req, uint8_t unit, uint8_t cs,
+					struct uvc_request_data *resp)
+{
+	struct uvc_control_state *ctrl = find_uvc_control(unit, cs);
+
+	if (!ctrl)
+		return;
+
+	switch (req) {
+	case UVC_SET_CUR:
+		control_data_kind = CONTROL_DATA_UVC_CONTROL;
+		control_unit = unit;
+		control_sel = cs;
+		control_data_len = ctrl->len;
+		resp->length = ctrl->len;
+		break;
+	case UVC_GET_CUR:
+		write_uvc_control_value(resp, ctrl, ctrl->cur);
+		break;
+	case UVC_GET_MIN:
+		write_uvc_control_value(resp, ctrl, ctrl->min);
+		break;
+	case UVC_GET_MAX:
+		write_uvc_control_value(resp, ctrl, ctrl->max);
+		break;
+	case UVC_GET_RES:
+		write_uvc_control_value(resp, ctrl, ctrl->res);
+		break;
+	case UVC_GET_DEF:
+		write_uvc_control_value(resp, ctrl, ctrl->def);
+		break;
+	case UVC_GET_LEN:
+		resp->data[0] = ctrl->len;
+		resp->data[1] = 0;
+		resp->length = 2;
+		break;
+	case UVC_GET_INFO:
+		resp->data[0] = 0x03; /* GET and SET supported */
+		resp->length = 1;
+		break;
+	default:
+		resp->length = -EL2HLT;
+		break;
+	}
+}
+
 /* ---- UVC PROBE/COMMIT streaming-control request handling ---- */
 
 static void process_streaming(uint8_t req, uint8_t cs, struct uvc_request_data *resp)
@@ -659,7 +778,10 @@ static void process_streaming(uint8_t req, uint8_t cs, struct uvc_request_data *
 
 	switch (req) {
 	case UVC_SET_CUR:
+		control_data_kind = CONTROL_DATA_STREAMING;
+		control_unit = 0;
 		control_sel = cs;        /* the next UVC_EVENT_DATA carries the payload */
+		control_data_len = g_control_len;
 		resp->length = g_control_len;
 		break;
 	case UVC_GET_CUR:
@@ -697,8 +819,12 @@ static void process_setup(struct usb_ctrlrequest *ctrl, struct uvc_request_data 
 {
 	uint8_t cs;
 	uint8_t intf;
+	uint8_t unit;
 
+	control_data_kind = CONTROL_DATA_NONE;
 	control_sel = 0;
+	control_unit = 0;
+	control_data_len = 0;
 	resp->length = -EL2HLT; /* stall optional/unhandled controls */
 
 	if ((ctrl->bRequestType & USB_TYPE_MASK) != USB_TYPE_CLASS)
@@ -706,17 +832,17 @@ static void process_setup(struct usb_ctrlrequest *ctrl, struct uvc_request_data 
 
 	cs = ctrl->wValue >> 8;
 	intf = ctrl->wIndex & 0xff;
+	unit = ctrl->wIndex >> 8;
 
-	/* Only the streaming (VS) interface PROBE/COMMIT controls are handled;
-	 * optional VC unit/terminal controls are stalled so the host falls back
-	 * to defaults, which is sufficient for a basic webcam. */
 	if (intf == g_streaming_intf &&
 	    (cs == UVC_VS_PROBE_CONTROL || cs == UVC_VS_COMMIT_CONTROL))
 		process_streaming(ctrl->bRequest, cs, resp);
+	else if (intf == 0 && (unit == UVC_UNIT_CAMERA_TERMINAL || unit == UVC_UNIT_PROCESSING))
+		process_uvc_control(ctrl->bRequest, unit, cs, resp);
 
 	if (g_verbose)
-		ilog("setup type=0x%02x req=0x%02x cs=0x%02x intf=%u len=%u -> resp.len=%d",
-		     ctrl->bRequestType, ctrl->bRequest, cs, intf, ctrl->wLength, resp->length);
+		ilog("setup type=0x%02x req=0x%02x cs=0x%02x intf=%u unit=%u len=%u -> resp.len=%d",
+		     ctrl->bRequestType, ctrl->bRequest, cs, intf, unit, ctrl->wLength, resp->length);
 }
 
 static int start_streaming(void);
@@ -841,8 +967,38 @@ static void process_data(struct uvc_request_data *data)
 {
 	struct uvc_streaming_control *target;
 
-	if (control_sel == 0 || data->length <= 0)
+	if (control_data_kind == CONTROL_DATA_NONE || control_sel == 0 || data->length <= 0)
 		return;
+
+	if (control_data_kind == CONTROL_DATA_UVC_CONTROL) {
+		struct uvc_control_state *ctrl = find_uvc_control(control_unit, control_sel);
+		if (ctrl) {
+			if ((unsigned int)data->length < ctrl->len) {
+				ilog("ignored short control payload: unit=%u selector=0x%02x %s len=%d expected=%u",
+				     ctrl->unit, ctrl->selector, ctrl->name, data->length, ctrl->len);
+			} else {
+				int32_t value = read_le_value(data->data, ctrl->len);
+				if (control_value_valid(ctrl, value)) {
+					char event[128];
+					ctrl->cur = value;
+					snprintf(event, sizeof(event), "CTRL unit=%u selector=%u name=%s value=%d",
+						 ctrl->unit, ctrl->selector, ctrl->name, ctrl->cur);
+					emit_event(event);
+					if (g_verbose)
+						ilog("control set: unit=%u selector=0x%02x %s=%d",
+						     ctrl->unit, ctrl->selector, ctrl->name, ctrl->cur);
+				} else {
+					ilog("ignored invalid control value: unit=%u selector=0x%02x %s=%d range=%d..%d",
+					     ctrl->unit, ctrl->selector, ctrl->name, value, ctrl->min, ctrl->max);
+				}
+			}
+		}
+		control_data_kind = CONTROL_DATA_NONE;
+		control_sel = 0;
+		control_unit = 0;
+		control_data_len = 0;
+		return;
+	}
 
 	target = (control_sel == UVC_VS_COMMIT_CONTROL) ? &g_commit : &g_probe;
 	{
@@ -897,7 +1053,10 @@ static void process_data(struct uvc_request_data *data)
 		}
 	}
 
+	control_data_kind = CONTROL_DATA_NONE;
 	control_sel = 0;
+	control_unit = 0;
+	control_data_len = 0;
 }
 
 /* ---- OUTPUT buffer queue ---- */

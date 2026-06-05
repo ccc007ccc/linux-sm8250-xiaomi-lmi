@@ -12,10 +12,10 @@ const DEFAULT_GADGET: &str = "lmi_uvc";
 const DEFAULT_VENDOR: &str = "0x1d6b";
 const DEFAULT_PRODUCT: &str = "0x0102";
 const DEFAULT_BCD_USB: &str = "0x0200";
-const RUST_MJPEG_BCD_DEVICE: &str = "0x0013";
-const RUST_MJPEG_SERIAL: &str = "lmi0004";
-const RUST_H264_BCD_DEVICE: &str = "0x0015";
-const RUST_H264_SERIAL: &str = "lmi0006";
+const RUST_MJPEG_BCD_DEVICE: &str = "0x0014";
+const RUST_MJPEG_SERIAL: &str = "lmi0005";
+const RUST_H264_BCD_DEVICE: &str = "0x0016";
+const RUST_H264_SERIAL: &str = "lmi0007";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum UvcCodec {
@@ -273,6 +273,11 @@ impl UvcGadget {
         fs::create_dir_all(f)?;
         fs::create_dir_all(f.join("control/class/fs"))?;
         fs::create_dir_all(f.join("control/class/ss"))?;
+        self.try_write(
+            &f.join("control/terminal/camera/default/bmControls"),
+            "10\n0\n0\n",
+        );
+        self.try_write(&f.join("control/processing/default/bmControls"), "0\n6\n");
         self.try_write(
             &f.join("streaming_maxpacket"),
             self.config.maxpacket.to_string(),

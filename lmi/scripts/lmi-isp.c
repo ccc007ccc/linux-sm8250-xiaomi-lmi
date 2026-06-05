@@ -24,6 +24,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -57,6 +58,7 @@ static const char *g_raw = "/dev/video3";
 static const char *g_ctrl = "";		  /* sensor subdev for AE (optional) */
 static const char *g_loopback = "";	   /* v4l2loopback OUTPUT node, or "" */
 static const char *g_fifo = "";		   /* FIFO for the UVC feeder, or "" */
+static const char *g_control_fifo = ""; /* FIFO for live UVC control updates, or "" */
 static const char *g_dump = "";		   /* processed frame dump for regression, or "" */
 static int g_dump_frames = 1;
 static int g_out_w = 1280, g_out_h = 720;
@@ -175,6 +177,7 @@ static int g_ae_last_hi;
 static int g_ae_changed;
 static int g_auto_tone = 1;
 static int g_dgain_limit = -1;
+static int g_flicker_hz;
 static double g_soft_gain = 1.0;
 static double g_max_soft_gain = 4.0;
 
@@ -275,19 +278,29 @@ static int set_ctrl(int fd, unsigned int id, int val)
 }
 
 static int g_ctrlfd = -1;
+static int g_controlfd = -1;
+static char g_control_line[256];
+static unsigned int g_control_line_len;
 
-static void ae_init(void)
+static int controls_init(void)
 {
-	if (!g_auto_exposure || !g_ctrl[0])
-		return;
+	if (g_ctrlfd >= 0)
+		return 0;
+	if (!g_ctrl[0]) {
+		ilog("controls: no ctrl subdev configured");
+		return -1;
+	}
 	g_ctrlfd = open(g_ctrl, O_RDWR);
 	if (g_ctrlfd < 0) {
-		ilog("AE: cannot open ctrl subdev %s: %s", g_ctrl, strerror(errno));
-		g_auto_exposure = 0;
-		return;
+		ilog("controls: cannot open ctrl subdev %s: %s", g_ctrl, strerror(errno));
+		return -1;
 	}
-	if (get_ctrl_range(g_ctrlfd, V4L2_CID_EXPOSURE, &g_exp_min, &g_exp_max, &g_exposure) < 0)
-		g_auto_exposure = 0;
+	if (get_ctrl_range(g_ctrlfd, V4L2_CID_EXPOSURE, &g_exp_min, &g_exp_max, &g_exposure) < 0) {
+		ilog("controls: EXPOSURE is not available on %s", g_ctrl);
+		close(g_ctrlfd);
+		g_ctrlfd = -1;
+		return -1;
+	}
 	if (get_ctrl_range(g_ctrlfd, V4L2_CID_ANALOGUE_GAIN, &g_gain_min, &g_gain_max, &g_again) < 0)
 		g_again = -1;
 	if (get_ctrl_range(g_ctrlfd, V4L2_CID_DIGITAL_GAIN, &g_dgain_min, &g_dgain_max, &g_dgain) < 0)
@@ -300,12 +313,27 @@ static void ae_init(void)
 		if (g_dgain > g_dgain_limit && set_ctrl(g_ctrlfd, V4L2_CID_DIGITAL_GAIN, g_dgain_limit) == 0)
 			g_dgain = g_dgain_limit;
 	}
-	ilog("AE: exposure[%d..%d]=%d gain[%d..%d]=%d digital[%d..%d]=%d target=%d clip=%d/%d digital_limit=%d soft_limit=%.1f",
+	if (g_again < 0) {
+		g_gain_min = 0;
+		g_gain_max = 0;
+	}
+	if (g_dgain < 0) {
+		g_dgain_min = 0;
+		g_dgain_max = 0;
+	}
+	ilog("controls: exposure[%d..%d]=%d gain[%d..%d]=%d digital[%d..%d]=%d ae=%d target=%d clip=%d/%d flicker=%d digital_limit=%d soft_limit=%.1f",
 		 g_exp_min, g_exp_max, g_exposure, g_gain_min, g_gain_max, g_again,
-		 g_dgain_min, g_dgain_max, g_dgain, g_target, g_ae_clip_target,
-		 g_ae_clip_weight,
+		 g_dgain_min, g_dgain_max, g_dgain, g_auto_exposure, g_target, g_ae_clip_target,
+		 g_ae_clip_weight, g_flicker_hz,
 		 g_dgain >= 0 && g_dgain_limit >= 0 ? g_dgain_limit : g_dgain_max,
 		 g_max_soft_gain);
+	return 0;
+}
+
+static void ae_init(void)
+{
+	if (g_auto_exposure && controls_init() < 0)
+		g_auto_exposure = 0;
 }
 
 static int ae_dgain_max(void)
@@ -315,6 +343,207 @@ static int ae_dgain_max(void)
 	if (g_dgain_limit >= 0 && g_dgain_limit < g_dgain_max)
 		return g_dgain_limit;
 	return g_dgain_max;
+}
+
+static int clamp_i(int value, int vmin, int vmax)
+{
+	if (value < vmin)
+		return vmin;
+	if (value > vmax)
+		return vmax;
+	return value;
+}
+
+static int apply_exposure(int value)
+{
+	if (g_ctrlfd < 0 && controls_init() < 0)
+		return -1;
+	value = clamp_i(value, g_exp_min, g_exp_max);
+	if (set_ctrl(g_ctrlfd, V4L2_CID_EXPOSURE, value) < 0) {
+		ilog("control: exposure=%d failed: %s", value, strerror(errno));
+		return -1;
+	}
+	g_exposure = value;
+	g_ae_changed = 1;
+	return 0;
+}
+
+static int apply_analogue_gain(int value)
+{
+	if (g_again < 0)
+		return -1;
+	value = clamp_i(value, g_gain_min, g_gain_max);
+	if (set_ctrl(g_ctrlfd, V4L2_CID_ANALOGUE_GAIN, value) < 0) {
+		ilog("control: analogue_gain=%d failed: %s", value, strerror(errno));
+		return -1;
+	}
+	g_again = value;
+	g_ae_changed = 1;
+	return 0;
+}
+
+static int apply_digital_gain(int value)
+{
+	int dgain_max = ae_dgain_max();
+	if (g_dgain < 0 || dgain_max < 0)
+		return -1;
+	value = clamp_i(value, g_dgain_min, dgain_max);
+	if (set_ctrl(g_ctrlfd, V4L2_CID_DIGITAL_GAIN, value) < 0) {
+		ilog("control: digital_gain=%d failed: %s", value, strerror(errno));
+		return -1;
+	}
+	g_dgain = value;
+	g_ae_changed = 1;
+	return 0;
+}
+
+static int flicker_quantize_exposure(int value)
+{
+	int quantum;
+	if (g_flicker_hz != 50 && g_flicker_hz != 60)
+		return value;
+	/* Sensor exposure is line-based here; use a conservative coarse bucket so AE
+	 * does not chase every frame when power-line mode is enabled. */
+	quantum = (g_exp_max - g_exp_min) / (g_flicker_hz == 50 ? 100 : 120);
+	if (quantum < 1)
+		quantum = 1;
+	value = ((value + quantum / 2) / quantum) * quantum;
+	return clamp_i(value, g_exp_min, g_exp_max);
+}
+
+static int exposure_absolute_to_lines(int value_100us)
+{
+	int fps = g_fps_cap > 0 ? g_fps_cap : 30;
+	int frame_units = 10000 / fps; /* 100us units per nominal frame */
+	int lines;
+	if (value_100us < 1)
+		value_100us = 1;
+	if (frame_units < 1)
+		frame_units = 1;
+	lines = g_exp_min + (int)(((int64_t)value_100us * (g_exp_max - g_exp_min)) / frame_units);
+	return flicker_quantize_exposure(clamp_i(lines, g_exp_min, g_exp_max));
+}
+
+static int uvc_gain_to_sensor_gain(int value)
+{
+	if (g_again < 0)
+		return -1;
+	value = clamp_i(value, 0, 255);
+	return g_gain_min + (int)(((int64_t)value * (g_gain_max - g_gain_min)) / 255);
+}
+
+static void control_fifo_open(void)
+{
+	if (!g_control_fifo[0] || g_controlfd >= 0)
+		return;
+	g_controlfd = open(g_control_fifo, O_RDWR | O_NONBLOCK);
+	if (g_controlfd < 0)
+		ilog("control fifo: cannot open %s: %s", g_control_fifo, strerror(errno));
+	else
+		ilog("control fifo: listening on %s", g_control_fifo);
+}
+
+static void apply_control_line(char *line)
+{
+	char *key, *value, *end;
+	long parsed;
+
+	while (*line && isspace((unsigned char)*line))
+		line++;
+	if (!*line || *line == '#')
+		return;
+	end = line + strlen(line);
+	while (end > line && isspace((unsigned char)end[-1]))
+		*--end = '\0';
+	value = strchr(line, '=');
+	if (!value) {
+		ilog("control fifo: ignored malformed command '%s'", line);
+		return;
+	}
+	*value++ = '\0';
+	key = line;
+	if (!strcmp(key, "auto_exposure")) {
+		parsed = strtol(value, NULL, 0);
+		if (parsed) {
+			if (controls_init() == 0)
+				g_auto_exposure = 1;
+		} else {
+			g_auto_exposure = 0;
+		}
+		ilog("control: auto_exposure=%d", g_auto_exposure);
+		return;
+	}
+	if (!strcmp(key, "flicker")) {
+		if (!strcmp(value, "50"))
+			g_flicker_hz = 50;
+		else if (!strcmp(value, "60"))
+			g_flicker_hz = 60;
+		else if (!strcmp(value, "auto"))
+			g_flicker_hz = 50;
+		else
+			g_flicker_hz = 0;
+		ilog("control: flicker=%s hz=%d", value, g_flicker_hz);
+		return;
+	}
+	if (controls_init() < 0) {
+		ilog("control fifo: cannot apply '%s=%s' without sensor controls", key, value);
+		return;
+	}
+	parsed = strtol(value, NULL, 0);
+	if (!strcmp(key, "exposure_absolute")) {
+		g_auto_exposure = 0;
+		if (apply_exposure(exposure_absolute_to_lines((int)parsed)) == 0)
+			ilog("control: exposure_absolute=%ld -> exposure=%d", parsed, g_exposure);
+	} else if (!strcmp(key, "exposure")) {
+		g_auto_exposure = 0;
+		if (apply_exposure(flicker_quantize_exposure((int)parsed)) == 0)
+			ilog("control: exposure=%d", g_exposure);
+	} else if (!strcmp(key, "analogue_gain")) {
+		g_auto_exposure = 0;
+		if (apply_analogue_gain((int)parsed) == 0)
+			ilog("control: analogue_gain=%d", g_again);
+	} else if (!strcmp(key, "digital_gain")) {
+		g_auto_exposure = 0;
+		if (apply_digital_gain((int)parsed) == 0)
+			ilog("control: digital_gain=%d", g_dgain);
+	} else if (!strcmp(key, "gain")) {
+		int again = uvc_gain_to_sensor_gain((int)parsed);
+		g_auto_exposure = 0;
+		if (again >= 0 && apply_analogue_gain(again) == 0)
+			ilog("control: gain=%ld -> analogue_gain=%d", parsed, g_again);
+	} else {
+		ilog("control fifo: ignored unknown command '%s=%s'", key, value);
+	}
+}
+
+static void control_fifo_drain(void)
+{
+	char buf[256];
+	ssize_t n;
+	unsigned int i;
+
+	if (!g_control_fifo[0])
+		return;
+	control_fifo_open();
+	if (g_controlfd < 0)
+		return;
+	while ((n = read(g_controlfd, buf, sizeof(buf))) > 0) {
+		for (i = 0; i < (unsigned int)n; i++) {
+			char c = buf[i];
+			if (c == '\n' || c == '\r') {
+				g_control_line[g_control_line_len] = '\0';
+				apply_control_line(g_control_line);
+				g_control_line_len = 0;
+			} else if (g_control_line_len + 1 < sizeof(g_control_line)) {
+				g_control_line[g_control_line_len++] = c;
+			} else {
+				g_control_line_len = 0;
+				ilog("control fifo: dropped overlong command");
+			}
+		}
+	}
+	if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+		ilog("control fifo: read failed: %s", strerror(errno));
 }
 
 static int raw_percentile_luma(int step, int pct);
@@ -348,6 +577,7 @@ static void ae_update(int mean)
 			g_exposure += step * 2;
 			if (g_exposure > g_exp_max)
 				g_exposure = g_exp_max;
+			g_exposure = flicker_quantize_exposure(g_exposure);
 			if (set_ctrl(g_ctrlfd, V4L2_CID_EXPOSURE, g_exposure) == 0)
 				g_ae_changed = 1;
 		} else if (g_again >= 0 && g_again < g_gain_max) {
@@ -380,6 +610,7 @@ static void ae_update(int mean)
 			g_exposure -= step;
 			if (g_exposure < g_exp_min)
 				g_exposure = g_exp_min;
+			g_exposure = flicker_quantize_exposure(g_exposure);
 			if (set_ctrl(g_ctrlfd, V4L2_CID_EXPOSURE, g_exposure) == 0)
 				g_ae_changed = 1;
 		}
@@ -2952,6 +3183,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--ctrl") && i + 1 < argc) g_ctrl = argv[++i];
 		else if (!strcmp(argv[i], "--loopback") && i + 1 < argc) g_loopback = argv[++i];
 		else if (!strcmp(argv[i], "--fifo") && i + 1 < argc) g_fifo = argv[++i];
+		else if (!strcmp(argv[i], "--control-fifo") && i + 1 < argc) g_control_fifo = argv[++i];
 		else if (!strcmp(argv[i], "--dump") && i + 1 < argc) g_dump = argv[++i];
 		else if (!strcmp(argv[i], "--frames") && i + 1 < argc) g_dump_frames = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--out-width") && i + 1 < argc) g_out_w = atoi(argv[++i]);
@@ -3046,6 +3278,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, on_sig);
 	signal(SIGPIPE, SIG_IGN);
 	pin_cpu_range();
+	control_fifo_open();
 	if (g_motion_overlay_size < 16)
 		g_motion_overlay_size = 16;
 	if (g_motion_overlay_size > 512)
@@ -3219,6 +3452,8 @@ int main(int argc, char **argv)
 
 	while (g_run) {
 		struct pollfd p = { g_rawfd, POLLIN, 0 };
+
+		control_fifo_drain();
 		struct v4l2_buffer buf;
 		struct v4l2_plane planes[MAXPLANES];
 		struct timespec t_loop, t_poll, t_dq, t_copy, t_qbuf, t_unpack, t_awb, t_pack, t_out, t_ae, t_sleep;
@@ -3232,10 +3467,12 @@ int main(int argc, char **argv)
 		clock_gettime(CLOCK_MONOTONIC, &t_poll);
 		perf_add(&ps.poll_sum, &ps.poll_max, ts_ms(&t_loop, &t_poll));
 		if (pr <= 0) {
+			control_fifo_drain();
 			if (pr == 0)
 				ps.poll_timeouts++;
 			continue;
 		}
+		control_fifo_drain();
 		memset(&buf, 0, sizeof(buf));
 		memset(planes, 0, sizeof(planes));
 		buf.type = type; buf.memory = V4L2_MEMORY_MMAP;

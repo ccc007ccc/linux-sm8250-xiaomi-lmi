@@ -6,7 +6,7 @@ use crate::route::LmiRouteConfig;
 use crate::uvc::{UvcCodec, UvcGadget, UvcGadgetConfig};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,7 @@ pub struct NativeUvcRunConfig {
     pub venus_node: PathBuf,
     pub fifo: PathBuf,
     pub isp_nv12_fifo: PathBuf,
+    pub isp_control_fifo: PathBuf,
     pub event_fifo: PathBuf,
     pub ready_file: PathBuf,
     pub setup_route: bool,
@@ -82,6 +83,7 @@ impl Default for NativeUvcRunConfig {
             venus_node: PathBuf::new(),
             fifo: PathBuf::from("/run/lmi-camera/lmi-uvc.fifo"),
             isp_nv12_fifo: PathBuf::from("/run/lmi-camera/lmi-isp-nv12.fifo"),
+            isp_control_fifo: PathBuf::from("/run/lmi-camera/lmi-isp.control"),
             event_fifo: PathBuf::from("/run/lmi-camera/lmi-uvc.events"),
             ready_file: PathBuf::from("/run/lmi-camera/lmi-uvc.ready"),
             setup_route: true,
@@ -182,6 +184,9 @@ where
             }
             "--isp-nv12-fifo" | "--venus-input-fifo" => {
                 config.isp_nv12_fifo = PathBuf::from(next_value(&mut args, &arg)?)
+            }
+            "--isp-control-fifo" | "--control-fifo" => {
+                config.isp_control_fifo = PathBuf::from(next_value(&mut args, &arg)?)
             }
             "--uvc-event-fifo" | "--isp-uvc-event-fifo" => {
                 config.event_fifo = PathBuf::from(next_value(&mut args, &arg)?)
@@ -361,8 +366,11 @@ pub fn print_native_uvc_run_usage() {
     println!("Native UVC runtime options:");
     println!("  run --output uvc --profile native-modes [--codec mjpeg|h264]");
     println!("  --isp-bin PATH --uvc-feeder-bin PATH --uvc-fifo PATH --uvc-event-fifo PATH");
+    println!("  --isp-control-fifo PATH  (runtime AE/exposure/gain/flicker UVC controls)");
     println!("  --venus-bin PATH [--venus-node DEV] --isp-nv12-fifo PATH  (for --codec h264)");
-    println!("  --uvc-gadget-name NAME --uvc-udc NAME --uvc-default-frame INDEX --uvc-no-restore-prev-gadget");
+    println!(
+        "  --uvc-gadget-name NAME --uvc-udc NAME --uvc-default-frame INDEX --uvc-no-restore-prev-gadget"
+    );
     println!("  --raw DEV --ctrl DEV --media DEV --sensor-subdev DEV --keep-links");
     println!(
         "  native-modes exposes exactly six OV13B10 RAW-size frames; default codec remains MJPEG"
@@ -398,14 +406,17 @@ pub fn run_native_uvc(mut config: NativeUvcRunConfig) -> io::Result<()> {
 
     prepare_parent_dir(&config.fifo)?;
     prepare_parent_dir(&config.isp_nv12_fifo)?;
+    prepare_parent_dir(&config.isp_control_fifo)?;
     prepare_parent_dir(&config.event_fifo)?;
     prepare_parent_dir(&config.ready_file)?;
     prepare_fifo(&config.fifo)?;
     if config.codec == UvcCodec::H264 {
         prepare_fifo(&config.isp_nv12_fifo)?;
     }
+    prepare_fifo(&config.isp_control_fifo)?;
     prepare_fifo(&config.event_fifo)?;
     let mut event_reader = EventReader::open(&config.event_fifo)?;
+    let mut pending_controls = RuntimeControls::default();
 
     let mut active_mode = by_frame_index(config.gadget.default_frame_index)
         .ok_or_else(|| invalid_input("invalid native UVC default frame"))?;
@@ -437,6 +448,7 @@ pub fn run_native_uvc(mut config: NativeUvcRunConfig) -> io::Result<()> {
                 &mut stream_requested,
                 &mut pending_stop_at,
                 &mut pipeline,
+                &mut pending_controls,
             )?;
         }
 
@@ -490,7 +502,7 @@ pub fn run_native_uvc(mut config: NativeUvcRunConfig) -> io::Result<()> {
                     "[uvc] stream still requested after clean pipeline exit, restarting after delay"
                 );
                 thread::sleep(config.restart_delay);
-                start_pipeline(&config, active_mode, &mut pipeline)?;
+                start_pipeline(&config, active_mode, &pending_controls, &mut pipeline)?;
             } else if stream_requested {
                 return Err(io::Error::other(format!(
                     "{} exited while streaming: {}",
@@ -518,6 +530,7 @@ fn handle_event(
     stream_requested: &mut bool,
     pending_stop_at: &mut Option<Instant>,
     pipeline: &mut Option<PipelineSupervisor>,
+    pending_controls: &mut RuntimeControls,
 ) -> io::Result<()> {
     match parse_event(event) {
         UvcEvent::Commit {
@@ -567,17 +580,17 @@ fn handle_event(
                     child.terminate()?;
                 }
                 if *stream_requested {
-                    start_pipeline(config, mode, pipeline)?;
+                    start_pipeline(config, mode, pending_controls, pipeline)?;
                 }
             } else if *stream_requested && pipeline.is_none() {
-                start_pipeline(config, mode, pipeline)?;
+                start_pipeline(config, mode, pending_controls, pipeline)?;
             }
         }
         UvcEvent::StreamOn => {
             *stream_requested = true;
             *pending_stop_at = None;
             if pipeline.is_none() {
-                start_pipeline(config, *active_mode, pipeline)?;
+                start_pipeline(config, *active_mode, pending_controls, pipeline)?;
             }
         }
         UvcEvent::StreamOff | UvcEvent::Disconnect => {
@@ -587,6 +600,28 @@ fn handle_event(
                 "[uvc] demand: {event}, stopping camera pipeline after {:.2}s idle grace",
                 config.idle_stop_delay.as_secs_f32()
             );
+        }
+        UvcEvent::ControlSet(control) => {
+            if let Some(commands) = pending_controls.update(&control) {
+                println!(
+                    "[uvc] control: unit={} selector={} {}={} -> {}",
+                    control.unit,
+                    control.selector,
+                    control.name,
+                    control.value,
+                    commands.join(",")
+                );
+                if pipeline.is_some() {
+                    for command in commands {
+                        apply_control_command(config, &command);
+                    }
+                }
+            } else {
+                println!(
+                    "[uvc] ignored unsupported control: unit={} selector={} {}={}",
+                    control.unit, control.selector, control.name, control.value
+                );
+            }
         }
         UvcEvent::Connect => println!("[uvc] host connected"),
         UvcEvent::Other(line) => println!("[uvc] event: {line}"),
@@ -606,6 +641,7 @@ fn build_uvc_isp_profile(
         ctrl_node,
         isp_bin: config.isp_bin.clone(),
         fifo,
+        control_fifo: Some(config.isp_control_fifo.clone()),
         out_width: mode.width,
         out_height: mode.height,
         fps_cap: mode.fps_cap,
@@ -673,6 +709,7 @@ fn route_for_mode(
 fn start_pipeline(
     config: &NativeUvcRunConfig,
     mode: NativeMode,
+    pending_controls: &RuntimeControls,
     slot: &mut Option<PipelineSupervisor>,
 ) -> io::Result<()> {
     let (raw_node, ctrl_node) = route_for_mode(config, mode)?;
@@ -728,7 +765,101 @@ fn start_pipeline(
             .unwrap_or_default()
     );
     *slot = Some(pipeline);
+    pending_controls.apply_all(config);
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct UvcControlSet {
+    unit: u32,
+    selector: u32,
+    name: String,
+    value: i32,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeControls {
+    auto_exposure: Option<bool>,
+    exposure_absolute: Option<i32>,
+    gain: Option<i32>,
+    flicker: Option<&'static str>,
+}
+
+impl RuntimeControls {
+    fn update(&mut self, control: &UvcControlSet) -> Option<Vec<String>> {
+        match control.name.as_str() {
+            "ae_mode" => match control.value {
+                0x01 => {
+                    self.auto_exposure = Some(false);
+                    Some(vec!["auto_exposure=0".to_string()])
+                }
+                0x02 => {
+                    self.auto_exposure = Some(true);
+                    Some(vec!["auto_exposure=1".to_string()])
+                }
+                _ => None,
+            },
+            "exposure_time_absolute" => {
+                self.auto_exposure = Some(false);
+                self.exposure_absolute = Some(control.value);
+                Some(vec![
+                    "auto_exposure=0".to_string(),
+                    format!("exposure_absolute={}", control.value),
+                ])
+            }
+            "gain" => {
+                self.auto_exposure = Some(false);
+                self.gain = Some(control.value);
+                Some(vec![
+                    "auto_exposure=0".to_string(),
+                    format!("gain={}", control.value),
+                ])
+            }
+            "power_line_frequency" => {
+                let value = match control.value {
+                    0 => "off",
+                    1 => "50",
+                    2 => "60",
+                    3 => "auto",
+                    _ => return None,
+                };
+                self.flicker = Some(value);
+                Some(vec![format!("flicker={value}")])
+            }
+            _ => None,
+        }
+    }
+
+    fn commands(&self) -> Vec<String> {
+        let mut commands = Vec::new();
+        if let Some(flicker) = self.flicker {
+            commands.push(format!("flicker={flicker}"));
+        }
+        match self.auto_exposure {
+            Some(true) => commands.push("auto_exposure=1".to_string()),
+            Some(false) => {
+                commands.push("auto_exposure=0".to_string());
+                self.push_manual_commands(&mut commands);
+            }
+            None => self.push_manual_commands(&mut commands),
+        }
+        commands
+    }
+
+    fn apply_all(&self, config: &NativeUvcRunConfig) {
+        for command in self.commands() {
+            apply_control_command(config, &command);
+        }
+    }
+
+    fn push_manual_commands(&self, commands: &mut Vec<String>) {
+        if let Some(value) = self.exposure_absolute {
+            commands.push(format!("exposure_absolute={value}"));
+        }
+        if let Some(value) = self.gain {
+            commands.push(format!("gain={value}"));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -743,6 +874,7 @@ enum UvcEvent {
         height: Option<u32>,
         size: Option<u32>,
     },
+    ControlSet(UvcControlSet),
     Other(String),
 }
 
@@ -781,7 +913,80 @@ fn parse_event(line: &str) -> UvcEvent {
             };
         }
     }
+    if let Some(rest) = trimmed.strip_prefix("CTRL") {
+        let mut unit = None;
+        let mut selector = None;
+        let mut name = None;
+        let mut value = None;
+        for item in rest.split_whitespace() {
+            let Some((key, field)) = item.split_once('=') else {
+                continue;
+            };
+            match key {
+                "unit" => unit = field.parse().ok(),
+                "selector" => selector = field.parse().ok(),
+                "name" => name = Some(field.to_string()),
+                "value" => value = field.parse().ok(),
+                _ => {}
+            }
+        }
+        if let (Some(unit), Some(selector), Some(name), Some(value)) = (unit, selector, name, value)
+        {
+            return UvcEvent::ControlSet(UvcControlSet {
+                unit,
+                selector,
+                name,
+                value,
+            });
+        }
+    }
     UvcEvent::Other(trimmed.to_string())
+}
+
+fn apply_control_command(config: &NativeUvcRunConfig, command: &str) {
+    let deadline = Instant::now() + Duration::from_millis(250);
+
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&config.isp_control_fifo)
+        {
+            Ok(mut fifo) => {
+                if let Err(err) = writeln!(fifo, "{command}") {
+                    println!(
+                        "[uvc] failed to write control '{}' to {}: {}",
+                        command,
+                        config.isp_control_fifo.display(),
+                        err
+                    );
+                }
+                return;
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(6) =>
+            {
+                if Instant::now() >= deadline {
+                    println!(
+                        "[uvc] deferred control '{}' because {} has no reader",
+                        command,
+                        config.isp_control_fifo.display()
+                    );
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                println!(
+                    "[uvc] failed to open control fifo {} for '{}': {}",
+                    config.isp_control_fifo.display(),
+                    command,
+                    err
+                );
+                return;
+            }
+        }
+    }
 }
 
 struct EventReader {

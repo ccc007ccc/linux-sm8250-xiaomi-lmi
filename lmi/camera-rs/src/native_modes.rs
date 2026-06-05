@@ -151,9 +151,7 @@ pub fn native_h264_max_record_bytes(width: u32, height: u32) -> u32 {
         .max(1);
     let peak = u64::from(native_h264_peak_bitrate(width, height, fps));
     let peak_frame = (peak / u64::from(fps)) / 8;
-    let burst_record = peak_frame
-        .saturating_mul(8)
-        .saturating_add(2 * 1024 * 1024);
+    let burst_record = peak_frame.saturating_mul(8).saturating_add(2 * 1024 * 1024);
     let safe = burst_record.max(4 * 1024 * 1024).min(rawish.max(1_048_576));
     ((safe + 4095) & !4095) as u32
 }

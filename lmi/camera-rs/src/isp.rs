@@ -25,6 +25,7 @@ pub struct UvcIspProfile {
     pub ctrl_node: Option<PathBuf>,
     pub isp_bin: PathBuf,
     pub fifo: PathBuf,
+    pub control_fifo: Option<PathBuf>,
     pub out_width: u32,
     pub out_height: u32,
     pub fps_cap: u32,
@@ -237,6 +238,11 @@ fn add_uvc_control_args(profile: &UvcIspProfile, args: &mut Vec<String>) {
         args.push(ctrl.display().to_string());
     }
 
+    if let Some(control_fifo) = &profile.control_fifo {
+        args.push("--control-fifo".to_string());
+        args.push(control_fifo.display().to_string());
+    }
+
     if profile.auto_exposure {
         args.push("--auto-exposure".to_string());
         args.push("--target".to_string());
@@ -319,6 +325,52 @@ mod tests {
         assert!(has_arg(&command.args, "--nv12"));
         assert!(!has_arg(&command.args, "--auto-exposure"));
         assert!(!has_arg(&command.args, "--target"));
+    }
+
+    #[test]
+    fn uvc_mjpeg_command_passes_control_fifo() {
+        let profile = UvcIspProfile {
+            raw_node: PathBuf::from("/dev/video3"),
+            ctrl_node: Some(PathBuf::from("/dev/v4l-subdev13")),
+            isp_bin: PathBuf::from("/run/lmi-camera/lmi-isp"),
+            fifo: PathBuf::from("/run/lmi-camera/lmi-uvc.fifo"),
+            control_fifo: Some(PathBuf::from("/run/lmi-camera/lmi-isp.control")),
+            out_width: 1364,
+            out_height: 768,
+            fps_cap: 120,
+            gamma: 3.0,
+            tone_highlight_knee: 0,
+            tone_highlight_max: 255,
+            max_soft_gain: 3.5,
+            auto_exposure: true,
+            ae_target: 85,
+            ae_clip_target: Some(620),
+            ae_clip_weight: 50,
+            max_digital_gain: Some(1024),
+            max_frame_bytes: 4 * 1024 * 1024,
+            mjpeg_quality: 90,
+            mjpeg_sharpen: 0,
+            mjpeg_smooth: 0,
+            mjpeg_area_scale: 100,
+            mjpeg_subsampling: 420,
+            mjpeg_scale_mode: "bayer-area-frac".to_string(),
+            mjpeg_fast_threads: 4,
+            cpu_affinity: Some("4-7".to_string()),
+        };
+        let command = IspCommand::for_uvc_mjpeg(&profile);
+
+        assert!(has_pair(
+            &command.args,
+            "--fifo",
+            "/run/lmi-camera/lmi-uvc.fifo"
+        ));
+        assert!(has_pair(&command.args, "--ctrl", "/dev/v4l-subdev13"));
+        assert!(has_pair(
+            &command.args,
+            "--control-fifo",
+            "/run/lmi-camera/lmi-isp.control"
+        ));
+        assert!(has_arg(&command.args, "--auto-exposure"));
     }
 
     #[test]

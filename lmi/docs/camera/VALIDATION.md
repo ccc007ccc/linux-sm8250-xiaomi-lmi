@@ -17,7 +17,7 @@ C helper 交叉编译 smoke check（示例使用 Android NDK clang）：
 
 ```sh
 NDK_CC=/home/ccc007/Android/android-ndk-r27d/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang
-$NDK_CC -O2 -Wall -Wextra -o /tmp/lmi-isp-check lmi/scripts/lmi-isp.c
+$NDK_CC -O2 -Wall -Wextra -o /tmp/lmi-isp-check lmi/scripts/lmi-isp.c -lm
 $NDK_CC -O2 -Wall -Wextra -o /tmp/lmi-uvc-gadget-check lmi/scripts/lmi-uvc-gadget.c
 $NDK_CC -O2 -Wall -Wextra -o /tmp/lmi-venus-enc-check lmi/scripts/lmi-venus-enc.c
 ```
@@ -61,6 +61,32 @@ find /sys/kernel/config/usb_gadget/lmi_uvc/functions/uvc.0/streaming/mjpeg/mjpg 
 - configfs frame 目录正好六个：`f01_4208x3120` 到 `f06_1364x768`。
 - Windows/DirectShow host 枚举同样看到六个 MJPEG 原生模式。
 - host 打开某 frame 后，日志显示 `COMMIT frame=N -> OV13B10 mode=M WxH`，并且 `/dev/video3 pgAA`、`lmi-isp` output、UVC frame 尺寸一致。
+
+## UVC 曝光/增益/防闪烁控制检查
+
+设备侧 descriptor 应 advertised：
+
+```sh
+cat /sys/kernel/config/usb_gadget/lmi_uvc/functions/uvc.0/control/terminal/camera/default/bmControls
+cat /sys/kernel/config/usb_gadget/lmi_uvc/functions/uvc.0/control/processing/default/bmControls
+```
+
+期望当前值：
+
+- Camera Terminal 第一字节为 `10`：`AE_MODE` + `EXPOSURE_TIME_ABSOLUTE`。
+- Processing Unit 第一字节为 `0`、第二字节为 `6`：`GAIN` + `POWER_LINE_FREQUENCY`。
+
+Host 写控制项时，设备日志应出现：
+
+```text
+[uvc] control: unit=1 selector=2 ae_mode=... -> auto_exposure=...
+[uvc] control: unit=1 selector=4 exposure_time_absolute=... -> auto_exposure=0,exposure_absolute=...
+[uvc] control: unit=2 selector=4 gain=... -> auto_exposure=0,gain=...
+[uvc] control: unit=2 selector=5 power_line_frequency=... -> flicker=...
+[lmi-isp] control: ...
+```
+
+Windows/DirectShow 侧优先确认 Exposure、Gain、Power Line Frequency 是否可见；ISO 不是标准 UVC 控制项，当前按 `GAIN` 做 ISO-like 映射。ROI/测光点暂不作为通过条件。
 
 ## H.264 / Venus 检查
 

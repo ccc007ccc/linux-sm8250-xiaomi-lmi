@@ -47,8 +47,22 @@ UVC advertised size == OV13B10 selected RAW size == lmi-isp output size
 
 - `COMMIT frame=N`：校验 host 宽高等于 native table，记录目标 sensor mode。
 - `STREAMON`：配置 media route、设置 `/dev/video3 pgAA`，启动 `lmi-isp` 和 feeder。
+- `CTRL unit=... selector=...`：接收 host 写入的标准 UVC 控制项，并通过 `/run/lmi-camera/lmi-isp.control` 转发到运行中的 `lmi-isp`。
 - `STREAMOFF`/`DISCONNECT`：按 idle grace 停止 `lmi-isp`/RAW，保留 UVC gadget 枚举。
 - 退出或切换：先停 manager/feeder/ISP，再解绑 UDC，再删除 configfs，避免 configfs 卡死。
+
+## UVC 控制项
+
+当前 advertised 的标准 UVC 控制项只覆盖 Windows/DirectShow 更可能识别的基础项目；Processing Unit `bmControls` 按 UVC 位序只打开 Gain 和 Power Line Frequency，不继续 advertised 未实现的亮度/背光等项目：
+
+| UVC 单元 | selector | host 语义 | runtime 映射 |
+| --- | ---: | --- | --- |
+| Camera Terminal | `AE_MODE` / `0x02` | 自动曝光开关 | `auto_exposure=1/0` |
+| Camera Terminal | `EXPOSURE_TIME_ABSOLUTE` / `0x04` | 快门/曝光时间，100us 单位 | `exposure_absolute=N` 后换算到 sensor exposure lines |
+| Processing Unit | `GAIN` / `0x04` | Gain/ISO-like 增益 | `gain=N` 后映射到 analogue gain |
+| Processing Unit | `POWER_LINE_FREQUENCY` / `0x05` | 关闭/50Hz/60Hz/auto 防闪烁 | `flicker=off/50/60/auto` |
+
+注意：UVC 没有通用标准 ISO 控制项，host 侧“ISO”只能先用 `PU_GAIN` 近似；测光点/ROI 需要 UVC 1.5 `REGION_OF_INTEREST` 或应用私有扩展，Windows Camera 是否暴露不可靠，暂未作为默认控制项宣传。
 
 ## 已验证状态
 
