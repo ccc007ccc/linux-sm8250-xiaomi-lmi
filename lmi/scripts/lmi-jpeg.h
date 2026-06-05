@@ -29,6 +29,14 @@ struct lmi_jpeg_huff {
 	uint8_t size[256];
 };
 
+#if defined(__GNUC__)
+#define LMI_JPEG_UNUSED __attribute__((unused))
+#else
+#define LMI_JPEG_UNUSED
+#endif
+
+static unsigned int lmi_jpeg_restart_interval;
+
 static const uint8_t lmi_jpeg_zigzag[64] = {
 	0, 1, 8, 16, 9, 2, 3, 10,
 	17, 24, 32, 25, 18, 11, 4, 5,
@@ -241,7 +249,27 @@ static void lmi_jpeg_make_qtable(uint8_t q[64], const uint8_t base[64], int qual
 	}
 }
 
-static void lmi_jpeg_fdct_quant(const double in[64], int out[64], const uint8_t q[64])
+static const double lmi_jpeg_fdct_scale[8] = {
+	1.0, 1.3870398453221475, 1.3065629648763766, 1.1758756024193588,
+	1.0, 0.7856949583871022, 0.5411961001461970, 0.2758993792829431,
+};
+
+static const float lmi_jpeg_fdct_scale_f[8] = {
+	1.0f, 1.3870398453221475f, 1.3065629648763766f, 1.1758756024193588f,
+	1.0f, 0.7856949583871022f, 0.5411961001461970f, 0.2758993792829431f,
+};
+
+static void lmi_jpeg_make_inv_qtable(double invq[64], const uint8_t q[64])
+{
+	for (int y = 0; y < 8; y++) {
+		for (int x = 0; x < 8; x++) {
+			int i = y * 8 + x;
+			invq[i] = 1.0 / (q[i] * 8.0 * lmi_jpeg_fdct_scale[y] * lmi_jpeg_fdct_scale[x]);
+		}
+	}
+}
+
+static void lmi_jpeg_fdct_quant_scaled(const double in[64], int out[64], const double invq[64])
 {
 	double tmp[64];
 	int i;
@@ -307,20 +335,27 @@ static void lmi_jpeg_fdct_quant(const double in[64], int out[64], const uint8_t 
 		}
 		for (int r = 0; r < 8; r++) {
 			int idx = r * 8 + i;
-			double scaled = col[r] / (q[idx] * 8.0);
+			double scaled = col[r] * invq[idx];
 			out[idx] = (int)(scaled >= 0.0 ? scaled + 0.5 : scaled - 0.5);
 		}
 	}
 }
 
-static void lmi_jpeg_encode_block(struct lmi_jpeg_writer *w, const double block[64],
-				  const uint8_t q[64], const struct lmi_jpeg_huff *hdc,
-				  const struct lmi_jpeg_huff *hac, int *pred)
+static void lmi_jpeg_fdct_quant(const double in[64], int out[64], const uint8_t q[64])
 {
-	int coeff[64];
+	double invq[64];
+
+	lmi_jpeg_make_inv_qtable(invq, q);
+	lmi_jpeg_fdct_quant_scaled(in, out, invq);
+}
+
+static void lmi_jpeg_encode_coeffs(struct lmi_jpeg_writer *w, const int coeff[64],
+				   const struct lmi_jpeg_huff *hdc,
+				   const struct lmi_jpeg_huff *hac, int *pred)
+{
 	int zz[64];
 	int diff, nbits, run;
-	lmi_jpeg_fdct_quant(block, coeff, q);
+
 	for (int i = 0; i < 64; i++)
 		zz[i] = coeff[lmi_jpeg_zigzag[i]];
 	diff = zz[0] - *pred;
@@ -346,6 +381,108 @@ static void lmi_jpeg_encode_block(struct lmi_jpeg_writer *w, const double block[
 	}
 	if (run)
 		lmi_jpeg_huff_bits(w, hac, 0x00);
+}
+
+static void lmi_jpeg_encode_block(struct lmi_jpeg_writer *w, const double block[64],
+				  const uint8_t q[64], const struct lmi_jpeg_huff *hdc,
+				  const struct lmi_jpeg_huff *hac, int *pred)
+{
+	int coeff[64];
+
+	lmi_jpeg_fdct_quant(block, coeff, q);
+	lmi_jpeg_encode_coeffs(w, coeff, hdc, hac, pred);
+}
+
+static LMI_JPEG_UNUSED void lmi_jpeg_make_inv_qtable_f(float invq[64], const uint8_t q[64])
+{
+	for (int y = 0; y < 8; y++) {
+		for (int x = 0; x < 8; x++) {
+			int i = y * 8 + x;
+			invq[i] = 1.0f / (q[i] * 8.0f * lmi_jpeg_fdct_scale_f[y] * lmi_jpeg_fdct_scale_f[x]);
+		}
+	}
+}
+
+static void lmi_jpeg_fdct_quant_scaled_f(const float in[64], int out[64], const float invq[64])
+{
+	float tmp[64];
+	int i;
+	for (i = 0; i < 8; i++) {
+		const float *d = in + i * 8;
+		float *t = tmp + i * 8;
+		float tmp0 = d[0] + d[7], tmp7 = d[0] - d[7];
+		float tmp1 = d[1] + d[6], tmp6 = d[1] - d[6];
+		float tmp2 = d[2] + d[5], tmp5 = d[2] - d[5];
+		float tmp3 = d[3] + d[4], tmp4 = d[3] - d[4];
+		float tmp10 = tmp0 + tmp3, tmp13 = tmp0 - tmp3;
+		float tmp11 = tmp1 + tmp2, tmp12 = tmp1 - tmp2;
+		float z1;
+		t[0] = tmp10 + tmp11;
+		t[4] = tmp10 - tmp11;
+		z1 = (tmp12 + tmp13) * 0.7071067811865476f;
+		t[2] = tmp13 + z1;
+		t[6] = tmp13 - z1;
+		tmp10 = tmp4 + tmp5;
+		tmp11 = tmp5 + tmp6;
+		tmp12 = tmp6 + tmp7;
+		{
+			float z5 = (tmp10 - tmp12) * 0.3826834323650898f;
+			float z2 = 0.5411961001461970f * tmp10 + z5;
+			float z4 = 1.3065629648763766f * tmp12 + z5;
+			float z3 = tmp11 * 0.7071067811865476f;
+			float z11 = tmp7 + z3;
+			float z13 = tmp7 - z3;
+			t[5] = z13 + z2;
+			t[3] = z13 - z2;
+			t[1] = z11 + z4;
+			t[7] = z11 - z4;
+		}
+	}
+	for (i = 0; i < 8; i++) {
+		float d0 = tmp[i + 0] + tmp[i + 56], d7 = tmp[i + 0] - tmp[i + 56];
+		float d1 = tmp[i + 8] + tmp[i + 48], d6 = tmp[i + 8] - tmp[i + 48];
+		float d2 = tmp[i + 16] + tmp[i + 40], d5 = tmp[i + 16] - tmp[i + 40];
+		float d3 = tmp[i + 24] + tmp[i + 32], d4 = tmp[i + 24] - tmp[i + 32];
+		float tmp10 = d0 + d3, tmp13 = d0 - d3;
+		float tmp11 = d1 + d2, tmp12 = d1 - d2;
+		float col[8];
+		float z1;
+		col[0] = tmp10 + tmp11;
+		col[4] = tmp10 - tmp11;
+		z1 = (tmp12 + tmp13) * 0.7071067811865476f;
+		col[2] = tmp13 + z1;
+		col[6] = tmp13 - z1;
+		tmp10 = d4 + d5;
+		tmp11 = d5 + d6;
+		tmp12 = d6 + d7;
+		{
+			float z5 = (tmp10 - tmp12) * 0.3826834323650898f;
+			float z2 = 0.5411961001461970f * tmp10 + z5;
+			float z4 = 1.3065629648763766f * tmp12 + z5;
+			float z3 = tmp11 * 0.7071067811865476f;
+			float z11 = d7 + z3;
+			float z13 = d7 - z3;
+			col[5] = z13 + z2;
+			col[3] = z13 - z2;
+			col[1] = z11 + z4;
+			col[7] = z11 - z4;
+		}
+		for (int r = 0; r < 8; r++) {
+			int idx = r * 8 + i;
+			float scaled = col[r] * invq[idx];
+			out[idx] = (int)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
+		}
+	}
+}
+
+static LMI_JPEG_UNUSED void lmi_jpeg_encode_block_scaled_f(struct lmi_jpeg_writer *w, const float block[64],
+						   const float invq[64], const struct lmi_jpeg_huff *hdc,
+						   const struct lmi_jpeg_huff *hac, int *pred)
+{
+	int coeff[64];
+
+	lmi_jpeg_fdct_quant_scaled_f(block, coeff, invq);
+	lmi_jpeg_encode_coeffs(w, coeff, hdc, hac, pred);
 }
 
 static void lmi_jpeg_emit_dqt(struct lmi_jpeg_writer *w, const uint8_t qy[64], const uint8_t qc[64])
@@ -423,6 +560,11 @@ static void lmi_jpeg_emit_header(struct lmi_jpeg_writer *w, int width, int heigh
 	lmi_jpeg_emit_dht_one(w, 0x10, lmi_jpeg_bits_ac_luma, lmi_jpeg_vals_ac_luma);
 	lmi_jpeg_emit_dht_one(w, 0x01, lmi_jpeg_bits_dc_chroma, lmi_jpeg_vals_dc_chroma);
 	lmi_jpeg_emit_dht_one(w, 0x11, lmi_jpeg_bits_ac_chroma, lmi_jpeg_vals_ac_chroma);
+	if (lmi_jpeg_restart_interval) {
+		lmi_jpeg_marker(w, 0xdd); /* DRI */
+		lmi_jpeg_put_be16(w, 4);
+		lmi_jpeg_put_be16(w, lmi_jpeg_restart_interval);
+	}
 	lmi_jpeg_marker(w, 0xda); /* SOS */
 	lmi_jpeg_put_be16(w, 12);
 	lmi_jpeg_put_raw(w, 3);
@@ -503,7 +645,7 @@ static int lmi_jpeg_encode_rgb420(uint8_t *dst, size_t cap, const uint8_t *rgb,
 	return (int)w.pos;
 }
 
-static int lmi_jpeg_encode_rgb444(uint8_t *dst, size_t cap, const uint8_t *rgb,
+static LMI_JPEG_UNUSED int lmi_jpeg_encode_rgb444(uint8_t *dst, size_t cap, const uint8_t *rgb,
 				       int width, int height, int stride, int quality)
 {
 	struct lmi_jpeg_writer w;

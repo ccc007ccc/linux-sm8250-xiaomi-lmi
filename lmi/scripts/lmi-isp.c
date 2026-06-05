@@ -3,8 +3,8 @@
 // lmi-isp.c -- fast C software ISP + streamer for the lmi OV13B10 camera.
 //
 // Captures RAW10 (MIPI packed GRBG, V4L2 fourcc "pgAA") from a CAMSS RDI video
-// node whose media pipeline + sensor mode were already configured by
-// lmi-camera-web-preview.py, runs a real software ISP in C
+// node whose media pipeline + sensor mode were already configured by the
+// Rust lmi-camera runtime, runs a real software ISP in C
 //   10-bit unpack -> black-level -> gray-world AWB -> bilinear demosaic
 //   -> gamma tone curve (10-bit linear -> 8-bit display) -> scale -> YUYV/NV12/MJPEG
 // and writes processed frames to a v4l2loopback OUTPUT node (write()), a FIFO
@@ -29,6 +29,8 @@
 #include <math.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
@@ -58,6 +60,13 @@ static const char *g_fifo = "";		   /* FIFO for the UVC feeder, or "" */
 static const char *g_dump = "";		   /* processed frame dump for regression, or "" */
 static int g_dump_frames = 1;
 static int g_out_w = 1280, g_out_h = 720;
+enum source_aspect_policy {
+	SOURCE_ASPECT_STRETCH = 0,
+	SOURCE_ASPECT_PRESERVE,
+};
+static enum source_aspect_policy g_source_aspect = SOURCE_ASPECT_STRETCH;
+static int g_src_x, g_src_y, g_src_w, g_src_h;
+static int g_src_qx, g_src_qy, g_src_qw, g_src_qh;
 static int g_nv12 = 0;					 /* 0 = YUYV, 1 = NV12 */
 static int g_mjpeg = 0;
 static int g_mjpeg_quality = 60;
@@ -75,6 +84,9 @@ static int g_ae_clip_target;				/* optional percentile cap for bright highlights
 static int g_ae_clip_weight = 50;			/* percent penalty applied when highlights exceed cap */
 static int g_awb = 1;					  /* gray-world AWB */
 static int g_verbose = 0;
+static int g_motion_overlay = 0;		  /* moving test graphics for live UVC checks */
+static int g_motion_overlay_size = 96;
+static unsigned int g_motion_overlay_seq;
 
 /* ---- raw capture state ---- */
 static int g_rawfd = -1;
@@ -88,8 +100,11 @@ static int g_outfd = -1;				   /* loopback OR fifo OR dump fd */
 static int g_out_stride, g_out_size;
 static int g_pipe_cap = 1 << 20;
 static int g_mjpeg_pipe_short_log_sec;
+static int g_fifo_backpressure_log_sec;
+static unsigned int g_fifo_backpressure_drops;
 
 /* ---- ISP buffers ---- */
+static uint8_t *g_raw_copy;				  /* packed RAW10 work copy for early QBUF */
 static uint16_t *g_bayer;				  /* raw_w * raw_h, 10-bit values */
 static uint8_t *g_gamma_lut;			   /* 1024 -> 8-bit */
 static uint8_t *g_frame;				   /* output YUYV/NV12 or RGB before MJPEG */
@@ -140,6 +155,17 @@ enum mjpeg_scale_mode {
 static enum mjpeg_scale_mode g_mjpeg_scale_mode = MJPEG_SCALE_BAYER_AREA;
 static uint32_t *g_int_r, *g_int_gr, *g_int_gb, *g_int_b;
 static int g_int_qw, g_int_qh, g_int_stride;
+static int *g_center_qx, *g_center_qy;
+static int g_center_map_src_x, g_center_map_src_y, g_center_map_src_w, g_center_map_src_h;
+static int g_center_map_out_w, g_center_map_out_h, g_center_map_area_scale;
+static int *g_frac_qx0, *g_frac_qx1, *g_frac_fx;
+static int *g_frac_qy0, *g_frac_qy1, *g_frac_fy;
+static int g_frac_map_src_x, g_frac_map_src_y, g_frac_map_src_w, g_frac_map_src_h;
+static int g_frac_map_out_w, g_frac_map_out_h;
+static int g_mjpeg_fast_threads = 4;
+static int g_cpu_first = -1, g_cpu_last = -1;
+static double g_stage_jpeg_ms;
+static int g_stage_direct_mjpeg;
 
 /* ---- AE state ---- */
 static int g_exposure = -1, g_again = -1, g_dgain = -1;
@@ -170,6 +196,52 @@ static int xioctl(int fd, unsigned long req, void *arg)
 	int r;
 	do { r = ioctl(fd, req, arg); } while (r < 0 && errno == EINTR);
 	return r;
+}
+
+static double ts_ms(const struct timespec *a, const struct timespec *b)
+{
+	return (b->tv_sec - a->tv_sec) * 1e3 + (b->tv_nsec - a->tv_nsec) / 1e6;
+}
+
+static double ts_sec(const struct timespec *a, const struct timespec *b)
+{
+	return (b->tv_sec - a->tv_sec) + (b->tv_nsec - a->tv_nsec) / 1e9;
+}
+
+struct perf_stats {
+	unsigned int frames;
+	unsigned int poll_timeouts;
+	unsigned int dq_eagain;
+	unsigned int qbuf_errors;
+	unsigned int raw_seq_lost;
+	unsigned int fifo_drops;
+	unsigned int over_budget;
+	unsigned int direct_mjpeg;
+	double poll_sum, poll_max;
+	double dq_sum, dq_max;
+	double hold_sum, hold_max;
+	double copy_sum, copy_max;
+	double qbuf_sum, qbuf_max;
+	double unpack_sum, unpack_max;
+	double awb_sum, awb_max;
+	double pack_sum, pack_max;
+	double jpeg_sum, jpeg_max;
+	double out_sum, out_max;
+	double ae_sum, ae_max;
+	double sleep_sum, sleep_max;
+	double work_sum, work_max;
+};
+
+static void perf_add(double *sum, double *max, double value)
+{
+	*sum += value;
+	if (value > *max)
+		*max = value;
+}
+
+static double perf_avg(double sum, unsigned int frames)
+{
+	return frames ? sum / frames : 0.0;
 }
 
 /* ---------------- sensor controls / AE ---------------- */
@@ -476,8 +548,8 @@ static void compute_awb(double *rgain, double *bgain)
  * To avoid a full-res RGB buffer at large sensor modes, we demosaic on the fly.
  * For MJPEG downscale we build summed-area tables over Bayer quads, then average
  * each output pixel's source footprint in O(1) and apply the gamma LUT once.  This
- * keeps the 4160x2340 detail-first source mode practical while avoiding the old
- * single-site Bayer sample that made 1280x720 look much lower than true 720p. */
+ * keeps large source modes practical while avoiding the old single-site Bayer
+ * sample that made downscaled MJPEG look softer than the requested output size. */
 
 static inline void demosaic_linear_at(int bx, int by, double rgain, double bgain,
 					  int *R, int *Gout, int *Bout)
@@ -575,6 +647,85 @@ static inline void source_span_scaled(int out_i, int out_n, int src_n, int scale
 	}
 	/* Upscale or 1:1 fallback: sample nearest source coordinate. */
 	*first = *last = bclamp((int)(((long)(out_i * 2 + 1) * src_n) / (out_n * 2)), 0, src_n - 1);
+}
+
+static inline int source_coord_scaled(int out_i, int out_n, int src_n)
+{
+	return bclamp((int)(((long)(out_i * 2 + 1) * src_n) / (out_n * 2)), 0, src_n - 1);
+}
+
+static inline int source_view_coord_scaled(int out_i, int out_n, int src_n, int offset)
+{
+	return offset + source_coord_scaled(out_i, out_n, src_n);
+}
+
+static void source_view_compute(void)
+{
+	long raw_aspect, out_aspect;
+	int x = 0, y = 0, w = g_raw_w, h = g_raw_h;
+
+	if (w < 2 || h < 2) {
+		g_src_x = g_src_y = g_src_qx = g_src_qy = 0;
+		g_src_w = w;
+		g_src_h = h;
+		g_src_qw = w / 2;
+		g_src_qh = h / 2;
+		return;
+	}
+	w &= ~1;
+	h &= ~1;
+	if (g_source_aspect == SOURCE_ASPECT_PRESERVE && g_out_w > 0 && g_out_h > 0) {
+		raw_aspect = (long)w * g_out_h;
+		out_aspect = (long)g_out_w * h;
+		if (raw_aspect > out_aspect) {
+			int nw = (int)(((long)h * g_out_w) / g_out_h);
+			nw &= ~1;
+			if (nw >= 2 && nw < w) {
+				x = ((w - nw) / 2) & ~1;
+				w = nw;
+			}
+		} else if (raw_aspect < out_aspect) {
+			int nh = (int)(((long)w * g_out_h) / g_out_w);
+			nh &= ~1;
+			if (nh >= 2 && nh < h) {
+				y = ((h - nh) / 2) & ~1;
+				h = nh;
+			}
+		}
+	}
+	if (x + w > g_raw_w)
+		w = (g_raw_w - x) & ~1;
+	if (y + h > g_raw_h)
+		h = (g_raw_h - y) & ~1;
+	if (w < 2) {
+		x = 0;
+		w = g_raw_w & ~1;
+	}
+	if (h < 2) {
+		y = 0;
+		h = g_raw_h & ~1;
+	}
+	g_src_x = x;
+	g_src_y = y;
+	g_src_w = w;
+	g_src_h = h;
+	g_src_qx = g_src_x / 2;
+	g_src_qy = g_src_y / 2;
+	g_src_qw = g_src_w / 2;
+	g_src_qh = g_src_h / 2;
+}
+
+static inline void source_view_span_scaled(int out_i, int out_n, int src_n, int offset,
+						       int scale_percent, int *first, int *last)
+{
+	source_span_scaled(out_i, out_n, src_n, scale_percent, first, last);
+	*first += offset;
+	*last += offset;
+}
+
+static const char *source_aspect_name(void)
+{
+	return g_source_aspect == SOURCE_ASPECT_PRESERVE ? "preserve" : "stretch";
 }
 
 
@@ -723,8 +874,8 @@ static inline void bayer_area_rgb(int tx, int ty, int ow, int oh,
 	uint32_t rs, grs, gbs, bs;
 	int qn;
 
-	source_span_scaled(tx, ow, g_raw_w, g_mjpeg_area_scale, &sx0, &sx1);
-	source_span_scaled(ty, oh, g_raw_h, g_mjpeg_area_scale, &sy0, &sy1);
+	source_view_span_scaled(tx, ow, g_src_w, g_src_x, g_mjpeg_area_scale, &sx0, &sx1);
+	source_view_span_scaled(ty, oh, g_src_h, g_src_y, g_mjpeg_area_scale, &sy0, &sy1);
 
 	/* Work in complete 2x2 Bayer quads: Gr/R on the first row, B/Gb on the
 	 * second.  The summed-area table keeps high-source downscale sharp without a
@@ -789,8 +940,8 @@ static inline void bayer_center_rgb(int tx, int ty, int ow, int oh,
 	int sx0, sx1, sy0, sy1;
 	int qx, qy;
 
-	source_span_scaled(tx, ow, g_raw_w, g_mjpeg_area_scale, &sx0, &sx1);
-	source_span_scaled(ty, oh, g_raw_h, g_mjpeg_area_scale, &sy0, &sy1);
+	source_view_span_scaled(tx, ow, g_src_w, g_src_x, g_mjpeg_area_scale, &sx0, &sx1);
+	source_view_span_scaled(ty, oh, g_src_h, g_src_y, g_mjpeg_area_scale, &sy0, &sy1);
 	qx = ((sx0 + sx1) >> 1) / 2;
 	qy = ((sy0 + sy1) >> 1) / 2;
 	quad_sample(qx, qy, rgain, bgain, R, Gout, Bout);
@@ -799,13 +950,628 @@ static inline void bayer_center_rgb(int tx, int ty, int ow, int oh,
 	gamma_clamp_rgb(R, Gout, Bout);
 }
 
+static int ensure_center_maps(int ow, int oh)
+{
+	int i;
+
+	if (g_center_qx && g_center_qy &&
+		g_center_map_src_x == g_src_x && g_center_map_src_y == g_src_y &&
+		g_center_map_src_w == g_src_w && g_center_map_src_h == g_src_h &&
+		g_center_map_out_w == ow && g_center_map_out_h == oh &&
+		g_center_map_area_scale == g_mjpeg_area_scale)
+		return 0;
+
+	free(g_center_qx);
+	free(g_center_qy);
+	g_center_qx = malloc((size_t)ow * sizeof(*g_center_qx));
+	g_center_qy = malloc((size_t)oh * sizeof(*g_center_qy));
+	if (!g_center_qx || !g_center_qy)
+		return -1;
+
+	for (i = 0; i < ow; i++) {
+		int sx0, sx1, qx;
+		source_view_span_scaled(i, ow, g_src_w, g_src_x, g_mjpeg_area_scale, &sx0, &sx1);
+		qx = ((sx0 + sx1) >> 1) / 2;
+		g_center_qx[i] = bclamp(qx, 0, g_int_qw - 1);
+	}
+	for (i = 0; i < oh; i++) {
+		int sy0, sy1, qy;
+		source_view_span_scaled(i, oh, g_src_h, g_src_y, g_mjpeg_area_scale, &sy0, &sy1);
+		qy = ((sy0 + sy1) >> 1) / 2;
+		g_center_qy[i] = bclamp(qy, 0, g_int_qh - 1);
+	}
+	g_center_map_src_x = g_src_x;
+	g_center_map_src_y = g_src_y;
+	g_center_map_src_w = g_src_w;
+	g_center_map_src_h = g_src_h;
+	g_center_map_out_w = ow;
+	g_center_map_out_h = oh;
+	g_center_map_area_scale = g_mjpeg_area_scale;
+	return 0;
+}
+
+static int ensure_frac_maps(int ow, int oh)
+{
+	int i;
+
+	if (g_frac_qx0 && g_frac_qx1 && g_frac_fx &&
+		g_frac_qy0 && g_frac_qy1 && g_frac_fy &&
+		g_frac_map_src_x == g_src_x && g_frac_map_src_y == g_src_y &&
+		g_frac_map_src_w == g_src_w && g_frac_map_src_h == g_src_h &&
+		g_frac_map_out_w == ow && g_frac_map_out_h == oh)
+		return 0;
+
+	free(g_frac_qx0);
+	free(g_frac_qx1);
+	free(g_frac_fx);
+	free(g_frac_qy0);
+	free(g_frac_qy1);
+	free(g_frac_fy);
+	g_frac_qx0 = g_frac_qx1 = g_frac_fx = NULL;
+	g_frac_qy0 = g_frac_qy1 = g_frac_fy = NULL;
+
+	g_frac_qx0 = malloc((size_t)ow * sizeof(*g_frac_qx0));
+	g_frac_qx1 = malloc((size_t)ow * sizeof(*g_frac_qx1));
+	g_frac_fx = malloc((size_t)ow * sizeof(*g_frac_fx));
+	g_frac_qy0 = malloc((size_t)oh * sizeof(*g_frac_qy0));
+	g_frac_qy1 = malloc((size_t)oh * sizeof(*g_frac_qy1));
+	g_frac_fy = malloc((size_t)oh * sizeof(*g_frac_fy));
+	if (!g_frac_qx0 || !g_frac_qx1 || !g_frac_fx ||
+		!g_frac_qy0 || !g_frac_qy1 || !g_frac_fy)
+		return -1;
+
+	for (i = 0; i < ow; i++) {
+		long sx_fp = ((long)(i * 2 + 1) * g_src_qw * 128) / ow + (long)g_src_qx * 256;
+		int qx = (int)(sx_fp >> 8);
+		int fx = (int)(sx_fp & 255);
+		int qx1;
+
+		if (qx < g_src_qx) {
+			qx = g_src_qx;
+			fx = 0;
+		}
+		if (qx >= g_src_qx + g_src_qw) {
+			qx = g_src_qx + g_src_qw - 1;
+			fx = 0;
+		}
+		qx1 = qx + 1;
+		if (qx1 >= g_src_qx + g_src_qw)
+			qx1 = qx;
+		g_frac_qx0[i] = bclamp(qx, 0, g_int_qw - 1);
+		g_frac_qx1[i] = bclamp(qx1, 0, g_int_qw - 1);
+		g_frac_fx[i] = fx;
+	}
+	for (i = 0; i < oh; i++) {
+		long sy_fp = ((long)(i * 2 + 1) * g_src_qh * 128) / oh + (long)g_src_qy * 256;
+		int qy = (int)(sy_fp >> 8);
+		int fy = (int)(sy_fp & 255);
+		int qy1;
+
+		if (qy < g_src_qy) {
+			qy = g_src_qy;
+			fy = 0;
+		}
+		if (qy >= g_src_qy + g_src_qh) {
+			qy = g_src_qy + g_src_qh - 1;
+			fy = 0;
+		}
+		qy1 = qy + 1;
+		if (qy1 >= g_src_qy + g_src_qh)
+			qy1 = qy;
+		g_frac_qy0[i] = bclamp(qy, 0, g_int_qh - 1);
+		g_frac_qy1[i] = bclamp(qy1, 0, g_int_qh - 1);
+		g_frac_fy[i] = fy;
+	}
+	g_frac_map_src_x = g_src_x;
+	g_frac_map_src_y = g_src_y;
+	g_frac_map_src_w = g_src_w;
+	g_frac_map_src_h = g_src_h;
+	g_frac_map_out_w = ow;
+	g_frac_map_out_h = oh;
+	return 0;
+}
+
+static inline void quad_sample_linear_q(int qx, int qy, int rgain_q, int ggain_q,
+					int bgain_q, int *R, int *Gout, int *Bout)
+{
+	const uint16_t *p;
+	int gr, r, b, gb, g;
+
+	if (qx < 0 || qx >= g_int_qw || qy < 0 || qy >= g_int_qh) {
+		*R = *Gout = *Bout = 0;
+		return;
+	}
+	p = g_bayer + (size_t)(qy * 2) * g_raw_w + qx * 2;
+	gr = bclamp(p[0] - g_blacklevel, 0, 1023);
+	r = bclamp(p[1] - g_blacklevel, 0, 1023);
+	b = bclamp(p[g_raw_w] - g_blacklevel, 0, 1023);
+	gb = bclamp(p[g_raw_w + 1] - g_blacklevel, 0, 1023);
+	g = (gr + gb) >> 1;
+	*R = (r * rgain_q + 128) >> 8;
+	*Gout = (g * ggain_q + 128) >> 8;
+	*Bout = (b * bgain_q + 128) >> 8;
+}
+
+static inline void bayer_area_frac_ycbcr_fast(int x, int y, int rgain_q,
+					      int ggain_q, int bgain_q,
+					      int *Y, int *Cb, int *Cr)
+{
+	int qx0 = g_frac_qx0[x], qx1 = g_frac_qx1[x], fx = g_frac_fx[x];
+	int qy0 = g_frac_qy0[y], qy1 = g_frac_qy1[y], fy = g_frac_fy[y];
+	int r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
+	int w00, w10, w01, w11;
+	int r, g, b;
+
+	quad_sample_linear_q(qx0, qy0, rgain_q, ggain_q, bgain_q, &r00, &g00, &b00);
+	quad_sample_linear_q(qx1, qy0, rgain_q, ggain_q, bgain_q, &r10, &g10, &b10);
+	quad_sample_linear_q(qx0, qy1, rgain_q, ggain_q, bgain_q, &r01, &g01, &b01);
+	quad_sample_linear_q(qx1, qy1, rgain_q, ggain_q, bgain_q, &r11, &g11, &b11);
+	w00 = (256 - fx) * (256 - fy);
+	w10 = fx * (256 - fy);
+	w01 = (256 - fx) * fy;
+	w11 = fx * fy;
+	r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11 + 32768) >> 16;
+	g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11 + 32768) >> 16;
+	b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11 + 32768) >> 16;
+	r = tone_map8(r);
+	g = tone_map8(g);
+	b = tone_map8(b);
+	*Y = lmi_jpeg_clamp_u8((77 * r + 150 * g + 29 * b) >> 8);
+	*Cb = lmi_jpeg_clamp_u8(((-43 * r - 85 * g + 128 * b) >> 8) + 128);
+	*Cr = lmi_jpeg_clamp_u8(((128 * r - 107 * g - 21 * b) >> 8) + 128);
+}
+
+static uint8_t g_mjpeg_rlut[1024], g_mjpeg_glut[1024], g_mjpeg_blut[1024];
+
+static void make_mjpeg_gain_lut(uint8_t lut[1024], int gain_q)
+{
+	for (int i = 0; i < 1024; i++) {
+		int v = (i * gain_q + 128) >> 8;
+
+		if (v > 1023)
+			v = 1023;
+		lut[i] = (uint8_t)tone_map8(v);
+	}
+}
+
+static inline void bayer_center_ycbcr_fast(int qx, int qy, int rgain_q,
+                                  int ggain_q, int bgain_q,
+                                  int *Y, int *Cb, int *Cr)
+{
+	const uint16_t *p = g_bayer + (size_t)(qy * 2) * g_raw_w + qx * 2;
+	int gr = bclamp(p[0] - g_blacklevel, 0, 1023);
+	int r = bclamp(p[1] - g_blacklevel, 0, 1023);
+	int b = bclamp(p[g_raw_w] - g_blacklevel, 0, 1023);
+	int gb = bclamp(p[g_raw_w + 1] - g_blacklevel, 0, 1023);
+	int g = (gr + gb) >> 1;
+
+	(void)rgain_q;
+	(void)ggain_q;
+	(void)bgain_q;
+	r = g_mjpeg_rlut[r];
+	g = g_mjpeg_glut[g];
+	b = g_mjpeg_blut[b];
+	*Y = lmi_jpeg_clamp_u8((77 * r + 150 * g + 29 * b) >> 8);
+	*Cb = lmi_jpeg_clamp_u8(((-43 * r - 85 * g + 128 * b) >> 8) + 128);
+	*Cr = lmi_jpeg_clamp_u8(((128 * r - 107 * g - 21 * b) >> 8) + 128);
+}
+struct lmi_mjpeg_chunk {
+	uint8_t *buf;
+	size_t cap;
+	int size;
+	long lumasum;
+	int mcu_y0, mcu_y1;
+	int width, height, quality;
+	int scale_mode;
+	int rgain_q, ggain_q, bgain_q;
+};
+
+static int lmi_mjpeg_encode_bayer_center420(uint8_t *dst, size_t cap,
+						    int width, int height, int quality,
+						    double rgain, double bgain, long *mean_out);
+
+static int lmi_mjpeg_encode_bayer_center420_range(struct lmi_mjpeg_chunk *c)
+{
+	struct lmi_jpeg_writer w;
+	struct lmi_jpeg_huff hdc_y, hac_y, hdc_c, hac_c;
+	uint8_t qy[64], qc[64];
+	float invqy[64], invqc[64];
+	int pred_y = 0, pred_cb = 0, pred_cr = 0;
+	long lumasum = 0;
+	int my;
+
+	memset(&w, 0, sizeof(w));
+	w.buf = c->buf;
+	w.cap = c->cap;
+	lmi_jpeg_make_qtable(qy, lmi_jpeg_q_luma_base, c->quality);
+	lmi_jpeg_make_qtable(qc, lmi_jpeg_q_chroma_base, c->quality);
+	lmi_jpeg_make_inv_qtable_f(invqy, qy);
+	lmi_jpeg_make_inv_qtable_f(invqc, qc);
+	lmi_jpeg_build_huff(&hdc_y, lmi_jpeg_bits_dc_luma, lmi_jpeg_vals_dc_luma);
+	lmi_jpeg_build_huff(&hac_y, lmi_jpeg_bits_ac_luma, lmi_jpeg_vals_ac_luma);
+	lmi_jpeg_build_huff(&hdc_c, lmi_jpeg_bits_dc_chroma, lmi_jpeg_vals_dc_chroma);
+	lmi_jpeg_build_huff(&hac_c, lmi_jpeg_bits_ac_chroma, lmi_jpeg_vals_ac_chroma);
+
+	for (my = c->mcu_y0 * 16; my < c->mcu_y1 * 16; my += 16) {
+		for (int mx = 0; mx < c->width; mx += 16) {
+			float yblk[4][64];
+			float cbblk[64];
+			float crblk[64];
+			int sum_cb[64];
+			int sum_cr[64];
+
+			memset(sum_cb, 0, sizeof(sum_cb));
+			memset(sum_cr, 0, sizeof(sum_cr));
+			for (int yy = 0; yy < 16; yy++) {
+				int oy = my + yy;
+				int cy = yy >> 1;
+				int map_y = oy < c->height ? oy : c->height - 1;
+				for (int xx = 0; xx < 16; xx++) {
+					int ox = mx + xx;
+					int map_x = ox < c->width ? ox : c->width - 1;
+					int yv, cb, cr;
+					int bi = (yy >= 8 ? 2 : 0) + (xx >= 8 ? 1 : 0);
+					int ci = cy * 8 + (xx >> 1);
+
+					if (c->scale_mode == MJPEG_SCALE_BAYER_AREA_FRAC) {
+						bayer_area_frac_ycbcr_fast(map_x, map_y, c->rgain_q,
+									      c->ggain_q, c->bgain_q,
+									      &yv, &cb, &cr);
+					} else {
+						int qx = g_center_qx[map_x];
+						int qy0 = g_center_qy[map_y];
+						bayer_center_ycbcr_fast(qx, qy0, c->rgain_q,
+								       c->ggain_q, c->bgain_q,
+								       &yv, &cb, &cr);
+					}
+					yblk[bi][(yy & 7) * 8 + (xx & 7)] = (float)yv - 128.0f;
+					sum_cb[ci] += cb;
+					sum_cr[ci] += cr;
+					if (ox < c->width && oy < c->height)
+						lumasum += yv;
+				}
+			}
+			for (int i = 0; i < 64; i++) {
+				cbblk[i] = (float)((sum_cb[i] + 2) >> 2) - 128.0f;
+				crblk[i] = (float)((sum_cr[i] + 2) >> 2) - 128.0f;
+			}
+			lmi_jpeg_encode_block_scaled_f(&w, yblk[0], invqy, &hdc_y, &hac_y, &pred_y);
+			lmi_jpeg_encode_block_scaled_f(&w, yblk[1], invqy, &hdc_y, &hac_y, &pred_y);
+			lmi_jpeg_encode_block_scaled_f(&w, yblk[2], invqy, &hdc_y, &hac_y, &pred_y);
+			lmi_jpeg_encode_block_scaled_f(&w, yblk[3], invqy, &hdc_y, &hac_y, &pred_y);
+			lmi_jpeg_encode_block_scaled_f(&w, cbblk, invqc, &hdc_c, &hac_c, &pred_cb);
+			lmi_jpeg_encode_block_scaled_f(&w, crblk, invqc, &hdc_c, &hac_c, &pred_cr);
+			if (w.err)
+				return -1;
+		}
+	}
+	lmi_jpeg_flush_bits(&w);
+	if (w.err)
+		return -1;
+	c->size = (int)w.pos;
+	c->lumasum = lumasum;
+	return 0;
+}
+
+struct lmi_mjpeg_pool {
+	pthread_mutex_t lock;
+	pthread_cond_t start;
+	pthread_cond_t done_cv;
+	pthread_t tids[8];
+	struct lmi_mjpeg_chunk *chunks;
+	int nthreads;
+	int generation;
+	int done;
+	int stop;
+	int initialized;
+};
+
+static struct lmi_mjpeg_pool g_mjpeg_pool = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.start = PTHREAD_COND_INITIALIZER,
+	.done_cv = PTHREAD_COND_INITIALIZER,
+};
+static uint8_t *g_mjpeg_chunk_bufs[8];
+static size_t g_mjpeg_chunk_caps[8];
+
+static void *lmi_mjpeg_pool_worker(void *arg)
+{
+	int idx = (int)(intptr_t)arg;
+	int seen = 0;
+
+	pthread_mutex_lock(&g_mjpeg_pool.lock);
+	for (;;) {
+		struct lmi_mjpeg_chunk *c;
+
+		while (!g_mjpeg_pool.stop && g_mjpeg_pool.generation == seen)
+			pthread_cond_wait(&g_mjpeg_pool.start, &g_mjpeg_pool.lock);
+		if (g_mjpeg_pool.stop)
+			break;
+		seen = g_mjpeg_pool.generation;
+		c = &g_mjpeg_pool.chunks[idx];
+		pthread_mutex_unlock(&g_mjpeg_pool.lock);
+
+		if (lmi_mjpeg_encode_bayer_center420_range(c) < 0)
+			c->size = -1;
+
+		pthread_mutex_lock(&g_mjpeg_pool.lock);
+		g_mjpeg_pool.done++;
+		if (g_mjpeg_pool.done >= g_mjpeg_pool.nthreads)
+			pthread_cond_signal(&g_mjpeg_pool.done_cv);
+	}
+	pthread_mutex_unlock(&g_mjpeg_pool.lock);
+	return NULL;
+}
+
+static int lmi_mjpeg_pool_init(int nthreads)
+{
+	int created = 0;
+
+	pthread_mutex_lock(&g_mjpeg_pool.lock);
+	if (g_mjpeg_pool.initialized) {
+		int ok = g_mjpeg_pool.nthreads == nthreads;
+		pthread_mutex_unlock(&g_mjpeg_pool.lock);
+		return ok ? 0 : -1;
+	}
+	g_mjpeg_pool.nthreads = nthreads;
+	g_mjpeg_pool.stop = 0;
+	g_mjpeg_pool.generation = 0;
+	g_mjpeg_pool.done = 0;
+	while (created < nthreads) {
+		if (pthread_create(&g_mjpeg_pool.tids[created], NULL,
+				   lmi_mjpeg_pool_worker, (void *)(intptr_t)created) != 0) {
+			g_mjpeg_pool.stop = 1;
+			g_mjpeg_pool.nthreads = created;
+			pthread_cond_broadcast(&g_mjpeg_pool.start);
+			pthread_mutex_unlock(&g_mjpeg_pool.lock);
+			for (int i = 0; i < created; i++)
+				pthread_join(g_mjpeg_pool.tids[i], NULL);
+			pthread_mutex_lock(&g_mjpeg_pool.lock);
+			g_mjpeg_pool.stop = 0;
+			g_mjpeg_pool.nthreads = 0;
+			g_mjpeg_pool.initialized = 0;
+			pthread_mutex_unlock(&g_mjpeg_pool.lock);
+			return -1;
+		}
+		created++;
+	}
+	g_mjpeg_pool.initialized = 1;
+	pthread_mutex_unlock(&g_mjpeg_pool.lock);
+	return 0;
+}
+
+static int lmi_mjpeg_pool_run(int nthreads, struct lmi_mjpeg_chunk *chunks)
+{
+	if (lmi_mjpeg_pool_init(nthreads) < 0)
+		return -1;
+
+	pthread_mutex_lock(&g_mjpeg_pool.lock);
+	if (g_mjpeg_pool.nthreads != nthreads) {
+		pthread_mutex_unlock(&g_mjpeg_pool.lock);
+		return -1;
+	}
+	g_mjpeg_pool.chunks = chunks;
+	g_mjpeg_pool.done = 0;
+	g_mjpeg_pool.generation++;
+	pthread_cond_broadcast(&g_mjpeg_pool.start);
+	while (g_mjpeg_pool.done < nthreads)
+		pthread_cond_wait(&g_mjpeg_pool.done_cv, &g_mjpeg_pool.lock);
+	g_mjpeg_pool.chunks = NULL;
+	pthread_mutex_unlock(&g_mjpeg_pool.lock);
+	return 0;
+}
+
+static int lmi_mjpeg_encode_bayer_direct420_threaded(uint8_t *dst, size_t cap,
+							 int width, int height, int quality,
+							 double rgain, double bgain, long *mean_out,
+							 enum mjpeg_scale_mode scale_mode)
+{
+	struct lmi_jpeg_writer hdr;
+	struct lmi_mjpeg_chunk chunks[8];
+	uint8_t qy[64], qc[64];
+	int rgain_q, ggain_q, bgain_q;
+	int mcu_w, mcu_h, nthreads, rows_per_thread;
+	size_t pos;
+	long lumasum = 0;
+
+	if (!dst || width <= 0 || height <= 0)
+		return -1;
+	if (scale_mode == MJPEG_SCALE_BAYER_AREA_FRAC) {
+		if (ensure_frac_maps(width, height) < 0)
+			return -1;
+	} else if (scale_mode == MJPEG_SCALE_BAYER_CENTER) {
+		if (ensure_center_maps(width, height) < 0)
+			return -1;
+	} else {
+		return -1;
+	}
+	mcu_w = (width + 15) / 16;
+	mcu_h = (height + 15) / 16;
+	nthreads = g_mjpeg_fast_threads;
+	if (scale_mode == MJPEG_SCALE_BAYER_CENTER && (nthreads < 2 || mcu_h < 2))
+		return lmi_mjpeg_encode_bayer_center420(dst, cap, width, height, quality,
+							  rgain, bgain, mean_out);
+	if (nthreads < 1)
+		nthreads = 1;
+	if (nthreads > 8)
+		nthreads = 8;
+	if (nthreads > mcu_h)
+		nthreads = mcu_h;
+	memset(chunks, 0, sizeof(chunks));
+
+	rgain_q = (int)(rgain * g_soft_gain * 256.0 + 0.5);
+	ggain_q = (int)(g_soft_gain * 256.0 + 0.5);
+	bgain_q = (int)(bgain * g_soft_gain * 256.0 + 0.5);
+	if (rgain_q < 0) rgain_q = 0;
+	if (ggain_q < 0) ggain_q = 0;
+	if (bgain_q < 0) bgain_q = 0;
+	make_mjpeg_gain_lut(g_mjpeg_rlut, rgain_q);
+	make_mjpeg_gain_lut(g_mjpeg_glut, ggain_q);
+	make_mjpeg_gain_lut(g_mjpeg_blut, bgain_q);
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.buf = dst;
+	hdr.cap = cap;
+	lmi_jpeg_make_qtable(qy, lmi_jpeg_q_luma_base, quality);
+	lmi_jpeg_make_qtable(qc, lmi_jpeg_q_chroma_base, quality);
+	lmi_jpeg_restart_interval = mcu_w * ((mcu_h + nthreads - 1) / nthreads);
+	lmi_jpeg_emit_header(&hdr, width, height, 0x22, qy, qc);
+	lmi_jpeg_restart_interval = 0;
+	if (hdr.err)
+		return -1;
+	pos = hdr.pos;
+
+	rows_per_thread = (mcu_h + nthreads - 1) / nthreads;
+	for (int i = 0; i < nthreads; i++) {
+		int y0 = i * rows_per_thread;
+		int y1 = y0 + rows_per_thread;
+		if (y1 > mcu_h)
+			y1 = mcu_h;
+		memset(&chunks[i], 0, sizeof(chunks[i]));
+		chunks[i].cap = cap / nthreads + 65536;
+		if (g_mjpeg_chunk_caps[i] < chunks[i].cap) {
+			uint8_t *buf = realloc(g_mjpeg_chunk_bufs[i], chunks[i].cap);
+			if (!buf)
+				goto fail;
+			g_mjpeg_chunk_bufs[i] = buf;
+			g_mjpeg_chunk_caps[i] = chunks[i].cap;
+		}
+		chunks[i].buf = g_mjpeg_chunk_bufs[i];
+		chunks[i].mcu_y0 = y0;
+		chunks[i].mcu_y1 = y1;
+		chunks[i].width = width;
+		chunks[i].height = height;
+		chunks[i].quality = quality;
+		chunks[i].scale_mode = scale_mode;
+		chunks[i].rgain_q = rgain_q;
+		chunks[i].ggain_q = ggain_q;
+		chunks[i].bgain_q = bgain_q;
+	}
+	if (lmi_mjpeg_pool_run(nthreads, chunks) < 0)
+		goto fail;
+	for (int i = 0; i < nthreads; i++) {
+		if (chunks[i].size < 0 || pos + (size_t)chunks[i].size + 4 > cap)
+			goto fail;
+		memcpy(dst + pos, chunks[i].buf, (size_t)chunks[i].size);
+		pos += (size_t)chunks[i].size;
+		hdr.pos = pos;
+		lumasum += chunks[i].lumasum;
+		if (i + 1 < nthreads)
+			lmi_jpeg_marker(&hdr, (uint8_t)(0xd0 + (i & 7)));
+		pos = hdr.pos;
+	}
+	if (pos + 2 > cap)
+		goto fail;
+	dst[pos++] = 0xff;
+	dst[pos++] = 0xd9;
+	if (mean_out)
+		*mean_out = lumasum / ((long)width * height);
+	return (int)pos;
+
+fail:
+	return -1;
+}
+
+static int lmi_mjpeg_encode_bayer_center420(uint8_t *dst, size_t cap,
+						     int width, int height, int quality,
+						     double rgain, double bgain, long *mean_out)
+{
+	struct lmi_jpeg_writer w;
+	struct lmi_jpeg_huff hdc_y, hac_y, hdc_c, hac_c;
+	uint8_t qy[64], qc[64];
+	float invqy[64], invqc[64];
+	int pred_y = 0, pred_cb = 0, pred_cr = 0;
+	int rgain_q, ggain_q, bgain_q;
+	long lumasum = 0;
+	int mx, my;
+
+	if (!dst || width <= 0 || height <= 0 || ensure_center_maps(width, height) < 0)
+		return -1;
+	memset(&w, 0, sizeof(w));
+	w.buf = dst;
+	w.cap = cap;
+	lmi_jpeg_make_qtable(qy, lmi_jpeg_q_luma_base, quality);
+	lmi_jpeg_make_qtable(qc, lmi_jpeg_q_chroma_base, quality);
+	lmi_jpeg_make_inv_qtable_f(invqy, qy);
+	lmi_jpeg_make_inv_qtable_f(invqc, qc);
+	lmi_jpeg_build_huff(&hdc_y, lmi_jpeg_bits_dc_luma, lmi_jpeg_vals_dc_luma);
+	lmi_jpeg_build_huff(&hac_y, lmi_jpeg_bits_ac_luma, lmi_jpeg_vals_ac_luma);
+	lmi_jpeg_build_huff(&hdc_c, lmi_jpeg_bits_dc_chroma, lmi_jpeg_vals_dc_chroma);
+	lmi_jpeg_build_huff(&hac_c, lmi_jpeg_bits_ac_chroma, lmi_jpeg_vals_ac_chroma);
+
+	rgain_q = (int)(rgain * g_soft_gain * 256.0 + 0.5);
+	ggain_q = (int)(g_soft_gain * 256.0 + 0.5);
+	bgain_q = (int)(bgain * g_soft_gain * 256.0 + 0.5);
+	if (rgain_q < 0) rgain_q = 0;
+	if (ggain_q < 0) ggain_q = 0;
+	if (bgain_q < 0) bgain_q = 0;
+	make_mjpeg_gain_lut(g_mjpeg_rlut, rgain_q);
+	make_mjpeg_gain_lut(g_mjpeg_glut, ggain_q);
+	make_mjpeg_gain_lut(g_mjpeg_blut, bgain_q);
+
+	lmi_jpeg_emit_header(&w, width, height, 0x22, qy, qc);
+	for (my = 0; my < height; my += 16) {
+		for (mx = 0; mx < width; mx += 16) {
+			float yblk[4][64];
+			float cbblk[64];
+			float crblk[64];
+			int sum_cb[64];
+			int sum_cr[64];
+
+			memset(sum_cb, 0, sizeof(sum_cb));
+			memset(sum_cr, 0, sizeof(sum_cr));
+			for (int yy = 0; yy < 16; yy++) {
+				int oy = my + yy;
+				int cy = yy >> 1;
+				int map_y = oy < height ? oy : height - 1;
+				for (int xx = 0; xx < 16; xx++) {
+					int ox = mx + xx;
+					int map_x = ox < width ? ox : width - 1;
+					int qx = g_center_qx[map_x];
+					int qy0 = g_center_qy[map_y];
+					int yv, cb, cr;
+					int bi = (yy >= 8 ? 2 : 0) + (xx >= 8 ? 1 : 0);
+					int ci = cy * 8 + (xx >> 1);
+
+					bayer_center_ycbcr_fast(qx, qy0, rgain_q, ggain_q, bgain_q,
+								   &yv, &cb, &cr);
+					yblk[bi][(yy & 7) * 8 + (xx & 7)] = (float)yv - 128.0f;
+					sum_cb[ci] += cb;
+					sum_cr[ci] += cr;
+					if (ox < width && oy < height)
+						lumasum += yv;
+				}
+			}
+			for (int i = 0; i < 64; i++) {
+				cbblk[i] = (float)((sum_cb[i] + 2) >> 2) - 128.0f;
+				crblk[i] = (float)((sum_cr[i] + 2) >> 2) - 128.0f;
+			}
+			lmi_jpeg_encode_block_scaled_f(&w, yblk[0], invqy, &hdc_y, &hac_y, &pred_y);
+			lmi_jpeg_encode_block_scaled_f(&w, yblk[1], invqy, &hdc_y, &hac_y, &pred_y);
+			lmi_jpeg_encode_block_scaled_f(&w, yblk[2], invqy, &hdc_y, &hac_y, &pred_y);
+			lmi_jpeg_encode_block_scaled_f(&w, yblk[3], invqy, &hdc_y, &hac_y, &pred_y);
+			lmi_jpeg_encode_block_scaled_f(&w, cbblk, invqc, &hdc_c, &hac_c, &pred_cb);
+			lmi_jpeg_encode_block_scaled_f(&w, crblk, invqc, &hdc_c, &hac_c, &pred_cr);
+			if (w.err)
+				return -1;
+		}
+	}
+	lmi_jpeg_flush_bits(&w);
+	lmi_jpeg_marker(&w, 0xd9);
+	if (w.err)
+		return -1;
+	if (mean_out)
+		*mean_out = lumasum / ((long)width * height);
+	return (int)w.pos;
+}
+
 static inline void bayer_area_frac_linear_rgb(int tx, int ty, int ow, int oh,
 												int xoff, int yoff,
 												double rgain, double bgain,
 												int *R, int *Gout, int *Bout)
 {
-	long sx_fp = ((long)(tx * 2 + 1) * g_int_qw * 128) / ow + xoff;
-	long sy_fp = ((long)(ty * 2 + 1) * g_int_qh * 128) / oh + yoff;
+	long sx_fp = ((long)(tx * 2 + 1) * g_src_qw * 128) / ow + (long)g_src_qx * 256 + xoff;
+	long sy_fp = ((long)(ty * 2 + 1) * g_src_qh * 128) / oh + (long)g_src_qy * 256 + yoff;
 	int qx = (int)(sx_fp >> 8);
 	int qy = (int)(sy_fp >> 8);
 	int fx = (int)(sx_fp & 255);
@@ -814,28 +1580,32 @@ static inline void bayer_area_frac_linear_rgb(int tx, int ty, int ow, int oh,
 	int r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
 	int w00, w10, w01, w11;
 
-	if (qx < 0) {
-		qx = 0;
+	if (qx < g_src_qx) {
+		qx = g_src_qx;
 		fx = 0;
 	}
-	if (qy < 0) {
-		qy = 0;
+	if (qy < g_src_qy) {
+		qy = g_src_qy;
 		fy = 0;
 	}
-	if (qx >= g_int_qw) {
-		qx = g_int_qw - 1;
+	if (qx >= g_src_qx + g_src_qw) {
+		qx = g_src_qx + g_src_qw - 1;
 		fx = 0;
 	}
-	if (qy >= g_int_qh) {
-		qy = g_int_qh - 1;
+	if (qy >= g_src_qy + g_src_qh) {
+		qy = g_src_qy + g_src_qh - 1;
 		fy = 0;
 	}
+	qx = bclamp(qx, 0, g_int_qw - 1);
+	qy = bclamp(qy, 0, g_int_qh - 1);
 	qx1 = qx + 1;
 	qy1 = qy + 1;
-	if (qx1 >= g_int_qw)
+	if (qx1 >= g_src_qx + g_src_qw)
 		qx1 = qx;
-	if (qy1 >= g_int_qh)
+	if (qy1 >= g_src_qy + g_src_qh)
 		qy1 = qy;
+	qx1 = bclamp(qx1, 0, g_int_qw - 1);
+	qy1 = bclamp(qy1, 0, g_int_qh - 1);
 	quad_sample(qx, qy, rgain, bgain, &r00, &g00, &b00);
 	quad_sample(qx1, qy, rgain, bgain, &r10, &g10, &b10);
 	quad_sample(qx, qy1, rgain, bgain, &r01, &g01, &b01);
@@ -874,8 +1644,8 @@ static inline void bayer_area_frac_4tap_rgb(int tx, int ty, int ow, int oh,
 	int r, g, b;
 	int rsum = 0, gsum = 0, bsum = 0;
 
-	xoff = (int)(((long)g_int_qw * 64 + ow / 2) / ow);
-	yoff = (int)(((long)g_int_qh * 64 + oh / 2) / oh);
+	xoff = (int)(((long)g_src_qw * 64 + ow / 2) / ow);
+	yoff = (int)(((long)g_src_qh * 64 + oh / 2) / oh);
 	if (xoff < 16)
 		xoff = 16;
 	if (yoff < 16)
@@ -924,8 +1694,8 @@ static inline void bayer_area_box_scaled_rgb(int tx, int ty, int ow, int oh,
 	int qxc, qyc, radius;
 	uint32_t rs, grs, gbs, bs;
 	int qn;
-	long src_qw = ((long)g_int_qw + ow - 1) / ow;
-	long src_qh = ((long)g_int_qh + oh - 1) / oh;
+	long src_qw = ((long)g_src_qw + ow - 1) / ow;
+	long src_qh = ((long)g_src_qh + oh - 1) / oh;
 
 	if (src_qw < 1)
 		src_qw = 1;
@@ -940,24 +1710,30 @@ static inline void bayer_area_box_scaled_rgb(int tx, int ty, int ow, int oh,
 		radius = 1;
 	if (radius > 8)
 		radius = 8;
-	qxc = (int)(((long)(tx * 2 + 1) * g_int_qw) / (ow * 2L));
-	qyc = (int)(((long)(ty * 2 + 1) * g_int_qh) / (oh * 2L));
-	if (qxc < 0)
-		qxc = 0;
-	if (qyc < 0)
-		qyc = 0;
-	if (qxc >= g_int_qw)
-		qxc = g_int_qw - 1;
-	if (qyc >= g_int_qh)
-		qyc = g_int_qh - 1;
+	qxc = g_src_qx + (int)(((long)(tx * 2 + 1) * g_src_qw) / (ow * 2L));
+	qyc = g_src_qy + (int)(((long)(ty * 2 + 1) * g_src_qh) / (oh * 2L));
+	if (qxc < g_src_qx)
+		qxc = g_src_qx;
+	if (qyc < g_src_qy)
+		qyc = g_src_qy;
+	if (qxc >= g_src_qx + g_src_qw)
+		qxc = g_src_qx + g_src_qw - 1;
+	if (qyc >= g_src_qy + g_src_qh)
+		qyc = g_src_qy + g_src_qh - 1;
+	qxc = bclamp(qxc, 0, g_int_qw - 1);
+	qyc = bclamp(qyc, 0, g_int_qh - 1);
 	qx0 = qxc - radius;
 	qx1 = qxc + radius + 1;
 	qy0 = qyc - radius;
 	qy1 = qyc + radius + 1;
-	rs = int_sum_bounded(g_int_r, qx0, qy0, qx1, qy1);
-	grs = int_sum_bounded(g_int_gr, qx0, qy0, qx1, qy1);
-	gbs = int_sum_bounded(g_int_gb, qx0, qy0, qx1, qy1);
-	bs = int_sum_bounded(g_int_b, qx0, qy0, qx1, qy1);
+	if (qx0 < g_src_qx)
+		qx0 = g_src_qx;
+	if (qy0 < g_src_qy)
+		qy0 = g_src_qy;
+	if (qx1 > g_src_qx + g_src_qw)
+		qx1 = g_src_qx + g_src_qw;
+	if (qy1 > g_src_qy + g_src_qh)
+		qy1 = g_src_qy + g_src_qh;
 	if (qx0 < 0)
 		qx0 = 0;
 	if (qy0 < 0)
@@ -966,6 +1742,10 @@ static inline void bayer_area_box_scaled_rgb(int tx, int ty, int ow, int oh,
 		qx1 = g_int_qw;
 	if (qy1 > g_int_qh)
 		qy1 = g_int_qh;
+	rs = int_sum_bounded(g_int_r, qx0, qy0, qx1, qy1);
+	grs = int_sum_bounded(g_int_gr, qx0, qy0, qx1, qy1);
+	gbs = int_sum_bounded(g_int_gb, qx0, qy0, qx1, qy1);
+	bs = int_sum_bounded(g_int_b, qx0, qy0, qx1, qy1);
 	qn = (qx1 - qx0) * (qy1 - qy0);
 	if (qn < 1)
 		qn = 1;
@@ -992,22 +1772,28 @@ static inline void bayer_quad_box_rgb(int tx, int ty, int ow, int oh,
 	int qx0, qx1, qy0, qy1;
 	uint32_t rs, gs, bs;
 	int qn;
-	(void)ow;
-	(void)oh;
 
 	/* Keep the downscale footprint phase-locked to integer Bayer quads.  The
 	 * fractional quad sampler is sharp, but clipped lights can expose the sampling
 	 * lattice as a square halo.  This mode averages only complete GR/BG quads that
 	 * map to the output pixel, so every output sample has equal red/green/blue
 	 * support before gamma/JPEG. */
-	qx0 = (int)(((long)tx * g_int_qw) / g_out_w);
-	qx1 = (int)(((long)(tx + 1) * g_int_qw + g_out_w - 1) / g_out_w);
-	qy0 = (int)(((long)ty * g_int_qh) / g_out_h);
-	qy1 = (int)(((long)(ty + 1) * g_int_qh + g_out_h - 1) / g_out_h);
+	qx0 = g_src_qx + (int)(((long)tx * g_src_qw) / ow);
+	qx1 = g_src_qx + (int)(((long)(tx + 1) * g_src_qw + ow - 1) / ow);
+	qy0 = g_src_qy + (int)(((long)ty * g_src_qh) / oh);
+	qy1 = g_src_qy + (int)(((long)(ty + 1) * g_src_qh + oh - 1) / oh);
 	if (qx1 <= qx0)
 		qx1 = qx0 + 1;
 	if (qy1 <= qy0)
 		qy1 = qy0 + 1;
+	if (qx0 < g_src_qx)
+		qx0 = g_src_qx;
+	if (qy0 < g_src_qy)
+		qy0 = g_src_qy;
+	if (qx1 > g_src_qx + g_src_qw)
+		qx1 = g_src_qx + g_src_qw;
+	if (qy1 > g_src_qy + g_src_qh)
+		qy1 = g_src_qy + g_src_qh;
 	if (qx0 < 0)
 		qx0 = 0;
 	if (qy0 < 0)
@@ -1036,19 +1822,19 @@ static inline void bayer_quad4_rgb(int tx, int ty, int ow, int oh,
 {
 	int qx, qy;
 	int r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
-	(void)ow;
-	(void)oh;
 
-	qx = (int)(((long)(tx * 2 + 1) * g_int_qw) / (g_out_w * 2L));
-	qy = (int)(((long)(ty * 2 + 1) * g_int_qh) / (g_out_h * 2L));
-	if (qx < 0)
-		qx = 0;
-	if (qy < 0)
-		qy = 0;
-	if (qx >= g_int_qw)
-		qx = g_int_qw - 1;
-	if (qy >= g_int_qh)
-		qy = g_int_qh - 1;
+	qx = g_src_qx + (int)(((long)(tx * 2 + 1) * g_src_qw) / (ow * 2L));
+	qy = g_src_qy + (int)(((long)(ty * 2 + 1) * g_src_qh) / (oh * 2L));
+	if (qx < g_src_qx)
+		qx = g_src_qx;
+	if (qy < g_src_qy)
+		qy = g_src_qy;
+	if (qx >= g_src_qx + g_src_qw)
+		qx = g_src_qx + g_src_qw - 1;
+	if (qy >= g_src_qy + g_src_qh)
+		qy = g_src_qy + g_src_qh - 1;
+	qx = bclamp(qx, 0, g_int_qw - 1);
+	qy = bclamp(qy, 0, g_int_qh - 1);
 	quad_sample(qx, qy, rgain, bgain, &r00, &g00, &b00);
 	quad_sample(qx + 1, qy, rgain, bgain, &r10, &g10, &b10);
 	quad_sample(qx, qy + 1, rgain, bgain, &r01, &g01, &b01);
@@ -1069,8 +1855,8 @@ static inline void demosaic_scaled_rgb(int tx, int ty, int ow, int oh,
 	int sx, sy, dx, dy, taps = 0;
 	int64_t rs = 0, gs = 0, bs = 0;
 
-	source_span_scaled(tx, ow, g_raw_w, g_mjpeg_area_scale, &sx0, &sx1);
-	source_span_scaled(ty, oh, g_raw_h, g_mjpeg_area_scale, &sy0, &sy1);
+	source_view_span_scaled(tx, ow, g_src_w, g_src_x, g_mjpeg_area_scale, &sx0, &sx1);
+	source_view_span_scaled(ty, oh, g_src_h, g_src_y, g_mjpeg_area_scale, &sy0, &sy1);
 	sx = (sx0 + sx1) >> 1;
 	sy = (sy0 + sy1) >> 1;
 
@@ -1551,6 +2337,53 @@ static void sharpen_rgb(uint8_t *dst, const uint8_t *src, int w, int h, int stri
 	}
 }
 
+static void draw_motion_overlay_nv12(void)
+{
+	uint8_t *yp = g_frame;
+	uint8_t *uvp = g_frame + (size_t)g_out_stride * g_out_h;
+	int box = g_motion_overlay_size;
+	int span_x, span_y, x0, y0, x1, y1;
+	int x, y;
+	uint8_t yval = (g_motion_overlay_seq & 1) ? 235 : 32;
+
+	if (!g_motion_overlay || !g_nv12 || g_mjpeg || g_out_w < 16 || g_out_h < 16)
+		return;
+	if (box < 16)
+		box = 16;
+	if (box > g_out_w / 3)
+		box = g_out_w / 3;
+	if (box > g_out_h / 3)
+		box = g_out_h / 3;
+	if (box < 16)
+		box = 16;
+	box &= ~1;
+	span_x = g_out_w - box - 2;
+	span_y = g_out_h - box - 2;
+	if (span_x < 2 || span_y < 2)
+		return;
+	x0 = 2 + (int)((g_motion_overlay_seq * 23U) % (unsigned int)span_x);
+	y0 = 2 + (int)((g_motion_overlay_seq * 11U) % (unsigned int)span_y);
+	x0 &= ~1;
+	y0 &= ~1;
+	x1 = x0 + box;
+	y1 = y0 + box;
+	for (y = y0; y < y1; y++) {
+		uint8_t *row = yp + (size_t)y * g_out_stride;
+		for (x = x0; x < x1; x++) {
+			int border = y - y0 < 6 || y1 - y <= 6 || x - x0 < 6 || x1 - x <= 6;
+			row[x] = border ? 255 : yval;
+		}
+	}
+	for (y = y0 >> 1; y < y1 >> 1; y++) {
+		uint8_t *row = uvp + (size_t)y * g_out_stride;
+		for (x = x0; x < x1; x += 2) {
+			row[x] = (g_motion_overlay_seq & 1) ? 32 : 220;
+			row[x + 1] = (g_motion_overlay_seq & 1) ? 220 : 32;
+		}
+	}
+	g_motion_overlay_seq++;
+}
+
 static long pack_output(double rgain, double bgain)
 {
 	int ow = g_out_w, oh = g_out_h;
@@ -1561,6 +2394,37 @@ static long pack_output(double rgain, double bgain)
 	if (g_mjpeg) {
 		const uint8_t *jpeg_src = g_frame;
 		(void)aw;
+		g_stage_jpeg_ms = 0.0;
+		g_stage_direct_mjpeg = 0;
+		if ((g_mjpeg_scale_mode == MJPEG_SCALE_BAYER_CENTER ||
+			 g_mjpeg_scale_mode == MJPEG_SCALE_BAYER_AREA_FRAC) &&
+			g_mjpeg_subsampling == 420 && g_mjpeg_smooth == 0 &&
+			g_mjpeg_highlight_smooth == 0 && g_mjpeg_desaturate_highlights == 0 &&
+			g_mjpeg_antibloom == 0 && g_mjpeg_edge_despeckle == 0 &&
+			g_sharpen == 0 && g_mjpeg_blend_frac == 0 &&
+			g_mjpeg_highlight_area == 0 && g_mjpeg_highlight_box == 0 &&
+			g_mjpeg_bayer_despeckle == 0) {
+			struct timespec ja, jb;
+			long mean = 0;
+			clock_gettime(CLOCK_MONOTONIC, &ja);
+			g_jpeg_size = lmi_mjpeg_encode_bayer_direct420_threaded(g_jpeg,
+					(size_t)g_max_frame_bytes, ow, oh, g_mjpeg_quality,
+					rgain, bgain, &mean, g_mjpeg_scale_mode);
+			clock_gettime(CLOCK_MONOTONIC, &jb);
+			g_stage_jpeg_ms = (jb.tv_sec - ja.tv_sec) * 1e3 +
+				(jb.tv_nsec - ja.tv_nsec) / 1e6;
+			g_stage_direct_mjpeg = 1;
+			if (g_jpeg_size < 0) {
+				struct timespec ts;
+				clock_gettime(CLOCK_MONOTONIC, &ts);
+				if ((int)ts.tv_sec != g_jpeg_drop_log_sec) {
+					g_jpeg_drop_log_sec = (int)ts.tv_sec;
+					ilog("MJPEG encode exceeded max-frame-bytes=%d; dropping", g_max_frame_bytes);
+				}
+				g_jpeg_size = 0;
+			}
+			return mean;
+		}
 		if (g_mjpeg_scale_mode == MJPEG_SCALE_BAYER_AREA ||
 			g_mjpeg_scale_mode == MJPEG_SCALE_BAYER_AREA_BOX ||
 			g_mjpeg_scale_mode == MJPEG_SCALE_BAYER_QUAD_BOX ||
@@ -1688,12 +2552,19 @@ static long pack_output(double rgain, double bgain)
 			sharpen_rgb(g_sharp, jpeg_src, ow, oh, g_out_stride, g_sharpen);
 			jpeg_src = g_sharp;
 		}
-		if (g_mjpeg_subsampling == 444)
-			g_jpeg_size = lmi_jpeg_encode_rgb444(g_jpeg, (size_t)g_max_frame_bytes,
-								   jpeg_src, ow, oh, g_out_stride, g_mjpeg_quality);
-		else
-			g_jpeg_size = lmi_jpeg_encode_rgb420(g_jpeg, (size_t)g_max_frame_bytes,
-								   jpeg_src, ow, oh, g_out_stride, g_mjpeg_quality);
+		{
+			struct timespec ja, jb;
+			clock_gettime(CLOCK_MONOTONIC, &ja);
+			if (g_mjpeg_subsampling == 444)
+				g_jpeg_size = lmi_jpeg_encode_rgb444(g_jpeg, (size_t)g_max_frame_bytes,
+									   jpeg_src, ow, oh, g_out_stride, g_mjpeg_quality);
+			else
+				g_jpeg_size = lmi_jpeg_encode_rgb420(g_jpeg, (size_t)g_max_frame_bytes,
+									   jpeg_src, ow, oh, g_out_stride, g_mjpeg_quality);
+			clock_gettime(CLOCK_MONOTONIC, &jb);
+			g_stage_jpeg_ms = (jb.tv_sec - ja.tv_sec) * 1e3 +
+				(jb.tv_nsec - ja.tv_nsec) / 1e6;
+		}
 		if (g_jpeg_size < 0) {
 			struct timespec ts;
 			clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1709,11 +2580,11 @@ static long pack_output(double rgain, double bgain)
 		uint8_t *yp = g_frame;
 		uint8_t *uvp = g_frame + (size_t)g_out_stride * oh;
 		for (ty = 0; ty < oh; ty++) {
-			int sy = (int)((long)ty * g_raw_h / oh);
+			int sy = source_view_coord_scaled(ty, oh, g_src_h, g_src_y);
 			uint8_t *yrow = yp + (size_t)ty * g_out_stride;
 			uint8_t *uvrow = uvp + (size_t)(ty >> 1) * g_out_stride;
 			for (tx = 0; tx < ow; tx++) {
-				int sx = (int)((long)tx * g_raw_w / ow);
+				int sx = source_view_coord_scaled(tx, ow, g_src_w, g_src_x);
 				int R, Gg, Bb;
 				demosaic_at(sx, sy, rgain, bgain, &R, &Gg, &Bb);
 				int Y = (77 * R + 150 * Gg + 29 * Bb) >> 8;
@@ -1727,16 +2598,17 @@ static long pack_output(double rgain, double bgain)
 				}
 			}
 		}
+		draw_motion_overlay_nv12();
 		return lumasum / ((long)ow * oh);
 	}
 	/* YUYV */
 	(void)aw;
 	for (ty = 0; ty < oh; ty++) {
-		int sy = (int)((long)ty * g_raw_h / oh);
+		int sy = source_view_coord_scaled(ty, oh, g_src_h, g_src_y);
 		uint8_t *row = g_frame + (size_t)ty * g_out_stride;
 		for (tx = 0; tx < ow; tx += 2) {
-			int sx0 = (int)((long)tx * g_raw_w / ow);
-			int sx1 = (int)((long)(tx + 1) * g_raw_w / ow);
+			int sx0 = source_view_coord_scaled(tx, ow, g_src_w, g_src_x);
+			int sx1 = source_view_coord_scaled(tx + 1, ow, g_src_w, g_src_x);
 			int R0, Gg0, Bb0, R1, Gg1, Bb1;
 			demosaic_at(sx0, sy, rgain, bgain, &R0, &Gg0, &Bb0);
 			demosaic_at(sx1, sy, rgain, bgain, &R1, &Gg1, &Bb1);
@@ -1920,22 +2792,21 @@ static int out_open(void)
 	} else if (g_fifo[0]) {
 		int cap;
 		int pipe_target = g_mjpeg ?
-			(g_max_frame_bytes + (int)sizeof(struct lmi_uvc_record_header)) * 2 :
+			(g_max_frame_bytes + (int)sizeof(struct lmi_uvc_record_header)) * 3 :
 			g_out_size * 2;
-		g_outfd = open(g_fifo, O_WRONLY | (g_mjpeg ? 0 : O_NONBLOCK));
+		g_outfd = open(g_fifo, O_WRONLY | (g_mjpeg ? 0 : 0));
 		if (g_outfd < 0) { ilog("open fifo %s: %s", g_fifo, strerror(errno)); return -1; }
 		cap = fcntl(g_outfd, F_SETPIPE_SZ, pipe_target);
 		if (cap < 0)
 			cap = fcntl(g_outfd, F_GETPIPE_SZ);
 		if (cap <= 0) {
-			ilog("fifo pipe is smaller than one frame and cannot be resized");
+			ilog("fifo pipe capacity cannot be detected");
 			return -1;
 		}
 		g_pipe_cap = cap;
-		if (!g_mjpeg && g_pipe_cap < g_out_size) {
-			ilog("fifo pipe capacity %d is smaller than frame size %d", g_pipe_cap, g_out_size);
-			return -1;
-		}
+		if (!g_mjpeg && g_pipe_cap < g_out_size)
+			ilog("fifo pipe capacity %d is smaller than raw frame size %d; using blocking full-frame writes",
+				 g_pipe_cap, g_out_size);
 		if (g_mjpeg && g_pipe_cap < (int)sizeof(struct lmi_uvc_record_header) + 4096) {
 			ilog("fifo pipe capacity %d is too small for MJPEG records", g_pipe_cap);
 			return -1;
@@ -1972,17 +2843,21 @@ static void out_write(void)
 		return;
 	if (g_mjpeg && g_jpeg_size <= 0)
 		return;
-	if (g_fifo[0]) {
+	if (g_fifo[0] && g_mjpeg) {
 		int inpipe = 0;
-		size_t need = payload_size + (g_mjpeg ? sizeof(struct lmi_uvc_record_header) : 0);
+		size_t need = payload_size + sizeof(struct lmi_uvc_record_header);
 		ioctl(g_outfd, FIONREAD, &inpipe);
 		if (g_pipe_cap - inpipe < (int)need) {
-			if (g_mjpeg && (int)need > g_pipe_cap) {
-				struct timespec ts;
-				clock_gettime(CLOCK_MONOTONIC, &ts);
-				if ((int)ts.tv_sec != g_mjpeg_pipe_short_log_sec) {
+			struct timespec ts;
+			g_fifo_backpressure_drops++;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			if ((int)ts.tv_sec != g_fifo_backpressure_log_sec) {
+				g_fifo_backpressure_log_sec = (int)ts.tv_sec;
+				if ((int)need > g_pipe_cap) {
 					g_mjpeg_pipe_short_log_sec = (int)ts.tv_sec;
-					ilog("MJPEG record %zu bytes exceeds fifo pipe capacity %d; dropping", need, g_pipe_cap);
+					ilog("MJPEG record %zu bytes exceeds fifo pipe capacity %d; drops=%u", need, g_pipe_cap, g_fifo_backpressure_drops);
+				} else {
+					ilog("FIFO backpressure drop: need=%zu inpipe=%d cap=%d drops=%u", need, inpipe, g_pipe_cap, g_fifo_backpressure_drops);
 				}
 			}
 			return; /* drop if feeder behind */
@@ -2021,10 +2896,55 @@ static volatile int g_run = 1;
 #include <signal.h>
 static void on_sig(int s) { (void)s; g_run = 0; }
 
+static int parse_cpu_range(const char *arg, int *first, int *last)
+{
+	char *end;
+	long a, b;
+
+	errno = 0;
+	a = strtol(arg, &end, 10);
+	if (errno || end == arg || a < 0)
+		return -1;
+	if (*end == '\0')
+		b = a;
+	else if (*end == '-') {
+		const char *p = end + 1;
+		errno = 0;
+		b = strtol(p, &end, 10);
+		if (errno || end == p || *end != '\0' || b < a)
+			return -1;
+	} else {
+		return -1;
+	}
+	if (a >= CPU_SETSIZE || b >= CPU_SETSIZE)
+		return -1;
+	*first = (int)a;
+	*last = (int)b;
+	return 0;
+}
+
+static void pin_cpu_range(void)
+{
+	cpu_set_t set;
+
+	if (g_cpu_first < 0)
+		return;
+	CPU_ZERO(&set);
+	for (int cpu = g_cpu_first; cpu <= g_cpu_last; cpu++)
+		CPU_SET(cpu, &set);
+	if (sched_setaffinity(0, sizeof(set), &set) < 0)
+		ilog("cpu affinity %d-%d failed: %s", g_cpu_first, g_cpu_last, strerror(errno));
+	else if (g_verbose || g_mjpeg)
+		ilog("cpu affinity: %d-%d", g_cpu_first, g_cpu_last);
+}
+
 int main(int argc, char **argv)
 {
 	int i, frames = 0, total_frames = 0, ae_div = 0;
 	struct timespec t0, tr;
+	struct perf_stats ps;
+	uint32_t last_raw_seq = 0;
+	int have_raw_seq = 0;
 	double rgain = 1.0, bgain = 1.0;
 
 	for (i = 1; i < argc; i++) {
@@ -2053,6 +2973,13 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--mjpeg-highlight-radius") && i + 1 < argc) g_mjpeg_highlight_radius = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mjpeg-area-scale") && i + 1 < argc) g_mjpeg_area_scale = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mjpeg-subsampling") && i + 1 < argc) g_mjpeg_subsampling = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--mjpeg-fast-threads") && i + 1 < argc) g_mjpeg_fast_threads = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--cpu-affinity") && i + 1 < argc) {
+			if (parse_cpu_range(argv[++i], &g_cpu_first, &g_cpu_last) < 0) {
+				fprintf(stderr, "invalid --cpu-affinity, expected N or N-M\n");
+				return 2;
+			}
+		}
 		else if (!strcmp(argv[i], "--mjpeg-bayer-despeckle") && i + 1 < argc) g_mjpeg_bayer_despeckle = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mjpeg-blend-frac") && i + 1 < argc) g_mjpeg_blend_frac = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mjpeg-blend-threshold") && i + 1 < argc) g_mjpeg_blend_threshold = atoi(argv[++i]);
@@ -2088,6 +3015,14 @@ int main(int argc, char **argv)
 			else { fprintf(stderr, "unknown --mjpeg-scale-mode: %s\n", m); return 2; }
 		}
 		else if (!strcmp(argv[i], "--max-frame-bytes") && i + 1 < argc) g_max_frame_bytes = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--source-aspect") && i + 1 < argc) {
+			const char *m = argv[++i];
+			if (!strcmp(m, "stretch"))
+				g_source_aspect = SOURCE_ASPECT_STRETCH;
+			else if (!strcmp(m, "preserve"))
+				g_source_aspect = SOURCE_ASPECT_PRESERVE;
+			else { fprintf(stderr, "unknown --source-aspect: %s\n", m); return 2; }
+		}
 		else if (!strcmp(argv[i], "--gamma") && i + 1 < argc) g_gamma = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--tone-highlight-knee") && i + 1 < argc) g_tone_highlight_knee = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--tone-highlight-max") && i + 1 < argc) g_tone_highlight_max = atoi(argv[++i]);
@@ -2101,6 +3036,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--no-auto-tone")) g_auto_tone = 0;
 		else if (!strcmp(argv[i], "--max-digital-gain") && i + 1 < argc) g_dgain_limit = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--max-soft-gain") && i + 1 < argc) g_max_soft_gain = atof(argv[++i]);
+		else if (!strcmp(argv[i], "--motion-overlay")) g_motion_overlay = 1;
+		else if (!strcmp(argv[i], "--motion-overlay-size") && i + 1 < argc) g_motion_overlay_size = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-v")) g_verbose = 1;
 		else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
 	}
@@ -2108,6 +3045,12 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_sig);
 	signal(SIGTERM, on_sig);
 	signal(SIGPIPE, SIG_IGN);
+	pin_cpu_range();
+	if (g_motion_overlay_size < 16)
+		g_motion_overlay_size = 16;
+	if (g_motion_overlay_size > 512)
+		g_motion_overlay_size = 512;
+	g_motion_overlay_size &= ~1;
 
 	/* gamma LUT: 10-bit (post black-level range) -> 8-bit display */
 	g_gamma_lut = malloc(1024);
@@ -2199,6 +3142,8 @@ int main(int argc, char **argv)
 	}
 
 	if (raw_start() < 0) return 1;
+	source_view_compute();
+	g_raw_copy = malloc((size_t)g_raw_sizeimage);
 	g_bayer = malloc((size_t)g_raw_w * g_raw_h * sizeof(uint16_t));
 	if (out_open() < 0) return 1;
 	g_frame = calloc(1, g_out_size);
@@ -2226,7 +3171,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
-	if (!g_bayer || !g_frame || (g_mjpeg && (!g_jpeg ||
+	if (!g_raw_copy || !g_bayer || !g_frame || (g_mjpeg && (!g_jpeg ||
 		(g_mjpeg_antibloom > 0 && !g_luma10) ||
 		((g_mjpeg_smooth > 0 || g_mjpeg_highlight_smooth > 0 ||
 		  g_mjpeg_desaturate_highlights > 0 || g_mjpeg_antibloom > 0 ||
@@ -2239,10 +3184,21 @@ int main(int argc, char **argv)
 			g_mjpeg_antibloom > 0) && g_mjpeg_edge_despeckle > 0)) && !g_filter2) ||
 		(g_sharpen > 0 && !g_sharp)))) { ilog("oom"); return 1; }
 	ae_init();
-	ilog("ready: raw %dx%d -> out %dx%d %s gamma=%.2f shoulder=%d/%d ae=%d sharpen=%d smooth=%d highlight=%d/%d/r%d desat=%d antibloom=%d/%d/r%d edge=%d/%d/r%d despeckle=%d blend=%d/%d harea=%d/%d/d%d hbox=%d/%d/d%d/a%d area=%d subsampling=%d scale=%s", g_raw_w, g_raw_h,
+	ilog("ready: raw %dx%d source=%d,%d %dx%d aspect=%s -> out %dx%d %s fps_cap=%d gamma=%.2f shoulder=%d/%d ae=%d mjpeg{quality=%d max=%d threads=%d direct_expected=%d sharpen=%d smooth=%d highlight=%d/%d/r%d desat=%d antibloom=%d/%d/r%d edge=%d/%d/r%d despeckle=%d blend=%d/%d harea=%d/%d/d%d hbox=%d/%d/d%d/a%d area=%d subsampling=%d scale=%s}",
+		 g_raw_w, g_raw_h, g_src_x, g_src_y, g_src_w, g_src_h, source_aspect_name(),
 		 g_out_w, g_out_h, g_mjpeg ? "MJPEG" : (g_nv12 ? "NV12" : "YUYV"),
-		 g_gamma, g_tone_highlight_knee, g_tone_highlight_max,
-		 g_auto_exposure, g_mjpeg ? g_sharpen : 0, g_mjpeg ? g_mjpeg_smooth : 0,
+		 g_fps_cap, g_gamma, g_tone_highlight_knee, g_tone_highlight_max,
+		 g_auto_exposure, g_mjpeg ? g_mjpeg_quality : 0,
+		 g_mjpeg ? g_max_frame_bytes : 0, g_mjpeg ? g_mjpeg_fast_threads : 0,
+		 g_mjpeg && (g_mjpeg_scale_mode == MJPEG_SCALE_BAYER_CENTER ||
+			 g_mjpeg_scale_mode == MJPEG_SCALE_BAYER_AREA_FRAC) &&
+			 g_mjpeg_subsampling == 420 && g_mjpeg_smooth == 0 &&
+			 g_mjpeg_highlight_smooth == 0 && g_mjpeg_desaturate_highlights == 0 &&
+			 g_mjpeg_antibloom == 0 && g_mjpeg_edge_despeckle == 0 &&
+			 g_sharpen == 0 && g_mjpeg_blend_frac == 0 &&
+			 g_mjpeg_highlight_area == 0 && g_mjpeg_highlight_box == 0 &&
+			 g_mjpeg_bayer_despeckle == 0,
+		 g_mjpeg ? g_sharpen : 0, g_mjpeg ? g_mjpeg_smooth : 0,
 		 g_mjpeg ? g_mjpeg_highlight_smooth : 0, g_mjpeg ? g_mjpeg_highlight_threshold : 0,
 		 g_mjpeg ? g_mjpeg_highlight_radius : 0, g_mjpeg ? g_mjpeg_desaturate_highlights : 0,
 		 g_mjpeg ? g_mjpeg_antibloom : 0, g_mjpeg ? g_mjpeg_antibloom_threshold : 0,
@@ -2258,64 +3214,159 @@ int main(int argc, char **argv)
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	tr = t0;
+	memset(&ps, 0, sizeof(ps));
 	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
 	while (g_run) {
 		struct pollfd p = { g_rawfd, POLLIN, 0 };
 		struct v4l2_buffer buf;
 		struct v4l2_plane planes[MAXPLANES];
-		struct timespec fa, fb;
-		int pr = poll(&p, 1, 1000);
-		if (pr <= 0) continue;
+		struct timespec t_loop, t_poll, t_dq, t_copy, t_qbuf, t_unpack, t_awb, t_pack, t_out, t_ae, t_sleep;
+		double work_ms, budget_ms = g_fps_cap > 0 ? 1000.0 / g_fps_cap : 0.0;
+		unsigned int drops_before = g_fifo_backpressure_drops;
+		long mean;
+		int pr;
+
+		clock_gettime(CLOCK_MONOTONIC, &t_loop);
+		pr = poll(&p, 1, 1000);
+		clock_gettime(CLOCK_MONOTONIC, &t_poll);
+		perf_add(&ps.poll_sum, &ps.poll_max, ts_ms(&t_loop, &t_poll));
+		if (pr <= 0) {
+			if (pr == 0)
+				ps.poll_timeouts++;
+			continue;
+		}
 		memset(&buf, 0, sizeof(buf));
 		memset(planes, 0, sizeof(planes));
 		buf.type = type; buf.memory = V4L2_MEMORY_MMAP;
 		buf.length = MAXPLANES; buf.m.planes = planes;
 		if (xioctl(g_rawfd, VIDIOC_DQBUF, &buf) < 0) {
-			if (errno == EAGAIN) continue;
+			if (errno == EAGAIN) {
+				ps.dq_eagain++;
+				continue;
+			}
 			ilog("DQBUF: %s", strerror(errno));
 			break;
 		}
-		clock_gettime(CLOCK_MONOTONIC, &fa);
-		unpack_raw10p(g_rb[buf.index].start);
+		clock_gettime(CLOCK_MONOTONIC, &t_dq);
+		perf_add(&ps.dq_sum, &ps.dq_max, ts_ms(&t_poll, &t_dq));
+		if (buf.index >= (unsigned int)g_nrb || !g_rb[buf.index].start) {
+			ilog("DQBUF returned invalid index=%u nbuf=%d", buf.index, g_nrb);
+			break;
+		}
+		if (g_rb[buf.index].len < (size_t)g_raw_sizeimage) {
+			ilog("raw buffer index=%u length=%zu smaller than sizeimage=%d", buf.index,
+				 g_rb[buf.index].len, g_raw_sizeimage);
+			break;
+		}
+		if (have_raw_seq && buf.sequence > last_raw_seq + 1)
+			ps.raw_seq_lost += buf.sequence - last_raw_seq - 1;
+		last_raw_seq = buf.sequence;
+		have_raw_seq = 1;
+
+		memcpy(g_raw_copy, g_rb[buf.index].start, (size_t)g_raw_sizeimage);
+		clock_gettime(CLOCK_MONOTONIC, &t_copy);
+		if (xioctl(g_rawfd, VIDIOC_QBUF, &buf) < 0) {
+			ps.qbuf_errors++;
+			ilog("QBUF index=%u seq=%u: %s", buf.index, buf.sequence, strerror(errno));
+			break;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &t_qbuf);
+		perf_add(&ps.hold_sum, &ps.hold_max, ts_ms(&t_dq, &t_qbuf));
+		perf_add(&ps.copy_sum, &ps.copy_max, ts_ms(&t_dq, &t_copy));
+		perf_add(&ps.qbuf_sum, &ps.qbuf_max, ts_ms(&t_copy, &t_qbuf));
+		unpack_raw10p(g_raw_copy);
+		clock_gettime(CLOCK_MONOTONIC, &t_unpack);
 		if (g_awb && (frames % 8) == 0)
 			compute_awb(&rgain, &bgain);
-		long mean = pack_output(rgain, bgain);
+		clock_gettime(CLOCK_MONOTONIC, &t_awb);
+		mean = pack_output(rgain, bgain);
+		clock_gettime(CLOCK_MONOTONIC, &t_pack);
 		out_write();
-		clock_gettime(CLOCK_MONOTONIC, &fb);
-		xioctl(g_rawfd, VIDIOC_QBUF, &buf);
+		clock_gettime(CLOCK_MONOTONIC, &t_out);
 
 		if (g_auto_exposure && (++ae_div % 3) == 0) {
 			g_ae_last_log = raw_mean_luma();
 			tone_update(g_ae_last_log);
 			ae_update(g_ae_last_log);
 		}
+		clock_gettime(CLOCK_MONOTONIC, &t_ae);
 
 		frames++;
 		total_frames++;
-		clock_gettime(CLOCK_MONOTONIC, &tr);
-		double el = (tr.tv_sec - t0.tv_sec) + (tr.tv_nsec - t0.tv_nsec) / 1e9;
-		if (el >= 2.0) {
-			double ms = (fb.tv_sec - fa.tv_sec) * 1e3 + (fb.tv_nsec - fa.tv_nsec) / 1e6;
-			if (g_auto_exposure)
-				ilog("fps=%.1f isp=%.1fms outmean=%ld ae{mean=%d hi=%d exp=%d again=%d dgain=%d%s soft=%.1f} gains r=%.2f b=%.2f",
-					 frames / el, ms, mean, g_ae_last_log, g_ae_last_hi, g_exposure, g_again, g_dgain,
-					 g_ae_changed ? " changed" : "", g_soft_gain, rgain, bgain);
-			else
-				ilog("fps=%.1f isp=%.1fms outmean=%ld gains r=%.2f b=%.2f", frames / el, ms, mean, rgain, bgain);
-			g_ae_changed = 0;
-			frames = 0; t0 = tr;
-		}
+		ps.frames++;
+		if (g_stage_direct_mjpeg)
+			ps.direct_mjpeg++;
+		if (g_fifo_backpressure_drops > drops_before)
+			ps.fifo_drops += g_fifo_backpressure_drops - drops_before;
+		perf_add(&ps.unpack_sum, &ps.unpack_max, ts_ms(&t_qbuf, &t_unpack));
+		perf_add(&ps.awb_sum, &ps.awb_max, ts_ms(&t_unpack, &t_awb));
+		perf_add(&ps.pack_sum, &ps.pack_max, ts_ms(&t_awb, &t_pack));
+		perf_add(&ps.jpeg_sum, &ps.jpeg_max, g_stage_jpeg_ms);
+		perf_add(&ps.out_sum, &ps.out_max, ts_ms(&t_pack, &t_out));
+		perf_add(&ps.ae_sum, &ps.ae_max, ts_ms(&t_out, &t_ae));
+		work_ms = ts_ms(&t_dq, &t_ae);
+		perf_add(&ps.work_sum, &ps.work_max, work_ms);
+		if (budget_ms > 0.0 && work_ms > budget_ms)
+			ps.over_budget++;
+
 		if (g_dump[0] && total_frames >= g_dump_frames)
 			break;
 
 		if (g_fps_cap > 0) {
-			double spent = (fb.tv_sec - fa.tv_sec) + (fb.tv_nsec - fa.tv_nsec) / 1e9;
+			double spent = ts_sec(&t_dq, &t_ae);
 			double budget = 1.0 / g_fps_cap;
 			if (spent < budget) {
 				struct timespec ts = { 0, (long)((budget - spent) * 1e9) };
 				nanosleep(&ts, NULL);
+				clock_gettime(CLOCK_MONOTONIC, &t_sleep);
+				perf_add(&ps.sleep_sum, &ps.sleep_max, ts_ms(&t_ae, &t_sleep));
 			}
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &tr);
+		double el = ts_sec(&t0, &tr);
+		if (el >= 2.0) {
+			if (g_auto_exposure)
+				ilog("fps=%.1f frame_ms{avg=%.1f max=%.1f budget=%.1f over=%u} raw{poll=%.1f/%.1f dq=%.2f/%.2f hold=%.1f/%.1f copy=%.1f/%.1f qbuf=%.2f/%.2f lost=%u timeout=%u eagain=%u qerr=%u} stage_avg/max{unpack=%.1f/%.1f awb=%.2f/%.2f pack=%.1f/%.1f jpeg=%.1f/%.1f out=%.1f/%.1f ae=%.2f/%.2f sleep=%.1f/%.1f direct=%u/%u fifo_drop=%u} outmean=%ld ae{mean=%d hi=%d exp=%d again=%d dgain=%d%s soft=%.1f} gains r=%.2f b=%.2f",
+					 frames / el, perf_avg(ps.work_sum, ps.frames), ps.work_max, budget_ms, ps.over_budget,
+					 perf_avg(ps.poll_sum, frames + ps.poll_timeouts), ps.poll_max,
+					 perf_avg(ps.dq_sum, ps.frames), ps.dq_max,
+					 perf_avg(ps.hold_sum, ps.frames), ps.hold_max,
+					 perf_avg(ps.copy_sum, ps.frames), ps.copy_max,
+					 perf_avg(ps.qbuf_sum, ps.frames), ps.qbuf_max,
+					 ps.raw_seq_lost, ps.poll_timeouts, ps.dq_eagain, ps.qbuf_errors,
+					 perf_avg(ps.unpack_sum, ps.frames), ps.unpack_max,
+					 perf_avg(ps.awb_sum, ps.frames), ps.awb_max,
+					 perf_avg(ps.pack_sum, ps.frames), ps.pack_max,
+					 perf_avg(ps.jpeg_sum, ps.frames), ps.jpeg_max,
+					 perf_avg(ps.out_sum, ps.frames), ps.out_max,
+					 perf_avg(ps.ae_sum, ps.frames), ps.ae_max,
+					 perf_avg(ps.sleep_sum, ps.frames), ps.sleep_max,
+					 ps.direct_mjpeg, ps.frames, ps.fifo_drops,
+					 mean, g_ae_last_log, g_ae_last_hi, g_exposure, g_again, g_dgain,
+					 g_ae_changed ? " changed" : "", g_soft_gain, rgain, bgain);
+			else
+				ilog("fps=%.1f frame_ms{avg=%.1f max=%.1f budget=%.1f over=%u} raw{poll=%.1f/%.1f dq=%.2f/%.2f hold=%.1f/%.1f copy=%.1f/%.1f qbuf=%.2f/%.2f lost=%u timeout=%u eagain=%u qerr=%u} stage_avg/max{unpack=%.1f/%.1f awb=%.2f/%.2f pack=%.1f/%.1f jpeg=%.1f/%.1f out=%.1f/%.1f ae=%.2f/%.2f sleep=%.1f/%.1f direct=%u/%u fifo_drop=%u} outmean=%ld gains r=%.2f b=%.2f",
+					 frames / el, perf_avg(ps.work_sum, ps.frames), ps.work_max, budget_ms, ps.over_budget,
+					 perf_avg(ps.poll_sum, frames + ps.poll_timeouts), ps.poll_max,
+					 perf_avg(ps.dq_sum, ps.frames), ps.dq_max,
+					 perf_avg(ps.hold_sum, ps.frames), ps.hold_max,
+					 perf_avg(ps.copy_sum, ps.frames), ps.copy_max,
+					 perf_avg(ps.qbuf_sum, ps.frames), ps.qbuf_max,
+					 ps.raw_seq_lost, ps.poll_timeouts, ps.dq_eagain, ps.qbuf_errors,
+					 perf_avg(ps.unpack_sum, ps.frames), ps.unpack_max,
+					 perf_avg(ps.awb_sum, ps.frames), ps.awb_max,
+					 perf_avg(ps.pack_sum, ps.frames), ps.pack_max,
+					 perf_avg(ps.jpeg_sum, ps.frames), ps.jpeg_max,
+					 perf_avg(ps.out_sum, ps.frames), ps.out_max,
+					 perf_avg(ps.ae_sum, ps.frames), ps.ae_max,
+					 perf_avg(ps.sleep_sum, ps.frames), ps.sleep_max,
+					 ps.direct_mjpeg, ps.frames, ps.fifo_drops,
+					 mean, rgain, bgain);
+			g_ae_changed = 0;
+			frames = 0; t0 = tr;
+			memset(&ps, 0, sizeof(ps));
 		}
 	}
 
