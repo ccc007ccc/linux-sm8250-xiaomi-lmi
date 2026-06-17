@@ -158,7 +158,7 @@ static struct uvc_control_state g_uvc_controls[] = {
 	{ UVC_UNIT_CAMERA_TERMINAL, UVC_CT_AE_MODE_CONTROL, 1, 0x02, 0x01, 0x08, 0x0f, 0x02, "ae_mode" },
 	{ UVC_UNIT_CAMERA_TERMINAL, UVC_CT_EXPOSURE_TIME_ABSOLUTE_CONTROL, 4, 333, 1, 10000, 1, 333, "exposure_time_absolute" },
 	{ UVC_UNIT_PROCESSING, UVC_PU_GAIN_CONTROL, 2, 0, 0, 255, 1, 0, "gain" },
-	{ UVC_UNIT_PROCESSING, UVC_PU_POWER_LINE_FREQUENCY_CONTROL, 1, 0, 0, 3, 1, 0, "power_line_frequency" },
+	{ UVC_UNIT_PROCESSING, UVC_PU_POWER_LINE_FREQUENCY_CONTROL, 1, 3, 0, 3, 1, 3, "power_line_frequency" },
 };
 static struct uvc_roi_state g_roi_cur = { 0, 0, UVC_ROI_MAX_COORD, UVC_ROI_MAX_COORD, UVC_ROI_AUTO_EXPOSURE };
 static const struct uvc_roi_state g_roi_min = { 0, 0, 0, 0, 0 };

@@ -17,6 +17,7 @@
 3. [`AUDIO_USAGE.md`](AUDIO_USAGE.md)
    - 适合想手动验证或临时使用扬声器、听筒和两路机身麦克风的用户。
    - 覆盖 ALSA mixer route、测试音、录音、录音回放和清理命令。
+   - 其它 rootfs 分发可直接使用 [`../rootfs/audio/`](../rootfs/audio/) 中的 PipeWire-Pulse 配置包。
 
 4. [`../HARDWARE_SUPPORT.md`](../HARDWARE_SUPPORT.md)
    - 快速判断当前哪些硬件已支持、部分支持、待适配或暂不支持。

@@ -917,12 +917,11 @@ static int vidioc_querycap(struct file *file, void *fh,
 	if (dev->announce_all_caps) {
 		capabilities |= V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_OUTPUT;
 	} else {
-		if (opener->io_method == V4L2L_IO_TIMEOUT ||
-		    (has_output_token(dev->stream_tokens) &&
-		     !dev->keep_format)) {
-			capabilities |= V4L2_CAP_VIDEO_OUTPUT;
-		} else
-			capabilities |= V4L2_CAP_VIDEO_CAPTURE;
+		/* exclusive_caps mode: always advertise both CAPTURE and OUTPUT
+		 * so consumers can discover the device. Runtime stream_tokens
+		 * enforce actual access control (only one producer at a time).
+		 */
+		capabilities |= V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_OUTPUT;
 	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)

@@ -8,6 +8,8 @@
 #define _MHI_INT_H
 
 #include "../common.h"
+#include <linux/interrupt.h>
+#include <linux/sched.h>
 
 extern const struct bus_type mhi_bus_type;
 

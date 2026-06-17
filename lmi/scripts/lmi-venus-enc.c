@@ -74,8 +74,35 @@
 #ifndef V4L2_MPEG_VIDEO_BITRATE_MODE_VBR
 #define V4L2_MPEG_VIDEO_BITRATE_MODE_VBR 0
 #endif
+#ifndef V4L2_MPEG_VIDEO_BITRATE_MODE_CBR
+#define V4L2_MPEG_VIDEO_BITRATE_MODE_CBR 1
+#endif
+#ifndef V4L2_MPEG_VIDEO_BITRATE_MODE_CQ
+#define V4L2_MPEG_VIDEO_BITRATE_MODE_CQ 2
+#endif
+#ifndef V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE
+#define V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE (V4L2_CID_CODEC_BASE + 215)
+#endif
+#ifndef V4L2_CID_MPEG_VIDEO_H264_MAX_QP
+#define V4L2_CID_MPEG_VIDEO_H264_MAX_QP (V4L2_CID_CODEC_BASE + 354)
+#endif
+#ifndef V4L2_CID_MPEG_VIDEO_H264_I_FRAME_MAX_QP
+#define V4L2_CID_MPEG_VIDEO_H264_I_FRAME_MAX_QP (V4L2_CID_CODEC_BASE + 386)
+#endif
+#ifndef V4L2_CID_MPEG_VIDEO_H264_P_FRAME_MAX_QP
+#define V4L2_CID_MPEG_VIDEO_H264_P_FRAME_MAX_QP (V4L2_CID_CODEC_BASE + 388)
+#endif
+#ifndef V4L2_CID_MPEG_VIDEO_H264_B_FRAME_MAX_QP
+#define V4L2_CID_MPEG_VIDEO_H264_B_FRAME_MAX_QP (V4L2_CID_CODEC_BASE + 390)
+#endif
 #ifndef V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME
 #define V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME 1
+#endif
+#ifndef V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE
+#define V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE 1
+#endif
+#ifndef V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CAVLC
+#define V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CAVLC 0
 #endif
 #ifndef V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC
 #define V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC 1
@@ -131,6 +158,12 @@ static unsigned int g_height;
 static unsigned int g_fps = 30;
 static unsigned int g_bitrate = 80000000;
 static unsigned int g_peak_bitrate = 120000000;
+static unsigned int g_bitrate_mode = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR;
+static int g_frame_rc = -1;
+static unsigned int g_h264_max_qp;
+static unsigned int g_h264_i_max_qp;
+static unsigned int g_h264_p_max_qp;
+static unsigned int g_h264_b_max_qp;
 static unsigned int g_gop = 30;
 static unsigned int g_profile = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
 static unsigned int g_level = V4L2_MPEG_VIDEO_H264_LEVEL_5_1;
@@ -159,6 +192,7 @@ static size_t g_tight_off;
 static uint32_t g_sequence;
 static unsigned int g_queued_input;
 static unsigned int g_encoded_output;
+static unsigned int g_last_forced_key;
 
 static struct mmap_buffer g_out_bufs[MAX_BUFS];
 static struct mmap_buffer g_cap_bufs[MAX_BUFS];
@@ -223,10 +257,25 @@ static int parse_profile(const char *s, unsigned int *out)
 {
 	if (!strcmp(s, "baseline"))
 		*out = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
+	else if (!strcmp(s, "constrained-baseline"))
+		*out = V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE;
 	else if (!strcmp(s, "main"))
 		*out = V4L2_MPEG_VIDEO_H264_PROFILE_MAIN;
 	else if (!strcmp(s, "high"))
 		*out = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
+	else
+		return parse_uint(s, out);
+	return 0;
+}
+
+static int parse_bitrate_mode(const char *s, unsigned int *out)
+{
+	if (!strcmp(s, "vbr"))
+		*out = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR;
+	else if (!strcmp(s, "cbr"))
+		*out = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
+	else if (!strcmp(s, "cq"))
+		*out = V4L2_MPEG_VIDEO_BITRATE_MODE_CQ;
 	else
 		return parse_uint(s, out);
 	return 0;
@@ -252,7 +301,10 @@ static void usage(const char *p)
 	fprintf(stderr,
 		"usage: %s --device /dev/video15 --input-fifo PATH --output-fifo PATH\n"
 		"          --width W --height H --fps N --bitrate B --peak-bitrate B\n"
-		"          [--gop N] [--profile high|main|baseline] [--level 5.1]\n"
+		"          [--bitrate-mode vbr|cbr|cq] [--frame-rc 0|1]\n"
+		"          [--h264-max-qp QP] [--h264-i-max-qp QP] [--h264-p-max-qp QP]\n"
+		"          [--gop N] [--profile high|main|baseline|constrained-baseline] [--level 5.1]\n"
+		"          [--output-buffers 1..4] [--capture-buffers 1..4]\n"
 		"          [--max-record BYTES] [--fifo-write-timeout-ms MS] [-v]\n",
 		p);
 }
@@ -269,6 +321,26 @@ static void set_ctrl_warn(unsigned int id, int value, const char *name)
 	} else if (g_verbose) {
 		ilog("control %s=%d", name, value);
 	}
+}
+
+static int set_ctrl_readback(unsigned int id, int value, const char *name)
+{
+	struct v4l2_control ctrl;
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.id = id;
+	ctrl.value = value;
+	if (xioctl(g_vfd, VIDIOC_S_CTRL, &ctrl) < 0) {
+		if (g_verbose || errno != EINVAL)
+			ilog("control %s=0x%x/%d failed: %s", name, id, value, strerror(errno));
+		return -1;
+	}
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.id = id;
+	if (xioctl(g_vfd, VIDIOC_G_CTRL, &ctrl) < 0)
+		ilog("control %s requested=%d applied=<unreadable>: %s", name, value, strerror(errno));
+	else
+		ilog("control %s requested=%d applied=%d", name, value, ctrl.value);
+	return 0;
 }
 
 static int configure_formats(void)
@@ -362,9 +434,19 @@ static int configure_formats(void)
 	if (xioctl(g_vfd, VIDIOC_S_PARM, &parm) < 0)
 		ilog("S_PARM OUTPUT %ufps failed: %s", g_fps, strerror(errno));
 
-	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_MPEG_VIDEO_BITRATE_MODE_VBR, "bitrate_mode");
-	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_BITRATE, (int)g_bitrate, "bitrate");
-	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, (int)g_peak_bitrate, "peak_bitrate");
+	set_ctrl_readback(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, (int)g_bitrate_mode, "bitrate_mode");
+	if (g_frame_rc >= 0)
+		set_ctrl_readback(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, g_frame_rc, "frame_rc");
+	set_ctrl_readback(V4L2_CID_MPEG_VIDEO_BITRATE, (int)g_bitrate, "bitrate");
+	set_ctrl_readback(V4L2_CID_MPEG_VIDEO_BITRATE_PEAK, (int)g_peak_bitrate, "peak_bitrate");
+	if (g_h264_max_qp)
+		set_ctrl_readback(V4L2_CID_MPEG_VIDEO_H264_MAX_QP, (int)g_h264_max_qp, "h264_max_qp");
+	if (g_h264_i_max_qp)
+		set_ctrl_readback(V4L2_CID_MPEG_VIDEO_H264_I_FRAME_MAX_QP, (int)g_h264_i_max_qp, "h264_i_max_qp");
+	if (g_h264_p_max_qp)
+		set_ctrl_readback(V4L2_CID_MPEG_VIDEO_H264_P_FRAME_MAX_QP, (int)g_h264_p_max_qp, "h264_p_max_qp");
+	if (g_h264_b_max_qp)
+		set_ctrl_readback(V4L2_CID_MPEG_VIDEO_H264_B_FRAME_MAX_QP, (int)g_h264_b_max_qp, "h264_b_max_qp");
 	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_GOP_SIZE, (int)g_gop, "gop");
 	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, "b_frames");
 	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_HEADER_MODE,
@@ -372,7 +454,11 @@ static int configure_formats(void)
 	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_H264_PROFILE, (int)g_profile, "h264_profile");
 	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_H264_LEVEL, (int)g_level, "h264_level");
 	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE,
-		      V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC, "h264_entropy");
+		      (g_profile == V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE ||
+		       g_profile == V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) ?
+		      V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CAVLC :
+		      V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC,
+		      "h264_entropy");
 	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_AU_DELIMITER, 1, "au_delimiter");
 	return 0;
 }
@@ -773,10 +859,18 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--fps") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_fps) == 0) {}
 		else if (!strcmp(argv[i], "--bitrate") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_bitrate) == 0) {}
 		else if (!strcmp(argv[i], "--peak-bitrate") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_peak_bitrate) == 0) {}
+		else if (!strcmp(argv[i], "--bitrate-mode") && i + 1 < (unsigned int)argc && parse_bitrate_mode(argv[++i], &g_bitrate_mode) == 0) {}
+		else if (!strcmp(argv[i], "--frame-rc") && i + 1 < (unsigned int)argc) { unsigned int v; if (parse_uint(argv[++i], &v) == 0) g_frame_rc = v ? 1 : 0; else { usage(argv[0]); return 2; } }
+		else if (!strcmp(argv[i], "--h264-max-qp") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_h264_max_qp) == 0) {}
+		else if (!strcmp(argv[i], "--h264-i-max-qp") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_h264_i_max_qp) == 0) {}
+		else if (!strcmp(argv[i], "--h264-p-max-qp") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_h264_p_max_qp) == 0) {}
+		else if (!strcmp(argv[i], "--h264-b-max-qp") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_h264_b_max_qp) == 0) {}
 		else if (!strcmp(argv[i], "--gop") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_gop) == 0) {}
 		else if (!strcmp(argv[i], "--profile") && i + 1 < (unsigned int)argc && parse_profile(argv[++i], &g_profile) == 0) {}
 		else if (!strcmp(argv[i], "--level") && i + 1 < (unsigned int)argc && parse_level(argv[++i], &g_level) == 0) {}
 		else if (!strcmp(argv[i], "--max-record") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_max_record) == 0) {}
+		else if (!strcmp(argv[i], "--output-buffers") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_out_count) == 0) {}
+		else if (!strcmp(argv[i], "--capture-buffers") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_cap_count) == 0) {}
 		else if (!strcmp(argv[i], "--fifo-write-timeout-ms") && i + 1 < (unsigned int)argc && parse_uint(argv[++i], &g_fifo_write_timeout_ms) == 0) {}
 		else if (!strcmp(argv[i], "-v")) g_verbose = 1;
 		else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
@@ -787,8 +881,21 @@ int main(int argc, char **argv)
 		usage(argv[0]);
 		return 2;
 	}
-	if (g_out_count > MAX_BUFS) g_out_count = MAX_BUFS;
-	if (g_cap_count > MAX_BUFS) g_cap_count = MAX_BUFS;
+	if (g_bitrate_mode > V4L2_MPEG_VIDEO_BITRATE_MODE_CQ) {
+		usage(argv[0]);
+		return 2;
+	}
+	if ((g_h264_max_qp && (g_h264_max_qp < 1 || g_h264_max_qp > 51)) ||
+	    (g_h264_i_max_qp && (g_h264_i_max_qp < 1 || g_h264_i_max_qp > 51)) ||
+	    (g_h264_p_max_qp && (g_h264_p_max_qp < 1 || g_h264_p_max_qp > 51)) ||
+	    (g_h264_b_max_qp && (g_h264_b_max_qp < 1 || g_h264_b_max_qp > 51))) {
+		usage(argv[0]);
+		return 2;
+	}
+	if (g_out_count == 0 || g_out_count > MAX_BUFS || g_cap_count == 0 || g_cap_count > MAX_BUFS) {
+		usage(argv[0]);
+		return 2;
+	}
 	g_tight_size = (size_t)g_width * g_height * 3 / 2;
 	g_tight = malloc(g_tight_size);
 	if (!g_tight) {
@@ -821,8 +928,11 @@ int main(int argc, char **argv)
 	if (streamon(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, &g_streaming_out, "OUTPUT") < 0)
 		goto out;
 	set_ctrl_warn(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, "force_key_frame");
-	ilog("streaming H264: visible=%ux%u fps=%u bitrate=%u peak=%u gop=%u max-record=%u",
-	     g_width, g_height, g_fps, g_bitrate, g_peak_bitrate, g_gop, g_max_record);
+	ilog("streaming H264: visible=%ux%u fps=%u bitrate=%u peak=%u mode=%u frame-rc=%d buffers=%u/%u max_qp=%u/%u/%u/%u gop=%u max-record=%u",
+	     g_width, g_height, g_fps, g_bitrate, g_peak_bitrate, g_bitrate_mode,
+	     g_frame_rc, g_out_count, g_cap_count,
+	     g_h264_max_qp, g_h264_i_max_qp, g_h264_p_max_qp, g_h264_b_max_qp,
+	     g_gop, g_max_record);
 
 	while (g_run) {
 		struct pollfd pfds[2];
@@ -831,6 +941,10 @@ int main(int argc, char **argv)
 			goto out;
 		free_idx = output_free_index();
 		if (free_idx >= 0 && g_tight_off >= g_tight_size) {
+			if (g_gop && g_queued_input >= g_last_forced_key + g_gop) {
+				set_ctrl_warn(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, "force_key_frame");
+				g_last_forced_key = g_queued_input;
+			}
 			if (queue_output((unsigned int)free_idx) < 0)
 				goto out;
 		}
@@ -839,6 +953,10 @@ int main(int argc, char **argv)
 				goto out;
 			free_idx = output_free_index();
 			if (free_idx >= 0 && g_tight_off >= g_tight_size) {
+				if (g_gop && g_queued_input >= g_last_forced_key + g_gop) {
+					set_ctrl_warn(V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, "force_key_frame");
+					g_last_forced_key = g_queued_input;
+				}
 				if (queue_output((unsigned int)free_idx) < 0)
 					goto out;
 			}

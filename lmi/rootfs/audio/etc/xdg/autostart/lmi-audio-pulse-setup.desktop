@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LMI Audio Pulse Setup
+Comment=Expose lmi speaker, earpiece and microphone routes as stable Pulse/PipeWire devices
+Exec=/usr/local/bin/lmi-audio-pulse-setup --setup
+Terminal=false
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=GNOME;Phosh;LXDE;XFCE;MATE;KDE;

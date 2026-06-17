@@ -35,6 +35,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/videodev2.h>
+#ifndef V4L2_CID_PIXEL_RATE
+#include <linux/v4l2-controls.h>
+#endif
 
 #include "lmi-jpeg.h"
 
@@ -45,7 +48,16 @@
 #define F_SETPIPE_SZ 1031
 #endif
 #ifndef V4L2_CID_DIGITAL_GAIN
-#define V4L2_CID_DIGITAL_GAIN (V4L2_CID_IMAGE_SOURCE_CLASS_BASE + 5)
+#define V4L2_CID_DIGITAL_GAIN (V4L2_CID_IMAGE_PROC_CLASS_BASE + 5)
+#endif
+#ifndef V4L2_CID_PIXEL_RATE
+#define V4L2_CID_PIXEL_RATE (V4L2_CID_IMAGE_PROC_CLASS_BASE + 2)
+#endif
+#ifndef V4L2_CID_HBLANK
+#define V4L2_CID_HBLANK (V4L2_CID_IMAGE_SOURCE_CLASS_BASE + 2)
+#endif
+#ifndef V4L2_CID_VBLANK
+#define V4L2_CID_VBLANK (V4L2_CID_IMAGE_SOURCE_CLASS_BASE + 1)
 #endif
 
 #define NBUF 4
@@ -54,6 +66,8 @@
 #define LMI_UVC_RECORD_VERSION 1
 #define LMI_UVC_ROI_MAX_COORD 65535
 #define LMI_UVC_ROI_COORD_DEN 65536
+#define LMI_FLICKER_BANDS 48
+#define LMI_FLICKER_MIN_BANDS 16
 
 /* ---- config ---- */
 static const char *g_raw = "/dev/video3";
@@ -64,6 +78,14 @@ static const char *g_control_fifo = ""; /* FIFO for live UVC control updates, or
 static const char *g_dump = "";		   /* processed frame dump for regression, or "" */
 static int g_dump_frames = 1;
 static int g_out_w = 1280, g_out_h = 720;
+/* Orientation is owned by the kernel: camera-rs reads V4L2_CID_CAMERA_SENSOR_ROTATION
+ * (DTS `rotation`) and passes it as --rotate so the YUYV loopback output is presented
+ * upright, exactly like libcamera would.  The ISP never invents an angle. */
+static int g_rotate;			   /* CCW degrees to apply to the YUYV loopback: 0/90/180/270 */
+static int g_logical_w, g_logical_h;   /* pre-rotation output size used for source mapping */
+static int g_denoise;			   /* 0..100 motion-gated temporal denoise for the YUYV loopback */
+static int g_denoise_thresh = 18;	  /* per-sample motion threshold; above = keep current (no ghost) */
+static uint8_t *g_prev_frame;		  /* previous YUYV frame for temporal denoise */
 enum source_aspect_policy {
 	SOURCE_ASPECT_STRETCH = 0,
 	SOURCE_ASPECT_PRESERVE,
@@ -177,9 +199,47 @@ static int g_exp_min, g_exp_max, g_gain_min, g_gain_max, g_dgain_min, g_dgain_ma
 static int g_ae_last_log;
 static int g_ae_last_hi;
 static int g_ae_changed;
+static double g_ae_filtered_mean = -1.0;
+static int g_ae_last_dir;
+static int g_ae_dir_count;
+static int g_ae_mean_window[8];
+static int g_ae_mean_window_count;
+static int g_ae_mean_window_pos;
 static int g_auto_tone = 1;
 static int g_dgain_limit = -1;
+
+enum flicker_mode {
+	FLICKER_MODE_OFF = 0,
+	FLICKER_MODE_FIXED_50,
+	FLICKER_MODE_FIXED_60,
+	FLICKER_MODE_AUTO,
+};
+
+struct flicker_stats {
+	int bands;
+	double score_50;
+	double score_60;
+	double score;
+	int candidate_hz;
+	int active;
+};
+
+static enum flicker_mode g_flicker_mode = FLICKER_MODE_OFF;
 static int g_flicker_hz;
+static int g_flicker_detected_hz;
+static int g_flicker_pending_hz;
+static int g_flicker_active;
+static double g_flicker_score_50;
+static double g_flicker_score_60;
+static double g_flicker_score;
+static int g_flicker_lock_count;
+static int g_flicker_clear_count;
+static int g_flicker_last_log_sec;
+static int g_timing_ready;
+static int g_line_time_ns;
+static int g_timing_hblank = -1;
+static int g_timing_vblank = -1;
+static int64_t g_timing_pixel_rate;
 static int g_meter_roi_enabled;
 static int g_meter_left, g_meter_top, g_meter_right, g_meter_bottom, g_meter_auto_controls;
 static double g_soft_gain = 1.0;
@@ -253,6 +313,13 @@ static double perf_avg(double sum, unsigned int frames)
 
 /* ---------------- sensor controls / AE ---------------- */
 
+static int g_ctrlfd = -1;
+static int g_controlfd = -1;
+static char g_control_line[256];
+static unsigned int g_control_line_len;
+
+static void ae_compensate_gain_for_exposure(int before, int after);
+
 static int get_ctrl_range(int fd, unsigned int id, int *vmin, int *vmax, int *cur)
 {
 	struct v4l2_queryctrl q;
@@ -272,6 +339,56 @@ static int get_ctrl_range(int fd, unsigned int id, int *vmin, int *vmax, int *cu
 	return 0;
 }
 
+static int get_ctrl_i64(int fd, unsigned int id, int64_t *value)
+{
+	struct v4l2_ext_controls ctrls;
+	struct v4l2_ext_control ctrl;
+	struct v4l2_queryctrl q;
+
+	memset(&q, 0, sizeof(q));
+	q.id = id;
+	if (xioctl(fd, VIDIOC_QUERYCTRL, &q) < 0)
+		return -1;
+	memset(&ctrls, 0, sizeof(ctrls));
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.id = id;
+	ctrls.count = 1;
+	ctrls.controls = &ctrl;
+	if (xioctl(fd, VIDIOC_G_EXT_CTRLS, &ctrls) < 0)
+		return -1;
+	if (q.type == V4L2_CTRL_TYPE_INTEGER64)
+		*value = ctrl.value64;
+	else
+		*value = ctrl.value;
+	return 0;
+}
+
+static void controls_update_timing(void)
+{
+	int minv, maxv, hblank = 0, vblank = -1;
+	int64_t pixel_rate;
+
+	if (g_timing_ready || g_ctrlfd < 0 || g_raw_w <= 0)
+		return;
+	if (get_ctrl_i64(g_ctrlfd, V4L2_CID_PIXEL_RATE, &pixel_rate) < 0 || pixel_rate <= 0)
+		return;
+	if (get_ctrl_range(g_ctrlfd, V4L2_CID_HBLANK, &minv, &maxv, &hblank) < 0)
+		hblank = 0;
+	if (get_ctrl_range(g_ctrlfd, V4L2_CID_VBLANK, &minv, &maxv, &vblank) < 0)
+		vblank = -1;
+	g_line_time_ns = (int)(((int64_t)g_raw_w + hblank) * 1000000000LL / pixel_rate);
+	if (g_line_time_ns <= 0)
+		return;
+	g_timing_ready = 1;
+	g_timing_pixel_rate = pixel_rate;
+	g_timing_hblank = hblank;
+	g_timing_vblank = vblank;
+	if (g_verbose || g_auto_exposure || g_flicker_mode != FLICKER_MODE_OFF)
+		ilog("controls: timing pixel_rate=%lld hblank=%d vblank=%d line_time_ns=%d",
+		     (long long)g_timing_pixel_rate, g_timing_hblank, g_timing_vblank,
+		     g_line_time_ns);
+}
+
 static int set_ctrl(int fd, unsigned int id, int val)
 {
 	struct v4l2_control c;
@@ -280,11 +397,6 @@ static int set_ctrl(int fd, unsigned int id, int val)
 	c.value = val;
 	return xioctl(fd, VIDIOC_S_CTRL, &c);
 }
-
-static int g_ctrlfd = -1;
-static int g_controlfd = -1;
-static char g_control_line[256];
-static unsigned int g_control_line_len;
 
 static int controls_init(void)
 {
@@ -325,10 +437,11 @@ static int controls_init(void)
 		g_dgain_min = 0;
 		g_dgain_max = 0;
 	}
-	ilog("controls: exposure[%d..%d]=%d gain[%d..%d]=%d digital[%d..%d]=%d ae=%d target=%d clip=%d/%d flicker=%d digital_limit=%d soft_limit=%.1f",
+	controls_update_timing();
+	ilog("controls: exposure[%d..%d]=%d gain[%d..%d]=%d digital[%d..%d]=%d ae=%d target=%d clip=%d/%d flicker_mode=%d hz=%d line_ns=%d digital_limit=%d soft_limit=%.1f",
 		 g_exp_min, g_exp_max, g_exposure, g_gain_min, g_gain_max, g_again,
 		 g_dgain_min, g_dgain_max, g_dgain, g_auto_exposure, g_target, g_ae_clip_target,
-		 g_ae_clip_weight, g_flicker_hz,
+		 g_ae_clip_weight, g_flicker_mode, g_flicker_hz, g_line_time_ns,
 		 g_dgain >= 0 && g_dgain_limit >= 0 ? g_dgain_limit : g_dgain_max,
 		 g_max_soft_gain);
 	return 0;
@@ -401,27 +514,71 @@ static int apply_digital_gain(int value)
 	return 0;
 }
 
-static int flicker_exposure_quantum(void)
+static const char *flicker_mode_name(void)
+{
+	switch (g_flicker_mode) {
+	case FLICKER_MODE_FIXED_50: return "50";
+	case FLICKER_MODE_FIXED_60: return "60";
+	case FLICKER_MODE_AUTO: return "auto";
+	case FLICKER_MODE_OFF:
+	default: return "off";
+	}
+}
+
+static int flicker_target_hz(void)
+{
+	if (g_flicker_mode == FLICKER_MODE_FIXED_50)
+		return 50;
+	if (g_flicker_mode == FLICKER_MODE_FIXED_60)
+		return 60;
+	if (g_flicker_mode == FLICKER_MODE_AUTO && g_flicker_active &&
+	    (g_flicker_detected_hz == 50 || g_flicker_detected_hz == 60))
+		return g_flicker_detected_hz;
+	return 0;
+}
+
+static int flicker_exposure_quantum_for_hz(int hz)
 {
 	int fps, frame_units_100us, half_cycle_100us, range;
-	if (g_flicker_hz != 50 && g_flicker_hz != 60)
+	if (hz != 50 && hz != 60)
 		return 0;
+	range = g_exp_max - g_exp_min;
+	if (range < 2)
+		return 0;
+	if (g_ctrlfd >= 0)
+		controls_update_timing();
+	if (g_timing_ready && g_line_time_ns > 0) {
+		int64_t half_ns = hz == 50 ? 10000000LL : 8333333LL;
+		int lines = (int)((half_ns + g_line_time_ns / 2) / g_line_time_ns);
+		/* Some high-FPS modes cannot fit a full mains half-cycle into one exposure;
+		 * do not quantize those modes down to the minimum shutter. */
+		if (lines >= range)
+			return 0;
+		return clamp_i(lines, 1, range);
+	}
 	fps = g_fps_cap > 0 ? g_fps_cap : 30;
 	frame_units_100us = 10000 / fps;
 	if (frame_units_100us < 1)
 		frame_units_100us = 1;
 	/* Mains flicker repeats every half-cycle: 10ms for 50Hz, 8.33ms for 60Hz. */
-	half_cycle_100us = g_flicker_hz == 50 ? 100 : 83;
-	range = g_exp_max - g_exp_min;
-	if (range < 1)
-		return 1;
-	return clamp_i((int)(((int64_t)range * half_cycle_100us + frame_units_100us / 2) /
-				     frame_units_100us), 1, range);
+	half_cycle_100us = hz == 50 ? 100 : 83;
+	{
+		int quantum = (int)(((int64_t)range * half_cycle_100us + frame_units_100us / 2) /
+					      frame_units_100us);
+		if (quantum >= range)
+			return 0;
+		return clamp_i(quantum, 1, range);
+	}
 }
 
-static int flicker_quantize_exposure_dir(int value, int direction)
+static int flicker_exposure_quantum(void)
 {
-	int offset, quantum = flicker_exposure_quantum();
+	return flicker_exposure_quantum_for_hz(flicker_target_hz());
+}
+
+static int flicker_quantize_exposure_for_hz(int value, int direction, int hz)
+{
+	int offset, quantum = flicker_exposure_quantum_for_hz(hz);
 	if (quantum <= 0)
 		return value;
 	value = clamp_i(value, g_exp_min, g_exp_max);
@@ -433,6 +590,40 @@ static int flicker_quantize_exposure_dir(int value, int direction)
 	else
 		value = g_exp_min + ((offset + quantum / 2) / quantum) * quantum;
 	return clamp_i(value, g_exp_min, g_exp_max);
+}
+
+static int flicker_alignment_tolerance(int quantum)
+{
+	int tolerance = quantum / 64;
+	if (tolerance < 4)
+		tolerance = 4;
+	if (tolerance > 24)
+		tolerance = 24;
+	return tolerance;
+}
+
+static int flicker_preferred_exposure_for_hz(int value, int hz)
+{
+	int offset, quantum = flicker_exposure_quantum_for_hz(hz);
+	int up, down, max_offset;
+
+	if (quantum <= 0)
+		return clamp_i(value, g_exp_min, g_exp_max);
+	value = clamp_i(value, g_exp_min, g_exp_max);
+	offset = value - g_exp_min;
+	up = g_exp_min + ((offset + quantum - 1) / quantum) * quantum;
+	if (up <= g_exp_max)
+		return up;
+	if (up - g_exp_max <= flicker_alignment_tolerance(quantum))
+		return g_exp_max;
+	max_offset = g_exp_max - g_exp_min;
+	down = g_exp_min + (max_offset / quantum) * quantum;
+	return clamp_i(down, g_exp_min, g_exp_max);
+}
+
+static int flicker_quantize_exposure_dir(int value, int direction)
+{
+	return flicker_quantize_exposure_for_hz(value, direction, flicker_target_hz());
 }
 
 static int flicker_quantize_exposure(int value)
@@ -447,6 +638,13 @@ static int exposure_absolute_to_lines(int value_100us)
 	int lines;
 	if (value_100us < 1)
 		value_100us = 1;
+	if (g_ctrlfd >= 0)
+		controls_update_timing();
+	if (g_timing_ready && g_line_time_ns > 0) {
+		lines = (int)(((int64_t)value_100us * 100000LL + g_line_time_ns / 2) /
+			      g_line_time_ns);
+		return flicker_quantize_exposure(clamp_i(lines, g_exp_min, g_exp_max));
+	}
 	if (frame_units < 1)
 		frame_units = 1;
 	lines = g_exp_min + (int)(((int64_t)value_100us * (g_exp_max - g_exp_min)) / frame_units);
@@ -504,6 +702,209 @@ static void meter_roi_bounds(int *left, int *top, int *right, int *bottom)
 	*bottom = b;
 }
 
+static double flicker_line_time_ns_for_detection(void)
+{
+	if (g_ctrlfd >= 0)
+		controls_update_timing();
+	if (g_timing_ready && g_line_time_ns > 0)
+		return (double)g_line_time_ns;
+	if (g_fps_cap > 0 && g_raw_h > 0)
+		return 1000000000.0 / ((double)g_fps_cap * g_raw_h);
+	return 0.0;
+}
+
+static double flicker_score_for_hz(const double *residual, int bands, int top,
+				   int height, int hz, double line_ns, double energy)
+{
+	const double two_pi = 6.28318530717958647692;
+	double half_ns, cs = 0.0, sn = 0.0, wn = 0.0;
+	int i;
+
+	if ((hz != 50 && hz != 60) || bands <= 1 || height <= 0 || line_ns <= 0.0 || energy <= 0.0)
+		return 0.0;
+	half_ns = hz == 50 ? 10000000.0 : 8333333.333333333;
+	for (i = 0; i < bands; i++) {
+		double y = top + ((i + 0.5) * height) / bands;
+		double phase = two_pi * y * line_ns / half_ns;
+		double c = cos(phase), s = sin(phase);
+		cs += residual[i] * c;
+		sn += residual[i] * s;
+		wn += c * c + s * s;
+	}
+	if (wn <= 0.0)
+		return 0.0;
+	return sqrt((cs * cs + sn * sn) / (energy * wn));
+}
+
+static struct flicker_stats flicker_analyze_frame(void)
+{
+	struct flicker_stats st;
+	double means[LMI_FLICKER_BANDS], residual[LMI_FLICKER_BANDS];
+	double sum = 0.0, sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+	double mean_level, slope = 0.0, intercept = 0.0, energy = 0.0, rms;
+	double line_ns;
+	int left, top, right, bottom, height, width, bands, i;
+	int use_full_frame = 0;
+
+	memset(&st, 0, sizeof(st));
+	meter_roi_bounds(&left, &top, &right, &bottom);
+	height = bottom - top;
+	width = right - left;
+	if (height < LMI_FLICKER_MIN_BANDS * 4 || width < 64)
+		use_full_frame = 1;
+	if (use_full_frame) {
+		left = 0;
+		top = 0;
+		right = g_raw_w;
+		bottom = g_raw_h;
+		height = bottom - top;
+		width = right - left;
+	}
+	if (height < LMI_FLICKER_MIN_BANDS * 2 || width < 16)
+		return st;
+	bands = LMI_FLICKER_BANDS;
+	if (height / 2 < bands)
+		bands = height / 2;
+	if (bands < LMI_FLICKER_MIN_BANDS)
+		return st;
+	if (bands > LMI_FLICKER_BANDS)
+		bands = LMI_FLICKER_BANDS;
+	for (i = 0; i < bands; i++) {
+		uint64_t acc = 0, cnt = 0;
+		int y0 = top + (height * i) / bands;
+		int y1 = top + (height * (i + 1)) / bands;
+		int row_step = (y1 - y0) / 4;
+		int col_step = width / 96;
+		int y, x;
+
+		if (row_step < 2)
+			row_step = 2;
+		row_step &= ~1;
+		if (row_step < 2)
+			row_step = 2;
+		if (col_step < 8)
+			col_step = 8;
+		if (col_step > 64)
+			col_step = 64;
+		col_step &= ~1;
+		y0 &= ~1;
+		y1 &= ~1;
+		if (y1 <= y0)
+			y1 = y0 + 2;
+		if (y1 > bottom - 1)
+			y1 = bottom - 1;
+		for (y = y0; y + 1 < y1; y += row_step) {
+			for (x = left & ~1; x + 1 < right; x += col_step) {
+				acc += g_bayer[(size_t)y * g_raw_w + x];
+				acc += g_bayer[(size_t)(y + 1) * g_raw_w + x + 1];
+				cnt += 2;
+			}
+		}
+		means[i] = cnt ? (double)acc / cnt : 0.0;
+		sum += means[i];
+	}
+	if (bands <= 1)
+		return st;
+	mean_level = sum / bands - g_blacklevel;
+	for (i = 0; i < bands; i++) {
+		double x = i - (bands - 1) * 0.5;
+		double y = means[i];
+		sx += x;
+		sy += y;
+		sxx += x * x;
+		sxy += x * y;
+	}
+	if (sxx > 0.0)
+		slope = (sxy - sx * sy / bands) / (sxx - sx * sx / bands);
+	intercept = sy / bands - slope * sx / bands;
+	for (i = 0; i < bands; i++) {
+		double x = i - (bands - 1) * 0.5;
+		residual[i] = means[i] - (intercept + slope * x);
+		energy += residual[i] * residual[i];
+	}
+	if (energy <= 0.0)
+		return st;
+	rms = sqrt(energy / bands);
+	line_ns = flicker_line_time_ns_for_detection();
+	st.bands = bands;
+	st.score_50 = flicker_score_for_hz(residual, bands, top, height, 50, line_ns, energy);
+	st.score_60 = flicker_score_for_hz(residual, bands, top, height, 60, line_ns, energy);
+	st.score = st.score_50 >= st.score_60 ? st.score_50 : st.score_60;
+	st.candidate_hz = st.score_50 >= st.score_60 ? 50 : 60;
+	st.active = st.score >= 0.25 && rms >= 2.0 &&
+		(mean_level <= 1.0 || rms / mean_level >= 0.004);
+	return st;
+}
+
+static void flicker_update_state(const struct flicker_stats *st)
+{
+	struct timespec ts;
+	int old_active = g_flicker_active;
+	int old_hz = g_flicker_hz;
+	int quantum;
+
+	if (g_flicker_mode == FLICKER_MODE_OFF || !st)
+		return;
+	g_flicker_score_50 = st->score_50;
+	g_flicker_score_60 = st->score_60;
+	g_flicker_score = st->score;
+	if (g_flicker_mode == FLICKER_MODE_AUTO) {
+		if (st->active && (st->candidate_hz == 50 || st->candidate_hz == 60)) {
+			int candidate_hz = st->candidate_hz;
+			double best = st->score_50 >= st->score_60 ? st->score_50 : st->score_60;
+			double diff = st->score_50 >= st->score_60 ? st->score_50 - st->score_60 : st->score_60 - st->score_50;
+
+			/* The short row sweep gives close 50/60 scores on many LED scenes.  If the
+			 * scores are not decisive, keep the previous lock or prefer the local
+			 * 50Hz-safe shutter step; a clearly stronger 60Hz score still wins. */
+			if (best > 0.0 && diff / best <= 0.12) {
+				if (g_flicker_detected_hz == 50 || g_flicker_detected_hz == 60)
+					candidate_hz = g_flicker_detected_hz;
+				else if (g_flicker_pending_hz == 50 || g_flicker_pending_hz == 60)
+					candidate_hz = g_flicker_pending_hz;
+				else
+					candidate_hz = 50;
+			}
+			if (g_flicker_pending_hz == candidate_hz)
+				g_flicker_lock_count++;
+			else {
+				g_flicker_pending_hz = candidate_hz;
+				g_flicker_lock_count = 1;
+			}
+			g_flicker_clear_count = 0;
+			if (!g_flicker_active || g_flicker_detected_hz == candidate_hz ||
+			    g_flicker_lock_count >= 3) {
+				g_flicker_detected_hz = candidate_hz;
+				g_flicker_active = 1;
+			}
+		} else {
+			g_flicker_lock_count = 0;
+			g_flicker_pending_hz = 0;
+			if (++g_flicker_clear_count >= 4) {
+				g_flicker_active = 0;
+				g_flicker_detected_hz = 0;
+			}
+		}
+	} else {
+		g_flicker_detected_hz = st->active ? st->candidate_hz : 0;
+		g_flicker_active = st->active;
+	}
+	g_flicker_hz = flicker_target_hz();
+	quantum = flicker_exposure_quantum();
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	if (old_active != g_flicker_active || old_hz != g_flicker_hz ||
+	    (int)ts.tv_sec - g_flicker_last_log_sec >= 2) {
+		g_flicker_last_log_sec = (int)ts.tv_sec;
+		ilog("flicker: mode=%s hz=%d detected=%d active=%d score=%.3f s50=%.3f s60=%.3f bands=%d quantum=%d source=%s exposure=%d again=%d dgain=%d",
+		     flicker_mode_name(), g_flicker_hz, g_flicker_detected_hz,
+		     g_flicker_active, g_flicker_score, g_flicker_score_50,
+		     g_flicker_score_60, st->bands, quantum,
+		     g_timing_ready ? "timing" : "fallback", g_exposure, g_again, g_dgain);
+	}
+}
+
+static void ae_reset_history(void);
+
 static void control_fifo_open(void)
 {
 	if (!g_control_fifo[0] || g_controlfd >= 0)
@@ -547,30 +948,47 @@ static void apply_control_line(char *line)
 	}
 	if (!strcmp(key, "flicker")) {
 		int quantum, have_controls = 0;
-		if (!strcmp(value, "50"))
-			g_flicker_hz = 50;
-		else if (!strcmp(value, "60"))
-			g_flicker_hz = 60;
-		else if (!strcmp(value, "auto"))
-			g_flicker_hz = 50;
-		else
-			g_flicker_hz = 0;
-		if (g_flicker_hz)
+		if (!strcmp(value, "50")) {
+			g_flicker_mode = FLICKER_MODE_FIXED_50;
+			g_flicker_active = 1;
+			g_flicker_detected_hz = 50;
+		} else if (!strcmp(value, "60")) {
+			g_flicker_mode = FLICKER_MODE_FIXED_60;
+			g_flicker_active = 1;
+			g_flicker_detected_hz = 60;
+		} else if (!strcmp(value, "auto")) {
+			g_flicker_mode = FLICKER_MODE_AUTO;
+			g_flicker_active = 0;
+			g_flicker_detected_hz = 0;
+		} else {
+			g_flicker_mode = FLICKER_MODE_OFF;
+			g_flicker_active = 0;
+			g_flicker_detected_hz = 0;
+		}
+		g_flicker_hz = flicker_target_hz();
+		g_flicker_pending_hz = 0;
+		g_flicker_lock_count = 0;
+		g_flicker_clear_count = 0;
+		if (g_flicker_mode != FLICKER_MODE_OFF)
 			have_controls = controls_init() == 0;
 		quantum = flicker_exposure_quantum();
 		if (have_controls && quantum > 0 && g_exposure >= 0) {
 			int before = g_exposure;
-			int snapped = flicker_quantize_exposure(g_exposure);
+			int snapped = flicker_preferred_exposure_for_hz(g_exposure, g_flicker_hz);
 			if (snapped != before && apply_exposure(snapped) == 0) {
-				ilog("control: flicker=%s hz=%d quantum=%d exposure=%d->%d",
-				     value, g_flicker_hz, quantum, before, g_exposure);
+				ae_compensate_gain_for_exposure(before, g_exposure);
+				ilog("control: flicker=%s mode=%s hz=%d quantum=%d exposure=%d->%d source=%s",
+				     value, flicker_mode_name(), g_flicker_hz, quantum, before,
+				     g_exposure, g_timing_ready ? "timing" : "fallback");
 				return;
 			}
-			ilog("control: flicker=%s hz=%d quantum=%d exposure=%d",
-			     value, g_flicker_hz, quantum, g_exposure);
+			ilog("control: flicker=%s mode=%s hz=%d quantum=%d exposure=%d source=%s",
+			     value, flicker_mode_name(), g_flicker_hz, quantum, g_exposure,
+			     g_timing_ready ? "timing" : "fallback");
 		} else {
-			ilog("control: flicker=%s hz=%d quantum=%d", value, g_flicker_hz,
-			     quantum);
+			ilog("control: flicker=%s mode=%s hz=%d quantum=%d source=%s", value,
+			     flicker_mode_name(), g_flicker_hz, quantum,
+			     g_timing_ready ? "timing" : "fallback");
 		}
 		return;
 	}
@@ -595,6 +1013,9 @@ static void apply_control_line(char *line)
 			g_meter_roi_enabled = 0;
 		else
 			g_meter_roi_enabled = auto_controls & 1;
+		ae_reset_history();
+		if (g_meter_roi_enabled && controls_init() == 0)
+			g_auto_exposure = 1;
 		ilog("control: meter_roi=%d,%d,%d,%d auto=0x%x enabled=%d",
 		     g_meter_top, g_meter_left, g_meter_bottom, g_meter_right,
 		     g_meter_auto_controls, g_meter_roi_enabled);
@@ -663,12 +1084,169 @@ static void control_fifo_drain(void)
 
 static int raw_percentile_luma(int step, int pct);
 
-/* simple proportional AE on the pre-gamma mean luma */
+static int ae_scale_down_control(int value, int vmin, int vmax, double ratio)
+{
+	if (value < vmin)
+		return value;
+	if (ratio < 0.05)
+		ratio = 0.05;
+	if (ratio > 1.0)
+		ratio = 1.0;
+	return clamp_i(vmin + (int)((value - vmin) * ratio + 0.5), vmin, vmax);
+}
+
+static int ae_try_reduce_digital(int step)
+{
+	if (g_dgain < 0 || g_dgain <= g_dgain_min)
+		return 0;
+	if (step < 1)
+		step = 1;
+	return apply_digital_gain(g_dgain - step) == 0;
+}
+
+static int ae_try_reduce_analogue(int step)
+{
+	if (g_again < 0 || g_again <= g_gain_min)
+		return 0;
+	if (step < 1)
+		step = 1;
+	return apply_analogue_gain(g_again - step) == 0;
+}
+
+static int ae_analogue_soft_max(void)
+{
+	int cap;
+	if (g_again < 0)
+		return -1;
+	cap = g_gain_min + ((g_gain_max - g_gain_min) * 3) / 5;
+	return clamp_i(cap, g_gain_min, g_gain_max);
+}
+
+static int ae_scale_up_control(int value, int vmin, int vmax, double ratio)
+{
+	if (value < vmin)
+		return value;
+	if (ratio < 1.0)
+		ratio = 1.0;
+	if (ratio > 4.0)
+		ratio = 4.0;
+	return clamp_i(vmin + (int)((value - vmin) * ratio + 0.5), vmin, vmax);
+}
+
+static void ae_compensate_gain_for_exposure(int before, int after)
+{
+	double ratio;
+	int target, soft_max;
+
+	if (before <= 0 || after <= 0 || before == after)
+		return;
+	if (after > before) {
+		ratio = (double)before / after;
+		if (g_dgain >= 0 && g_dgain > g_dgain_min) {
+			target = ae_scale_down_control(g_dgain, g_dgain_min, ae_dgain_max(), ratio);
+			if (target < g_dgain)
+				apply_digital_gain(target);
+		}
+		if (g_again >= 0 && g_again > g_gain_min) {
+			target = ae_scale_down_control(g_again, g_gain_min, g_gain_max, ratio);
+			if (target < g_again)
+				apply_analogue_gain(target);
+		}
+		return;
+	}
+
+	/* If anti-flicker shortens the shutter, lift analogue gain only up to the
+	 * soft ISO ceiling.  Digital gain remains the last resort to avoid noisy
+	 * oscillation when a small ROI lands on a lamp. */
+	ratio = (double)before / after;
+	soft_max = ae_analogue_soft_max();
+	if (g_again >= 0 && soft_max > g_again) {
+		target = ae_scale_up_control(g_again, g_gain_min, soft_max, ratio);
+		if (target > g_again)
+			apply_analogue_gain(target);
+	}
+}
+
+static void ae_reset_history(void)
+{
+	g_ae_filtered_mean = -1.0;
+	g_ae_last_dir = 0;
+	g_ae_dir_count = 0;
+	g_ae_mean_window_count = 0;
+	g_ae_mean_window_pos = 0;
+}
+
+static int ae_mean_window_average(void)
+{
+	int i, sum = 0;
+	if (g_ae_mean_window_count <= 0)
+		return -1;
+	for (i = 0; i < g_ae_mean_window_count; i++)
+		sum += g_ae_mean_window[i];
+	return (sum + g_ae_mean_window_count / 2) / g_ae_mean_window_count;
+}
+
+static int ae_mean_window_range(void)
+{
+	int i, minv = 255, maxv = 0;
+	if (g_ae_mean_window_count <= 1)
+		return 0;
+	for (i = 0; i < g_ae_mean_window_count; i++) {
+		if (g_ae_mean_window[i] < minv)
+			minv = g_ae_mean_window[i];
+		if (g_ae_mean_window[i] > maxv)
+			maxv = g_ae_mean_window[i];
+	}
+	return maxv - minv;
+}
+
+static void ae_mean_window_push(int mean)
+{
+	g_ae_mean_window[g_ae_mean_window_pos] = mean;
+	g_ae_mean_window_pos = (g_ae_mean_window_pos + 1) %
+		(int)(sizeof(g_ae_mean_window) / sizeof(g_ae_mean_window[0]));
+	if (g_ae_mean_window_count < (int)(sizeof(g_ae_mean_window) / sizeof(g_ae_mean_window[0])))
+		g_ae_mean_window_count++;
+}
+
+static int ae_direction_ready(int err, int deadband)
+{
+	int dir;
+	if (err > deadband)
+		dir = 1;
+	else if (err < -deadband)
+		dir = -1;
+	else {
+		g_ae_last_dir = 0;
+		g_ae_dir_count = 0;
+		return 0;
+	}
+	if (g_ae_last_dir == dir)
+		g_ae_dir_count++;
+	else {
+		g_ae_last_dir = dir;
+		g_ae_dir_count = 1;
+	}
+	if (abs(err) >= (meter_roi_active() ? 45 : 38) ||
+	    g_ae_dir_count >= (meter_roi_active() ? 2 : 1))
+		return dir;
+	return 0;
+}
+
+/* AE damps ROI changes, uses analogue gain only as a small ISO-like trim,
+ * and lets shutter/exposure participate early while power-line flicker control is
+ * active.  Anti-flicker exposure steps are coarse, so gain is still used to trim
+ * around the aligned shutter instead of hunting across several quanta. */
 static void ae_update(int mean)
 {
-	int err, step, dgain_max;
+	int err, dir, deadband, exp_step, again_step, dgain_step, dgain_max, quantum;
+	int target_exposure, requested_exposure, again_soft_max;
+	int flicker_hz, abs_err, window_avg, window_range;
+	double alpha;
 	if (!g_auto_exposure || g_ctrlfd < 0)
 		return;
+	flicker_hz = flicker_target_hz();
+	quantum = flicker_exposure_quantum_for_hz(flicker_hz);
 	g_ae_last_hi = 0;
 	if (g_ae_clip_target > 0) {
 		int hi = raw_percentile_luma(16, 995);
@@ -679,58 +1257,122 @@ static void ae_update(int mean)
 				mean = 255;
 		}
 	}
+	if (g_ae_filtered_mean < 0.0)
+		g_ae_filtered_mean = mean;
+	else {
+		alpha = meter_roi_active() ? 0.26 : 0.34;
+		if (abs(mean - (int)(g_ae_filtered_mean + 0.5)) > 70)
+			alpha = meter_roi_active() ? 0.40 : 0.50;
+		g_ae_filtered_mean = g_ae_filtered_mean * (1.0 - alpha) + mean * alpha;
+	}
+	mean = clamp_i((int)(g_ae_filtered_mean + 0.5), 0, 255);
+	ae_mean_window_push(mean);
+	window_avg = ae_mean_window_average();
+	window_range = ae_mean_window_range();
+	if (meter_roi_active() && flicker_hz && quantum <= 0 && window_avg >= 0 &&
+	    g_ae_mean_window_count >= 4 && window_range > 34)
+		mean = window_avg;
+	g_ae_last_log = mean;
 	err = g_target - mean;
-	if (err > -6 && err < 6)
+	deadband = meter_roi_active() ? 14 : 9;
+	if (meter_roi_active() && flicker_hz && quantum <= 0 && window_range > 28)
+		deadband += 8;
+	dir = ae_direction_ready(err, deadband);
+	if (!dir)
 		return;
-	/* prefer exposure, then analogue gain, then digital gain */
+
 	dgain_max = ae_dgain_max();
-	step = (g_exp_max - g_exp_min) / 16;
-	if (step < 1)
-		step = 1;
-	if (err > 0) {
-		if (g_exposure < g_exp_max) {
-			g_exposure += step * 2;
-			if (g_exposure > g_exp_max)
-				g_exposure = g_exp_max;
-			g_exposure = flicker_quantize_exposure_dir(g_exposure, 1);
-			if (set_ctrl(g_ctrlfd, V4L2_CID_EXPOSURE, g_exposure) == 0)
-				g_ae_changed = 1;
-		} else if (g_again >= 0 && g_again < g_gain_max) {
-			g_again += (g_gain_max - g_gain_min) / 16 + 1;
-			if (g_again > g_gain_max)
-				g_again = g_gain_max;
-			if (set_ctrl(g_ctrlfd, V4L2_CID_ANALOGUE_GAIN, g_again) == 0)
-				g_ae_changed = 1;
-		} else if (g_dgain >= 0 && dgain_max >= 0 && g_dgain < dgain_max) {
-			g_dgain += (g_dgain_max - g_dgain_min) / 16 + 1;
-			if (g_dgain > dgain_max)
-				g_dgain = dgain_max;
-			if (set_ctrl(g_ctrlfd, V4L2_CID_DIGITAL_GAIN, g_dgain) == 0)
-				g_ae_changed = 1;
-		}
-	} else {
-		if (g_dgain > g_dgain_min) {
-			g_dgain -= (g_dgain_max - g_dgain_min) / 16 + 1;
-			if (g_dgain < g_dgain_min)
-				g_dgain = g_dgain_min;
-			if (set_ctrl(g_ctrlfd, V4L2_CID_DIGITAL_GAIN, g_dgain) == 0)
-				g_ae_changed = 1;
-		} else if (g_again > g_gain_min) {
-			g_again -= (g_gain_max - g_gain_min) / 16 + 1;
-			if (g_again < g_gain_min)
-				g_again = g_gain_min;
-			if (set_ctrl(g_ctrlfd, V4L2_CID_ANALOGUE_GAIN, g_again) == 0)
-				g_ae_changed = 1;
-		} else if (g_exposure > g_exp_min) {
-			g_exposure -= step;
-			if (g_exposure < g_exp_min)
-				g_exposure = g_exp_min;
-			g_exposure = flicker_quantize_exposure_dir(g_exposure, -1);
-			if (set_ctrl(g_ctrlfd, V4L2_CID_EXPOSURE, g_exposure) == 0)
-				g_ae_changed = 1;
+	again_soft_max = ae_analogue_soft_max();
+	abs_err = abs(err);
+	exp_step = (g_exp_max - g_exp_min) / 36;
+	if (exp_step < 1)
+		exp_step = 1;
+	if (abs_err > 60)
+		exp_step *= meter_roi_active() ? 2 : 3;
+	else if (abs_err > 42 && !meter_roi_active())
+		exp_step *= 2;
+	else if (abs_err < 22 && exp_step > 1)
+		exp_step = (exp_step + 1) / 2;
+	again_step = (g_gain_max - g_gain_min) / 34 + 1;
+	if (abs_err > 60)
+		again_step *= meter_roi_active() ? 2 : 3;
+	else if (abs_err > 42 && !meter_roi_active())
+		again_step *= 2;
+	else if (abs_err < 22 && again_step > 1)
+		again_step = (again_step + 1) / 2;
+	dgain_step = (g_dgain_max - g_dgain_min) / 40 + 1;
+
+	if (flicker_hz && quantum > 0 && g_exposure >= 0) {
+		int preferred = flicker_preferred_exposure_for_hz(g_exposure, flicker_hz);
+		int tolerance = flicker_alignment_tolerance(quantum);
+		int can_compensate = (g_again > g_gain_min) || (g_dgain > g_dgain_min) || err > 0;
+		int not_aligned = abs(g_exposure - preferred) > tolerance;
+		if (preferred != g_exposure && not_aligned &&
+		    (err > 8 || (g_flicker_active && can_compensate)) &&
+		    (err > -40 || can_compensate)) {
+			int before = g_exposure;
+			if (apply_exposure(preferred) == 0) {
+				ae_compensate_gain_for_exposure(before, g_exposure);
+				return;
+			}
 		}
 	}
+
+	if (dir > 0) {
+		int tiny_iso_trim = err < (meter_roi_active() ? 18 : 22);
+		int exposure_can_rise;
+		target_exposure = g_exposure + exp_step;
+		requested_exposure = target_exposure;
+		if (flicker_hz && quantum > 0)
+			target_exposure = flicker_preferred_exposure_for_hz(target_exposure, flicker_hz);
+		exposure_can_rise = g_exposure < g_exp_max && target_exposure > g_exposure;
+		if (g_again >= 0 && again_soft_max >= 0 && g_again < again_soft_max &&
+		    ((!flicker_hz && tiny_iso_trim) || !exposure_can_rise)) {
+			if (apply_analogue_gain(g_again + again_step) == 0)
+				return;
+		}
+		if (exposure_can_rise && apply_exposure(target_exposure) == 0) {
+			if (target_exposure > requested_exposure)
+				ae_compensate_gain_for_exposure(requested_exposure, target_exposure);
+			return;
+		}
+		if (g_again >= 0 && g_again < g_gain_max && err > 42 &&
+		    apply_analogue_gain(g_again + again_step) == 0)
+			return;
+		if (g_dgain >= 0 && dgain_max >= 0 && g_dgain < dgain_max && err > 70)
+			apply_digital_gain(g_dgain + dgain_step);
+	} else {
+		int exposure_should_fall = g_exposure > g_exp_min &&
+			(err < -38 || g_ae_dir_count >= (meter_roi_active() ? 2 : 3));
+		if (meter_roi_active() && flicker_hz && quantum <= 0 && window_range > 28 &&
+		    err > -80 && g_exposure < g_exp_max)
+			exposure_should_fall = 0;
+		if (ae_try_reduce_digital(dgain_step))
+			return;
+		if (!exposure_should_fall && ae_try_reduce_analogue(again_step))
+			return;
+		if (exposure_should_fall) {
+			target_exposure = g_exposure - exp_step;
+			if (err < -80)
+				target_exposure -= exp_step;
+			if (flicker_hz && quantum > 0) {
+				int before_quantize = target_exposure;
+				target_exposure = flicker_quantize_exposure_for_hz(target_exposure, -1, flicker_hz);
+				if (target_exposure >= g_exposure) {
+					int next = g_exposure - (quantum > exp_step ? quantum : exp_step);
+					target_exposure = flicker_quantize_exposure_for_hz(next, -1, flicker_hz);
+				}
+				if (target_exposure <= g_exp_min && before_quantize > g_exp_min)
+					target_exposure = g_exp_min;
+			}
+			if (target_exposure < g_exposure && apply_exposure(target_exposure) == 0)
+				return;
+		}
+		if (ae_try_reduce_analogue(again_step))
+			return;
+	}
 }
+
 
 static void tone_update(int mean)
 {
@@ -1761,7 +2403,10 @@ static int lmi_mjpeg_encode_bayer_direct420_threaded(uint8_t *dst, size_t cap,
 	hdr.cap = cap;
 	lmi_jpeg_make_qtable(qy, lmi_jpeg_q_luma_base, quality);
 	lmi_jpeg_make_qtable(qc, lmi_jpeg_q_chroma_base, quality);
-	lmi_jpeg_restart_interval = mcu_w * ((mcu_h + nthreads - 1) / nthreads);
+	if (nthreads > 1)
+		lmi_jpeg_restart_interval = mcu_w * ((mcu_h + nthreads - 1) / nthreads);
+	else
+		lmi_jpeg_restart_interval = 0;
 	lmi_jpeg_emit_header(&hdr, width, height, 0x22, qy, qc);
 	lmi_jpeg_restart_interval = 0;
 	if (hdr.err)
@@ -2731,6 +3376,53 @@ static void draw_motion_overlay_nv12(void)
 	g_motion_overlay_seq++;
 }
 
+/* Map a physical (rotated) YUYV output pixel back to the logical (pre-rotation)
+ * output pixel, so rotation folds into the existing source-coordinate sampling
+ * with no extra full-frame buffer.  90 == counter-clockwise. */
+static inline void rot_logical(int tx, int ty, int *lx, int *ly)
+{
+	switch (g_rotate) {
+	case 90:	/* CCW */
+		*lx = g_logical_w - 1 - ty;
+		*ly = tx;
+		break;
+	case 270:	/* CW */
+		*lx = ty;
+		*ly = g_logical_h - 1 - tx;
+		break;
+	case 180:
+		*lx = g_logical_w - 1 - tx;
+		*ly = g_logical_h - 1 - ty;
+		break;
+	default:
+		*lx = tx;
+		*ly = ty;
+		break;
+	}
+}
+
+/* Motion-gated temporal denoise on the packed YUYV frame.  Static regions blend
+ * with the previous frame (knocks down low-light sensor noise); regions that
+ * moved beyond the threshold keep the current sample so motion does not ghost. */
+static void denoise_yuyv(void)
+{
+	int n, i, a, b;
+	if (g_denoise <= 0 || g_nv12 || g_mjpeg || !g_prev_frame)
+		return;
+	a = g_denoise > 100 ? 100 : g_denoise;
+	b = 100 - a;
+	n = g_out_stride * g_out_h;
+	for (i = 0; i < n; i++) {
+		int cur = g_frame[i];
+		int prv = g_prev_frame[i];
+		int out = (abs(cur - prv) < g_denoise_thresh)
+			? (cur * b + prv * a + 50) / 100
+			: cur;
+		g_frame[i] = (uint8_t)out;
+		g_prev_frame[i] = (uint8_t)out;
+	}
+}
+
 static long pack_output(double rgain, double bgain)
 {
 	int ow = g_out_w, oh = g_out_h;
@@ -2951,14 +3643,18 @@ static long pack_output(double rgain, double bgain)
 	/* YUYV */
 	(void)aw;
 	for (ty = 0; ty < oh; ty++) {
-		int sy = source_view_coord_scaled(ty, oh, g_src_h, g_src_y);
 		uint8_t *row = g_frame + (size_t)ty * g_out_stride;
 		for (tx = 0; tx < ow; tx += 2) {
-			int sx0 = source_view_coord_scaled(tx, ow, g_src_w, g_src_x);
-			int sx1 = source_view_coord_scaled(tx + 1, ow, g_src_w, g_src_x);
+			int lx0, ly0, lx1, ly1;
+			rot_logical(tx, ty, &lx0, &ly0);
+			rot_logical(tx + 1, ty, &lx1, &ly1);
+			int sx0 = source_view_coord_scaled(lx0, g_logical_w, g_src_w, g_src_x);
+			int sy0 = source_view_coord_scaled(ly0, g_logical_h, g_src_h, g_src_y);
+			int sx1 = source_view_coord_scaled(lx1, g_logical_w, g_src_w, g_src_x);
+			int sy1 = source_view_coord_scaled(ly1, g_logical_h, g_src_h, g_src_y);
 			int R0, Gg0, Bb0, R1, Gg1, Bb1;
-			demosaic_at(sx0, sy, rgain, bgain, &R0, &Gg0, &Bb0);
-			demosaic_at(sx1, sy, rgain, bgain, &R1, &Gg1, &Bb1);
+			demosaic_at(sx0, sy0, rgain, bgain, &R0, &Gg0, &Bb0);
+			demosaic_at(sx1, sy1, rgain, bgain, &R1, &Gg1, &Bb1);
 			int Y0 = (77 * R0 + 150 * Gg0 + 29 * Bb0) >> 8;
 			int Y1 = (77 * R1 + 150 * Gg1 + 29 * Bb1) >> 8;
 			int ar = (R0 + R1) >> 1, ag = (Gg0 + Gg1) >> 1, ab = (Bb0 + Bb1) >> 1;
@@ -2972,6 +3668,7 @@ static long pack_output(double rgain, double bgain)
 			lumasum += Y0 + Y1;
 		}
 	}
+	denoise_yuyv();
 	return lumasum / ((long)ow * oh);
 }
 
@@ -3100,9 +3797,30 @@ static int write_all_nonblock(int fd, const uint8_t *data, size_t len)
 
 static int out_open(void)
 {
+	if (g_rotate != 0 && g_rotate != 90 && g_rotate != 180 && g_rotate != 270) {
+		ilog("ignoring unsupported --rotate %d (only 0/90/180/270)", g_rotate);
+		g_rotate = 0;
+	}
+	if (g_rotate && (g_nv12 || g_mjpeg)) {
+		ilog("--rotate only applies to the YUYV loopback path; ignoring for nv12/mjpeg");
+		g_rotate = 0;
+	}
+	/* The parsed --out-width/height is the LOGICAL (pre-rotation) frame the source
+	 * sampling maps into; 90/270 swap W/H for the physical loopback frame. */
+	g_logical_w = g_out_w & ~1;
+	g_logical_h = (g_nv12 || g_mjpeg) ? (g_out_h & ~1) : g_out_h;
+	if (g_rotate == 90 || g_rotate == 270) {
+		g_out_w = g_logical_h;
+		g_out_h = g_logical_w;
+	} else {
+		g_out_w = g_logical_w;
+		g_out_h = g_logical_h;
+	}
 	g_out_w &= ~1;
 	if (g_nv12 || g_mjpeg)
 		g_out_h &= ~1;
+	ilog("orientation: rotate=%d (logical %dx%d -> frame %dx%d) denoise=%d/thr%d",
+		 g_rotate, g_logical_w, g_logical_h, g_out_w, g_out_h, g_denoise, g_denoise_thresh);
 	if (g_mjpeg) {
 		g_out_stride = g_out_w * 3;
 		g_out_size = g_out_stride * g_out_h;
@@ -3305,6 +4023,9 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--frames") && i + 1 < argc) g_dump_frames = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--out-width") && i + 1 < argc) g_out_w = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--out-height") && i + 1 < argc) g_out_h = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--rotate") && i + 1 < argc) g_rotate = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--denoise") && i + 1 < argc) g_denoise = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--denoise-threshold") && i + 1 < argc) g_denoise_thresh = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--nv12")) g_nv12 = 1;
 		else if (!strcmp(argv[i], "--mjpeg")) g_mjpeg = 1;
 		else if (!strcmp(argv[i], "--mjpeg-quality") && i + 1 < argc) g_mjpeg_quality = atoi(argv[++i]);
@@ -3497,6 +4218,8 @@ int main(int argc, char **argv)
 	g_bayer = malloc((size_t)g_raw_w * g_raw_h * sizeof(uint16_t));
 	if (out_open() < 0) return 1;
 	g_frame = calloc(1, g_out_size);
+	if (g_denoise > 0 && !g_nv12 && !g_mjpeg)
+		g_prev_frame = calloc(1, g_out_size);
 	if (g_mjpeg) {
 		uint8_t *jpeg_alloc = malloc((size_t)g_max_frame_bytes + sizeof(struct lmi_uvc_record_header));
 		if (jpeg_alloc)
@@ -3639,10 +4362,16 @@ int main(int argc, char **argv)
 		out_write();
 		clock_gettime(CLOCK_MONOTONIC, &t_out);
 
-		if (g_auto_exposure && (++ae_div % 3) == 0) {
-			g_ae_last_log = raw_mean_luma();
-			tone_update(g_ae_last_log);
-			ae_update(g_ae_last_log);
+		if ((g_auto_exposure || g_flicker_mode == FLICKER_MODE_AUTO) && (++ae_div % 3) == 0) {
+			if (g_flicker_mode == FLICKER_MODE_AUTO) {
+				struct flicker_stats st = flicker_analyze_frame();
+				flicker_update_state(&st);
+			}
+			if (g_auto_exposure) {
+				g_ae_last_log = raw_mean_luma();
+				tone_update(g_ae_last_log);
+				ae_update(g_ae_last_log);
+			}
 		}
 		clock_gettime(CLOCK_MONOTONIC, &t_ae);
 

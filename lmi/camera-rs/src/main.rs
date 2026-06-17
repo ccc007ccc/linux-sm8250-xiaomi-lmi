@@ -6,6 +6,7 @@ mod fourcc;
 mod isp;
 mod media;
 mod native_modes;
+mod network_runtime;
 mod pipeline;
 mod route;
 mod uvc;
@@ -77,7 +78,10 @@ fn run() -> io::Result<()> {
         }
         Some("run") => {
             let rest: Vec<String> = args.collect();
-            if uvc_runtime::looks_like_native_uvc_run(&rest) {
+            if network_runtime::looks_like_network_run(&rest) {
+                let config = network_runtime::parse_network_run_config(rest.into_iter())?;
+                network_runtime::run_network(config)
+            } else if uvc_runtime::looks_like_native_uvc_run(&rest) {
                 let config = uvc_runtime::parse_native_uvc_run_config(rest.into_iter())?;
                 uvc_runtime::run_native_uvc(config)
             } else {
@@ -149,6 +153,10 @@ fn usage() {
     println!("  run            run supervised local-loopback C ISP backend");
     println!("  run --output uvc --profile native-modes");
     println!("                 run default Rust/C UVC demand-start native six-mode backend");
+    println!(
+        "  run --output network --profile native-modes --frame-index 6 --listen 127.0.0.1:8080"
+    );
+    println!("                 run opt-in MJPEG-over-HTTP native-mode network camera backend");
     println!("  uvc-status     inspect UVC configfs frames; --codec h264 checks framebased H.264");
     println!("  pipeline-plan  print multithreaded performance pipeline plan");
     println!();
@@ -158,6 +166,8 @@ fn usage() {
     println!("  run also accepts --route-size WxH, sensor controls, and setup-route media options");
     println!();
     uvc_runtime::print_native_uvc_run_usage();
+    println!();
+    network_runtime::print_network_run_usage();
     println!();
     route::print_setup_route_usage();
     capture::print_capture_raw_usage();
@@ -548,6 +558,27 @@ fn run_local_loopback(mut config: LocalLoopbackRunConfig) -> io::Result<()> {
         return Err(invalid_input(
             "sensor controls requested but no control subdev is known; pass --ctrl or enable route setup",
         ));
+    }
+
+    // Orientation is owned by the kernel: consume the sensor rotation metadata
+    // (DTS `rotation`, exposed as V4L2_CID_CAMERA_SENSOR_ROTATION) and let the
+    // ISP rotate the loopback upright.  An explicit --rotate on the CLI wins.
+    if config.profile.rotate == 0 {
+        if let Some(ctrl) = config.profile.ctrl_node.as_deref() {
+            match controls::read_sensor_rotation(ctrl) {
+                Ok(Some(deg)) => {
+                    let norm = ((deg % 360) + 360) % 360;
+                    if matches!(norm, 0 | 90 | 180 | 270) {
+                        config.profile.rotate = norm as u32;
+                        println!("sensor_rotation_metadata={} -> isp --rotate {}", deg, norm);
+                    } else {
+                        println!("sensor_rotation_metadata={} not a right angle; not rotating", deg);
+                    }
+                }
+                Ok(None) => println!("sensor_rotation_metadata=absent; not rotating"),
+                Err(err) => println!("sensor_rotation_metadata read failed: {err}; not rotating"),
+            }
+        }
     }
 
     println!("starting local-loopback C ISP backend");

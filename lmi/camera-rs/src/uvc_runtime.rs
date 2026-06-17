@@ -803,13 +803,25 @@ struct UvcRoiSet {
     auto_controls: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RuntimeControls {
     auto_exposure: Option<bool>,
     exposure_absolute: Option<i32>,
     gain: Option<i32>,
     flicker: Option<&'static str>,
     roi: Option<UvcRoiSet>,
+}
+
+impl Default for RuntimeControls {
+    fn default() -> Self {
+        Self {
+            auto_exposure: None,
+            exposure_absolute: None,
+            gain: None,
+            flicker: Some("auto"),
+            roi: None,
+        }
+    }
 }
 
 impl RuntimeControls {
@@ -835,12 +847,16 @@ impl RuntimeControls {
                 ])
             }
             "gain" => {
-                self.auto_exposure = Some(false);
                 self.gain = Some(control.value);
-                Some(vec![
-                    "auto_exposure=0".to_string(),
-                    format!("gain={}", control.value),
-                ])
+                if self.auto_exposure == Some(false) {
+                    Some(vec![format!("gain={}", control.value)])
+                } else {
+                    self.auto_exposure = Some(true);
+                    Some(vec![
+                        "auto_exposure=1".to_string(),
+                        format!("gain={}", control.value),
+                    ])
+                }
             }
             "power_line_frequency" => {
                 let value = match control.value {

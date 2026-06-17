@@ -52,6 +52,12 @@ pub struct LocalLoopbackProfile {
     pub max_soft_gain: f32,
     pub auto_exposure: bool,
     pub ae_target: u32,
+    /// Counter-clockwise rotation applied by the ISP to present the loopback
+    /// upright.  Sourced from the kernel sensor `rotation` metadata
+    /// (V4L2_CID_CAMERA_SENSOR_ROTATION), not chosen by the ISP.
+    pub rotate: u32,
+    /// Motion-gated temporal denoise strength (0..100) for the YUYV loopback.
+    pub denoise: u32,
     pub pipeline: PipelinePlan,
 }
 
@@ -72,6 +78,8 @@ impl Default for LocalLoopbackProfile {
             max_soft_gain: 4.0,
             auto_exposure: true,
             ae_target: 110,
+            rotate: 0,
+            denoise: 35,
             pipeline: PipelinePlan::performance_default(),
         }
     }
@@ -95,6 +103,8 @@ impl LocalLoopbackProfile {
         println!("max_soft_gain={:.2}", self.max_soft_gain);
         println!("auto_exposure_requested={}", yes_no(self.auto_exposure));
         println!("ae_target={}", self.ae_target);
+        println!("rotate={} (from kernel sensor rotation metadata)", self.rotate);
+        println!("denoise={}", self.denoise);
         match &self.ctrl_node {
             Some(ctrl) => println!("ctrl_node={}", ctrl.display()),
             None => println!("ctrl_node=auto-discovery-planned"),

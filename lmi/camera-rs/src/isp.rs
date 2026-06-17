@@ -87,6 +87,18 @@ impl IspCommand {
             args.push(profile.ae_target.to_string());
         }
 
+        // Orientation is owned by the kernel: profile.rotate carries the sensor
+        // rotation metadata, applied here so the loopback is upright (libcamera
+        // does the same software rotate from the same metadata).
+        if profile.rotate != 0 {
+            args.push("--rotate".to_string());
+            args.push(profile.rotate.to_string());
+        }
+        if profile.denoise != 0 {
+            args.push("--denoise".to_string());
+            args.push(profile.denoise.to_string());
+        }
+
         Self {
             program: profile.isp_bin.clone(),
             args,

@@ -341,6 +341,24 @@ fn set_control_raw(fd: c_int, id: u32, value: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// V4L2_CID_CAMERA_SENSOR_ROTATION: kernel-declared sensor mounting rotation
+/// (from DTS `rotation`).  Orientation is owned by the kernel; the loopback ISP
+/// only consumes this value.
+pub const V4L2_CID_CAMERA_SENSOR_ROTATION: u32 = 0x009a_0923;
+
+/// Read the sensor rotation metadata from a sensor subdev.  Returns Ok(None) if
+/// the control is not implemented (so callers fall back to no rotation).
+pub fn read_sensor_rotation(path: &Path) -> io::Result<Option<i32>> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    match get_control_raw(file.as_raw_fd(), V4L2_CID_CAMERA_SENSOR_ROTATION) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) => match err.raw_os_error() {
+            Some(EINVAL) | Some(ENOTTY) => Ok(None),
+            _ => Err(err),
+        },
+    }
+}
+
 fn known_control(id: u32) -> Option<KnownControl> {
     KNOWN_CONTROLS.iter().copied().find(|known| known.id == id)
 }

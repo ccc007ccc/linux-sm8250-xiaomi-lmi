@@ -1,0 +1,485 @@
+#!/bin/sh
+# lmi PipeWire-Pulse audio helper for Redmi K30 Pro / POCO F2 Pro.
+# Exposes stable logical Pulse/PipeWire devices and switches ALSA mixer routes.
+
+set -eu
+
+CARD=${LMI_AUDIO_CARD:-0}
+RATE=${LMI_AUDIO_RATE:-48000}
+PERIOD=${LMI_AUDIO_PERIOD:-480}
+BUFFER=${LMI_AUDIO_BUFFER:-960}
+RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+PULSE_SERVER=${PULSE_SERVER:-unix:$RUNTIME_DIR/pulse/native}
+BASE=${LMI_AUDIO_RUNTIME_DIR:-$RUNTIME_DIR/lmi-audio}
+MODULE_DIR=$BASE/modules
+PLAYBACK_PID=$BASE/playback-bridge.pid
+CAPTURE_PID=$BASE/capture-bridge.pid
+WATCH_PID=$BASE/route-watch.pid
+STATE_PLAYBACK=$BASE/playback.mode
+STATE_CAPTURE=$BASE/capture.mode
+
+export PULSE_SERVER
+
+mkdir -p "$BASE" "$MODULE_DIR"
+
+log() {
+	printf '%s\n' "$*" >&2
+}
+
+ctl() {
+	amixer -q -c "$CARD" cset name="$1" "$2" >/dev/null 2>&1 || true
+}
+
+fifo_path() {
+	case "$1" in
+		speaker) printf '%s/speaker.fifo' "$BASE" ;;
+		earpiece) printf '%s/earpiece.fifo' "$BASE" ;;
+		virtual) printf '%s/virtual-speaker.fifo' "$BASE" ;;
+		bottom) printf '%s/bottom-mic.fifo' "$BASE" ;;
+		top) printf '%s/top-mic.fifo' "$BASE" ;;
+		stereo) printf '%s/stereo-mic.fifo' "$BASE" ;;
+		*) return 1 ;;
+	esac
+}
+
+ensure_fifo() {
+	path=$1
+	if [ -e "$path" ] && [ ! -p "$path" ]; then
+		log "refusing to replace non-fifo: $path"
+		return 1
+	fi
+	[ -p "$path" ] || mkfifo "$path"
+}
+
+playback_off() {
+	for mm in 1 2 3; do
+		ctl "PRI_MI2S_RX Audio Mixer MultiMedia$mm" 0
+		ctl "RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia$mm" 0
+	done
+	ctl 'WSA_CODEC_DMA_RX_0 Audio Mixer MultiMedia1' 0
+	ctl 'WSA_CODEC_DMA_RX_1 Audio Mixer MultiMedia1' 0
+	ctl 'AUX_RDAC Switch' 0
+	ctl 'EAR_RDAC Switch' 0
+	ctl 'RX_EAR Mode Switch' 0
+}
+
+playback_earpiece_controls() {
+	ctl 'RX_RX0 Digital Volume' 124
+	ctl 'RX_RX0 Mix Digital Volume' 124
+	ctl 'RX_RX1 Digital Volume' 124
+	ctl 'RX_RX1 Mix Digital Volume' 124
+	ctl 'RX_RX2 Digital Volume' 124
+	ctl 'RX_RX2 Mix Digital Volume' 124
+	ctl 'EAR_PA Volume' 16
+	ctl 'RX_MACRO RX0 MUX' AIF1_PB
+	ctl 'RX_MACRO RX3 MUX' AIF1_PB
+	ctl 'RX INT2_1 MIX1 INP0' RX0
+	ctl 'RX INT2_1 MIX1 INP1' ZERO
+	ctl 'RX INT2_1 MIX1 INP2' ZERO
+	ctl 'RX INT2_1 INTERP' 'RX INT2_1 MIX1'
+	ctl 'RDAC3_MUX' RX3
+	ctl 'AUX_RDAC Switch' 1
+	ctl 'EAR_RDAC Switch' 1
+	ctl 'RX_EAR Mode Switch' 1
+}
+
+playback_speaker() {
+	playback_off
+	ctl 'PRI_MI2S_RX Audio Mixer MultiMedia1' 1
+}
+
+playback_earpiece() {
+	playback_off
+	playback_earpiece_controls
+	ctl 'RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia1' 1
+}
+
+playback_virtual() {
+	playback_off
+	playback_earpiece_controls
+	ctl 'PRI_MI2S_RX Audio Mixer MultiMedia1' 1
+	ctl 'RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia2' 1
+}
+
+capture_off() {
+	ctl 'MultiMedia3 Mixer TX_CODEC_DMA_TX_3' 0
+	ctl 'TX_AIF1_CAP Mixer DEC0' 0
+	ctl 'TX_AIF1_CAP Mixer DEC1' 0
+	ctl 'ADC1 Switch' 0
+	ctl 'ADC1_MIXER Switch' 0
+	ctl 'ADC4 Switch' 0
+	ctl 'ADC4_MIXER Switch' 0
+}
+
+capture_bottom() {
+	capture_off
+	ctl 'ADC1 Volume' 20
+	ctl 'TX DEC0 MUX' SWR_MIC
+	ctl 'TX SMIC MUX0' ADC0
+	ctl 'ADC1 Switch' 1
+	ctl 'ADC1_MIXER Switch' 1
+	ctl 'TX_AIF1_CAP Mixer DEC0' 1
+	ctl 'MultiMedia3 Mixer TX_CODEC_DMA_TX_3' 1
+}
+
+capture_top() {
+	capture_off
+	ctl 'ADC4 Volume' 20
+	ctl 'ADC4 MUX' INP5
+	ctl 'TX DEC0 MUX' SWR_MIC
+	ctl 'TX SMIC MUX0' ADC3
+	ctl 'ADC4 Switch' 1
+	ctl 'ADC4_MIXER Switch' 1
+	ctl 'TX_AIF1_CAP Mixer DEC0' 1
+	ctl 'MultiMedia3 Mixer TX_CODEC_DMA_TX_3' 1
+}
+
+capture_stereo() {
+	capture_off
+	ctl 'ADC1 Volume' 20
+	ctl 'ADC4 Volume' 20
+	ctl 'ADC4 MUX' INP5
+	ctl 'TX DEC0 MUX' SWR_MIC
+	ctl 'TX DEC1 MUX' SWR_MIC
+	ctl 'TX SMIC MUX0' ADC0
+	ctl 'TX SMIC MUX1' ADC3
+	ctl 'ADC1 Switch' 1
+	ctl 'ADC1_MIXER Switch' 1
+	ctl 'ADC4 Switch' 1
+	ctl 'ADC4_MIXER Switch' 1
+	ctl 'TX_AIF1_CAP Mixer DEC0' 1
+	ctl 'TX_AIF1_CAP Mixer DEC1' 1
+	ctl 'MultiMedia3 Mixer TX_CODEC_DMA_TX_3' 1
+}
+
+cmdline_contains() {
+	pid=$1
+	needle=$2
+	[ -r "/proc/$pid/cmdline" ] || return 1
+	tr '\0' ' ' < "/proc/$pid/cmdline" | grep -F -- "$needle" >/dev/null 2>&1
+}
+
+stop_pidfile() {
+	pidfile=$1
+	needle=$2
+	[ -s "$pidfile" ] || return 0
+	pid=$(cat "$pidfile" 2>/dev/null || true)
+	case "$pid" in
+		''|*[!0-9]*) rm -f "$pidfile"; return 0 ;;
+	esac
+	if kill -0 "$pid" 2>/dev/null; then
+		if cmdline_contains "$pid" "$needle"; then
+			kill "$pid" 2>/dev/null || true
+			for _ in 1 2 3 4 5; do
+				kill -0 "$pid" 2>/dev/null || break
+				sleep 0.2
+			done
+			if kill -0 "$pid" 2>/dev/null && cmdline_contains "$pid" "$needle"; then
+				kill -KILL "$pid" 2>/dev/null || true
+			fi
+		else
+			log "refusing to stop pid $pid from $pidfile: cmdline mismatch"
+		fi
+	fi
+	rm -f "$pidfile"
+}
+
+stop_playback_bridge() {
+	stop_pidfile "$PLAYBACK_PID" 'lmi-audio-pulse-setup --playback-bridge'
+	playback_off
+	rm -f "$STATE_PLAYBACK"
+}
+
+stop_capture_bridge() {
+	stop_pidfile "$CAPTURE_PID" 'lmi-audio-pulse-setup --capture-bridge'
+	capture_off
+	rm -f "$STATE_CAPTURE"
+}
+
+write_pid() {
+	pidfile=$1
+	needle=$2
+	if [ -s "$pidfile" ]; then
+		old=$(cat "$pidfile" 2>/dev/null || true)
+		case "$old" in
+			''|*[!0-9]*) ;;
+			*)
+				if kill -0 "$old" 2>/dev/null && cmdline_contains "$old" "$needle"; then
+					log "already running: $pidfile pid $old"
+					exit 0
+				fi
+				;;
+		esac
+	fi
+	printf '%s\n' "$$" > "$pidfile"
+}
+
+playback_bridge() {
+	mode=$1
+	write_pid "$PLAYBACK_PID" "lmi-audio-pulse-setup --playback-bridge $mode"
+	fifo=$(fifo_path "$mode")
+	ensure_fifo "$fifo"
+	case "$mode" in
+		speaker) playback_speaker ;;
+		earpiece) playback_earpiece ;;
+		virtual) playback_virtual ;;
+		*) log "unknown playback bridge: $mode"; exit 2 ;;
+	esac
+	printf '%s\n' "$mode" > "$STATE_PLAYBACK"
+	trap 'rm -f "$PLAYBACK_PID" "$STATE_PLAYBACK"; playback_off; [ -n "${child:-}" ] && kill "$child" 2>/dev/null || true; exit 0' INT TERM EXIT
+	python3 - "$fifo" "$mode" "$RATE" "$PERIOD" "$BUFFER" <<'PY' &
+import os, signal, subprocess, sys
+fifo, mode, rate, period, buffer = sys.argv[1:6]
+
+def run_aplay(device, channels):
+    return subprocess.Popen([
+        'aplay', '-q', '-D', device, '-f', 'S16_LE', '-r', rate, '-c', str(channels),
+        '--period-size=' + period, '--buffer-size=' + buffer, '-t', 'raw', '-'
+    ], stdin=subprocess.PIPE)
+
+children = []
+try:
+    if mode == 'speaker':
+        p = run_aplay('plughw:0,0', 2)
+        children.append(p)
+        with open(fifo, 'rb', buffering=0) as f:
+            while True:
+                data = f.read(4096)
+                if not data:
+                    break
+                if len(data) & 1:
+                    data = data[:-1]
+                out = bytearray(len(data) * 2)
+                out[0::4] = data[0::2]
+                out[1::4] = data[1::2]
+                out[2::4] = data[0::2]
+                out[3::4] = data[1::2]
+                p.stdin.write(out)
+                p.stdin.flush()
+    elif mode == 'earpiece':
+        p = run_aplay('plughw:0,0', 1)
+        children.append(p)
+        with open(fifo, 'rb', buffering=0) as f:
+            while True:
+                data = f.read(4096)
+                if not data:
+                    break
+                p.stdin.write(data)
+                p.stdin.flush()
+    elif mode == 'virtual':
+        left = run_aplay('plughw:0,1', 1)
+        right = run_aplay('plughw:0,0', 2)
+        children.extend([left, right])
+        with open(fifo, 'rb', buffering=0) as f:
+            while True:
+                data = f.read(4096)
+                if not data:
+                    break
+                if len(data) < 4:
+                    continue
+                data = data[:len(data) - (len(data) % 4)]
+                l = bytearray(len(data) // 2)
+                rmono = bytearray(len(data) // 2)
+                l[0::2] = data[0::4]
+                l[1::2] = data[1::4]
+                rmono[0::2] = data[2::4]
+                rmono[1::2] = data[3::4]
+                rstereo = bytearray(len(rmono) * 2)
+                rstereo[0::4] = rmono[0::2]
+                rstereo[1::4] = rmono[1::2]
+                rstereo[2::4] = rmono[0::2]
+                rstereo[3::4] = rmono[1::2]
+                left.stdin.write(l); left.stdin.flush()
+                right.stdin.write(rstereo); right.stdin.flush()
+finally:
+    for p in children:
+        try:
+            if p.stdin:
+                p.stdin.close()
+        except Exception:
+            pass
+    for p in children:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    for p in children:
+        try:
+            p.wait(timeout=1)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+PY
+	child=$!
+	wait "$child"
+}
+
+capture_bridge() {
+	mode=$1
+	write_pid "$CAPTURE_PID" "lmi-audio-pulse-setup --capture-bridge $mode"
+	fifo=$(fifo_path "$mode")
+	ensure_fifo "$fifo"
+	case "$mode" in
+		bottom) capture_bottom; channels=1 ;;
+		top) capture_top; channels=1 ;;
+		stereo) capture_stereo; channels=2 ;;
+		*) log "unknown capture bridge: $mode"; exit 2 ;;
+	esac
+	printf '%s\n' "$mode" > "$STATE_CAPTURE"
+	trap 'rm -f "$CAPTURE_PID" "$STATE_CAPTURE"; capture_off; [ -n "${child:-}" ] && kill "$child" 2>/dev/null || true; exit 0' INT TERM EXIT
+	arecord -q -D hw:0,2 -f S16_LE -r "$RATE" -c "$channels" \
+		--period-size="$PERIOD" --buffer-size="$BUFFER" -t raw "$fifo" &
+	child=$!
+	wait "$child"
+}
+
+load_module_once() {
+	name=$1
+	kind=$2
+	channels=$3
+	desc=$4
+	fifo=$5
+	module_file=$MODULE_DIR/$name.module
+	if pactl list short "$kind" 2>/dev/null | awk '{print $2}' | grep -Fx "$name" >/dev/null 2>&1; then
+		return 0
+	fi
+	if [ "$kind" = sinks ]; then
+		id=$(pactl load-module module-pipe-sink "sink_name=$name" "file=$fifo" "format=s16le" "rate=$RATE" "channels=$channels" "sink_properties=device.description=$desc,device.class=sound" )
+	else
+		id=$(pactl load-module module-pipe-source "source_name=$name" "file=$fifo" "format=s16le" "rate=$RATE" "channels=$channels" "source_properties=device.description=$desc,device.class=sound" )
+	fi
+	printf '%s\n' "$id" > "$module_file"
+}
+
+setup_pulse() {
+	command -v pactl >/dev/null 2>&1 || { log 'pactl not found; install pipewire-pulse or pulseaudio-utils'; exit 1; }
+	command -v amixer >/dev/null 2>&1 || { log 'amixer not found; install alsa-utils'; exit 1; }
+	command -v aplay >/dev/null 2>&1 || { log 'aplay not found; install alsa-utils'; exit 1; }
+	command -v arecord >/dev/null 2>&1 || { log 'arecord not found; install alsa-utils'; exit 1; }
+	command -v python3 >/dev/null 2>&1 || { log 'python3 not found'; exit 1; }
+
+	for f in speaker earpiece virtual bottom top stereo; do
+		ensure_fifo "$(fifo_path "$f")"
+	done
+
+	load_module_once lmi_speaker sinks 1 LMI-Speaker "$(fifo_path speaker)"
+	load_module_once lmi_earpiece sinks 1 LMI-Earpiece "$(fifo_path earpiece)"
+	load_module_once lmi_virtual_speaker sinks 2 LMI-Virtual-Speaker "$(fifo_path virtual)"
+	load_module_once lmi_bottom_mic sources 1 LMI-Bottom-Mic "$(fifo_path bottom)"
+	load_module_once lmi_top_mic sources 1 LMI-Top-Mic "$(fifo_path top)"
+	load_module_once lmi_stereo_mic sources 2 LMI-Stereo-Mic "$(fifo_path stereo)"
+
+	pactl set-default-sink lmi_speaker >/dev/null 2>&1 || true
+	pactl set-default-source lmi_bottom_mic >/dev/null 2>&1 || true
+
+	if ! [ -s "$WATCH_PID" ] || ! kill -0 "$(cat "$WATCH_PID" 2>/dev/null || printf 0)" 2>/dev/null; then
+		"$0" --watch-routes >/dev/null 2>&1 &
+	fi
+}
+
+sink_to_mode() {
+	case "$1" in
+		lmi_speaker) printf speaker ;;
+		lmi_earpiece) printf earpiece ;;
+		lmi_virtual_speaker) printf virtual ;;
+		*) printf '' ;;
+	esac
+}
+
+source_to_mode() {
+	case "$1" in
+		lmi_bottom_mic) printf bottom ;;
+		lmi_top_mic) printf top ;;
+		lmi_stereo_mic) printf stereo ;;
+		*) printf '' ;;
+	esac
+}
+
+ensure_playback_mode() {
+	mode=$1
+	[ -n "$mode" ] || return 0
+	current=$(cat "$STATE_PLAYBACK" 2>/dev/null || true)
+	if [ "$current" = "$mode" ] && [ -s "$PLAYBACK_PID" ] && kill -0 "$(cat "$PLAYBACK_PID")" 2>/dev/null; then
+		return 0
+	fi
+	stop_playback_bridge
+	"$0" --playback-bridge "$mode" >/dev/null 2>&1 &
+}
+
+ensure_capture_mode() {
+	mode=$1
+	[ -n "$mode" ] || return 0
+	current=$(cat "$STATE_CAPTURE" 2>/dev/null || true)
+	if [ "$current" = "$mode" ] && [ -s "$CAPTURE_PID" ] && kill -0 "$(cat "$CAPTURE_PID")" 2>/dev/null; then
+		return 0
+	fi
+	stop_capture_bridge
+	"$0" --capture-bridge "$mode" >/dev/null 2>&1 &
+}
+
+watch_routes() {
+	write_pid "$WATCH_PID" 'lmi-audio-pulse-setup --watch-routes'
+	trap 'rm -f "$WATCH_PID"; stop_playback_bridge; stop_capture_bridge; exit 0' INT TERM EXIT
+	last_sink=
+	last_source=
+	while :; do
+		sink=$(pactl get-default-sink 2>/dev/null || true)
+		source=$(pactl get-default-source 2>/dev/null || true)
+		if [ "$sink" != "$last_sink" ]; then
+			ensure_playback_mode "$(sink_to_mode "$sink")"
+			last_sink=$sink
+		fi
+		if [ "$source" != "$last_source" ]; then
+			ensure_capture_mode "$(source_to_mode "$source")"
+			last_source=$source
+		fi
+		sleep 1
+	done
+}
+
+unload_modules() {
+	for name in lmi_speaker lmi_earpiece lmi_virtual_speaker lmi_bottom_mic lmi_top_mic lmi_stereo_mic; do
+		file=$MODULE_DIR/$name.module
+		if [ -s "$file" ]; then
+			pactl unload-module "$(cat "$file")" >/dev/null 2>&1 || true
+			rm -f "$file"
+		fi
+	done
+}
+
+stop_all() {
+	stop_pidfile "$WATCH_PID" 'lmi-audio-pulse-setup --watch-routes'
+	stop_playback_bridge
+	stop_capture_bridge
+	unload_modules
+	playback_off
+	capture_off
+}
+
+status() {
+	printf 'runtime=%s\n' "$BASE"
+	printf 'default_sink=%s\n' "$(pactl get-default-sink 2>/dev/null || true)"
+	printf 'default_source=%s\n' "$(pactl get-default-source 2>/dev/null || true)"
+	printf 'playback=%s\n' "$(cat "$STATE_PLAYBACK" 2>/dev/null || true)"
+	printf 'capture=%s\n' "$(cat "$STATE_CAPTURE" 2>/dev/null || true)"
+	pactl list short sinks 2>/dev/null | grep -E 'lmi_(speaker|earpiece|virtual_speaker)' || true
+	pactl list short sources 2>/dev/null | grep -E 'lmi_(bottom_mic|top_mic|stereo_mic)' || true
+}
+
+case "${1:---setup}" in
+	--setup) setup_pulse ;;
+	--watch-routes) watch_routes ;;
+	--playback-bridge) shift; playback_bridge "${1:?playback mode required}" ;;
+	--capture-bridge) shift; capture_bridge "${1:?capture mode required}" ;;
+	--stop) stop_all ;;
+	--status) status ;;
+	--speaker) stop_playback_bridge; playback_speaker ;;
+	--earpiece) stop_playback_bridge; playback_earpiece ;;
+	--bottom-mic) stop_capture_bridge; capture_bottom ;;
+	*)
+		printf 'usage: %s [--setup|--watch-routes|--stop|--status]\n' "$0" >&2
+		exit 2
+		;;
+esac

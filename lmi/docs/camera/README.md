@@ -16,7 +16,7 @@
    - Rust/C runtime 当前架构、support layer 和不能跨越的 raw-only 边界。
 
 4. [`SOFTWARE_ISP_UVC.md`](SOFTWARE_ISP_UVC.md)
-   - software-ISP、native-six MJPEG UVC、按需启动和画质/性能约束。
+   - software-ISP、native-six MJPEG UVC、opt-in 网络 MJPEG、按需启动和画质/性能约束。
 
 5. [`VENUS_H264.md`](VENUS_H264.md)
    - Venus codec 与 H.264 UVC 实验链路。

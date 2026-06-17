@@ -15,10 +15,11 @@
 
 - `/dev/video3` 必须保持真实 RAW10 Bayer 节点，fourcc 为 `pgAA` / `V4L2_PIX_FMT_SGRBG10P`。
 - 当前内核仍没有可用的 SM8250 VFE480 processed YUV/RGB 输出；`vfe480_yc_pp_chain_configured()` 必须继续关闭。
-- `lmi-camera` Rust runtime + C `lmi-isp` / `lmi-uvc-gadget` 是用户态 software-ISP/UVC 支持层，不把 `/dev/video3` 伪装成 YUV/RGB/MJPEG。
+- `lmi-camera` Rust runtime + C `lmi-isp` / `lmi-uvc-gadget` 是用户态 software-ISP/UVC/network-MJPEG 支持层，不把 `/dev/video3` 伪装成 YUV/RGB/MJPEG。
 - 默认/public UVC profile 是 `native-modes`，只暴露 OV13B10 六个原生 MJPEG frame。
-- UVC 控制项 advertised 标准 AE mode、exposure time absolute、gain/ISO-like、power-line frequency，并实验性 advertised UVC 1.5 ROI/测光矩形；Windows Camera 是否会下发 ROI 仍必须看设备日志确认。
+- UVC 控制项 advertised 标准 AE mode、exposure time absolute、gain/ISO-like、power-line frequency（默认 auto 防频闪），并实验性 advertised UVC 1.5 ROI/测光矩形；Windows Camera 是否展示手动快门/ISO 或下发 ROI 仍必须看 DirectShow/设备日志确认。
 - H.264 UVC 是 Venus-gated 实验链路，低分辨率 frame 6 已验证动态画面，但默认/public 仍是 MJPEG native-six。
+- Network camera 是显式 opt-in 的测试输出，frame 6 `1364x768` 已验证 HTTP MJPEG、RTSP RTP/JPEG、ONVIF SOAP 和 WS-Discovery；默认网络预览限制到 30fps，initramfs netcam 默认传 50Hz 防频闪，ONVIF/WS-Discovery 默认设备名/scopes 为 `LMI-OV13B10` 以改善 Windows 发现列表；`lmi.netcam=1 lmi.netcam.rtsp=1 lmi.netcam.onvif=1` 开机路径可用，但默认 UVC service 不因此改变。
 
 ## 文档索引
 
@@ -33,7 +34,7 @@
 | [`docs/camera/sensors/S5K3T2_FRONT_POPUP.md`](docs/camera/sensors/S5K3T2_FRONT_POPUP.md) | 前置升降 S5K3T2 当前证据、机械边界与暂缓状态。 |
 | [`docs/camera/RUNTIME_OVERVIEW.md`](docs/camera/RUNTIME_OVERVIEW.md) | Rust/C camera runtime 当前职责、数据流和边界。 |
 | [`docs/camera/RUNTIME_REFACTOR.md`](docs/camera/RUNTIME_REFACTOR.md) | Rust 控制面、C data-plane、性能/迁移计划。 |
-| [`docs/camera/SOFTWARE_ISP_UVC.md`](docs/camera/SOFTWARE_ISP_UVC.md) | software-ISP、native-six UVC、MJPEG、按需启动和画质边界。 |
+| [`docs/camera/SOFTWARE_ISP_UVC.md`](docs/camera/SOFTWARE_ISP_UVC.md) | software-ISP、native-six UVC、MJPEG、network MJPEG、按需启动和画质边界。 |
 | [`docs/camera/VENUS_H264.md`](docs/camera/VENUS_H264.md) | Venus codec、H.264 UVC 实验链路、Windows 兼容结论。 |
 | [`docs/camera/VFE480_STATUS.md`](docs/camera/VFE480_STATUS.md) | VFE480 processed YUV/RGB 当前状态和必须关闭的 gate。 |
 | [`docs/camera/VFE480_DIAGNOSTICS.md`](docs/camera/VFE480_DIAGNOSTICS.md) | `/dev/video6` RAW_DUMP 诊断历史、r24-r47 结论和主线边界。 |
@@ -73,7 +74,7 @@
 /dev/video3 RAW pgAA
   -> lmi-camera Rust control plane
   -> lmi-isp C software ISP
-  -> MJPEG/YUYV/NV12/FIFO/loopback/UVC helper
+  -> MJPEG/YUYV/NV12/FIFO/loopback/UVC/network-MJPEG helper
 ```
 
 - Rust `lmi-camera` 负责 media route、sensor mode、UVC configfs、COMMIT 到 sensor mode 映射、按需启动和 helper 生命周期。
@@ -88,8 +89,8 @@
 
 - OV13B10 后置超广角 RAW RDI 可用。
 - `/dev/video3` 能按六个原生模式输出真实 `pgAA` RAW。
-- UVC demand-start + software-ISP 用户态支持层可让 Windows/host 枚举 `UVC Camera`，默认 MJPEG native-six。
-- Windows/DirectShow 可通过标准 UVC 控制项尝试调节自动曝光、快门/曝光时间、Gain/ISO-like 和工频防闪烁；ISO 没有通用 UVC 标准控制，只能先按 Gain/ISO-like 映射；ROI/测光点已实验性按 UVC 1.5 advertised，但 Windows Camera 是否在点击取景器时下发控制不可靠，必须以 `ROI ...` / `meter_roi=...` 日志为准。
+- UVC demand-start + software-ISP 用户态支持层可让 Windows/host 枚举 `UVC Camera`，默认 MJPEG native-six。Opt-in network camera 模式可通过 HTTP `/status`、`/snapshot.jpg`、`/stream.mjpg` 在可信局域网提供测试流，默认 30fps，并可显式打开 RTSP RTP/JPEG、ONVIF SOAP 和 WS-Discovery 让 VLC/ONVIF 工具更容易取到 stream URI；默认 ONVIF 名称为 `LMI-OV13B10`，但没有鉴权/TLS/账号管理；当前 RTSP 不是 H.264。
+- Windows/DirectShow 可通过标准 UVC 控制项尝试调节自动曝光、快门/曝光时间、Gain/ISO-like 和工频防闪烁；software-ISP 的 auto 防闪烁会先做 row/band 检测再锁定 50/60Hz，并让曝光与 gain 协同。AE 对 ROI 测光做低通、deadband 和连续方向确认，小幅偏暗优先 analogue gain（ISO-like）到软噪声上限，随后才慢动真实快门，digital gain 最后使用。ISO 没有通用 UVC 标准控制，只能先按 Gain/ISO-like 映射；ROI/测光点已实验性按 UVC 1.5 advertised，但 Windows Camera 是否在点击取景器时下发控制不可靠，必须以 `ROI ...` / `meter_roi=...` 日志为准。
 - H.264 UVC 已在低分辨率实验链路验证动态画面，但仍依赖 Venus、firmware 和 host 兼容性。
 
 不能说明：
